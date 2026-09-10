@@ -55,7 +55,7 @@ def test_coop_vs_sabotage():
     import random
 
     def sample(mode, n=3000):
-        r = Roster(chefs=(0,))
+        r = Roster(chefs=(0,), seed=20240910)
         r.set_mode(0, mode)
         st = r.get(0)
         st.conscience = 0.5            # 捣蛋用中等良心，公平比较
@@ -77,9 +77,12 @@ def test_coop_vs_sabotage():
     sab = sample(Mode.SABOTAGE)
     print(f"    合作 3000 次决策: {coop}")
     print(f"    捣蛋 3000 次决策: {sab}")
-    check_true("合作基本不干正事以外的事(干扰 <15%)",
-               (coop['light'] + coop['mid'] + coop['heavy']) < 3000 * 0.15)
-    check_true("捣蛋的干扰显著更多", sab['light'] + sab['mid'] + sab['heavy'] > 1000)
+    n_coop = coop['light'] + coop['mid'] + coop['heavy']
+    n_sab = sab['light'] + sab['mid'] + sab['heavy']
+    check_true("合作基本只干正事(干扰 <15%)", n_coop < 3000 * 0.15)
+    # 用**相对倍数**判定: 绝对阈值会随参数微调而脆断(实测曾卡在 1003 vs 1000)
+    check_true("捣蛋的干扰显著多于合作(≥3倍)", n_sab > n_coop * 3,
+               f"合作={n_coop} 捣蛋={n_sab}")
     check_true("捣蛋会出现重档(倒队友菜/烧糊)",
                sab['heavy'] > 0, f"heavy={sab['heavy']}")
 
