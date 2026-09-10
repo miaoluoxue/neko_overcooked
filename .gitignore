@@ -4,7 +4,16 @@ __pycache__/
 *.pyc
 .pytest_cache/
 pytest-cache-files-*/
+Overcooked2AI/obj/
+Overcooked2AI/bin/
 tools/BepInEx_x86/
 tools/ref/
 *.log
 _sec*.md
+
+# 反编译得到的游戏源码 —— 属于 Team17 的专有代码, 不随仓库分发。
+# 需要的话请用你拥有的正版游戏自行生成, 命令见 README「重新生成反编译源码」。
+overcooked_decomp/
+overcooked_decomp.7z
+overcooked_decomp*.7z
+overcooked_decomp*.zip

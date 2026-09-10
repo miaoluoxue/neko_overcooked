@@ -1,0 +1,278 @@
+# neko_overcooked
+
+《胡闹厨房 2》(Overcooked! 2) 自动化脚本 —— **BepInEx 插件 + Python 外部驱动**。
+目标是让两个厨师在全自动脚本下通关：读订单、读配方、自己切菜煮菜、摆盘送餐，
+并且**不撞墙、不淹死、不踩空**。
+
+> ⚠️ **免责声明**
+> 本项目是非官方个人研究项目，与 Team17 / Ghost Town Games 无关。
+> 使用需要你**自行拥有正版游戏**。
+> 仓库内**不包含**任何游戏本体资源、模型、音频，也**不包含**反编译得到的游戏源码
+> （原因见 [重新生成反编译源码](#重新生成反编译源码)）。
+> 请勿将本项目用于联机对战或任何影响他人游戏体验的场景。
+
+---
+
+## 这是什么 / 不是什么
+
+**是** —— 一套"把游戏内部状态读出来、再用模拟键盘把操作打回去"的闭环工具。
+插件在游戏进程内读网格、台面、订单、配方、危险区；Python 侧做规划，
+然后用 `SendInput` 模拟键盘（P1 用 WASD 区、P2 用方向键区，游戏原生支持分屏双键盘）。
+
+**不是** —— 不是内存修改器，不改游戏逻辑，不做注入式作弊。
+所有操作都等价于一个手速稳定、不会累的玩家在按键。
+
+---
+
+## 环境要求
+
+| 项 | 说明 |
+|---|---|
+| 游戏 | Overcooked! 2（Steam appid 728880） |
+| 游戏运行时 | **Unity 2017.4 + Mono（x86）**，不是 IL2CPP。CLR 2.0.50727 |
+| Mod 加载器 | BepInEx **5.4.23.5 win_x86**（`tools/BepInEx_win_x86.zip`） |
+| 编译 | .NET SDK（用 `csc.dll` 直接编译，无需 VS/MSBuild） |
+| 脚本 | Python 3.8+（开发用 3.13），纯标准库，**零第三方依赖** |
+| 系统 | Windows（脚本侧用 `ctypes` 调 `SendInput`） |
+
+---
+
+## 构建与部署
+
+1. 把 BepInEx 解压到游戏根目录，先运行一次游戏让它生成 `BepInEx/plugins/`。
+2. 改 `build.bat` 顶部的两个路径：
+   ```bat
+   set GAME=E:\SteamLibrary\steamapps\common\Overcooked! 2\Overcooked2_Data\Managed
+   set BEP=%~dp0tools\BepInEx_x86\BepInEx\core
+   ```
+3. 编译：
+   ```bat
+   build.bat
+   ```
+   > 关键点：引用的是 **`C:\Windows\Microsoft.NET\Framework\v2.0.50727`**（.NET 2.0），
+   > **不是** `v4.0.30319`。游戏的 CLR 是 2.0，用 .NET 4 的引用会编译通过但加载时报
+   > `Method not found: 'System.Threading.Monitor.Enter'`。
+4. 把 `build/Overcooked2AI.dll` 复制到
+   `<游戏目录>\BepInEx\plugins\Overcooked2AI.dll`。
+5. 启动游戏。插件会在 **127.0.0.1:48778** 起一个 TCP 桥（行 JSON 协议）。
+
+---
+
+## 使用
+
+```bat
+:: 先看这一关长什么样（网格 + 危险区 + 机关），强烈建议每次都先跑这个
+python -u tools\mapview.py
+
+:: 验证四个方向键在这个场景能不能推动厨师
+python -u tools\probe_move.py W S A D
+
+:: 环境体检（环境/桥/窗口/状态/知识表/寻路/输入/导航 逐项过）
+python -u tools\diagnose.py
+
+:: 单人自动做菜
+python -u run_engine.py
+python -u run_engine.py --dry              :: 只规划不驱动，打印"这单要怎么做"
+python -u run_engine.py --mode sabotage     :: 三模式: coop | clumsy | sabotage
+
+:: 双人（两个引擎线程，共用一个订单黑板避免抢活）
+python -u run_team.py
+```
+
+### 桥协议（`neko/bridge/client.py`）
+
+每行一个 JSON，请求 `{"cmd": "...", ...}`：
+
+| cmd | 作用 |
+|---|---|
+| `state` | 状态快照（场景/是否在局/厨师/台面/烹饪进度/配方池） |
+| `orders` / `live` | 订单（含剩余时间比例） |
+| `know` | 食材知识表：每个食材/箱子/厨具的加工方式 |
+| `raw` | 全量物体清单（带 Collider 的物体 + 自定义组件） |
+| `map` | **整张关卡网格 + 危险区 + 空洞 + 平台**（见下） |
+| `dyn` | **机关/陷阱**：按钮、传送带方向、触发机器、平台、着火、关卡变形 |
+| `path` | 问游戏原生 `GridNavSpace` 寻路（**仅兜底，理由见下**） |
+| `action` | 入队一个动作，由主线程执行 |
+
+---
+
+## 逆向文档
+
+`docs/关卡逆向/` 是为写这套脚本而做的系统性逆向，**569 KB / 9 篇，全部结论带
+`文件名.cs:行号` 引用**，未验证的一律标注「未验证」：
+
+| 文档 | 内容 |
+|---|---|
+| 01 网格系统与边界重生 | 网格/占用物、KillPlane 与越界、重生时序（≈6 秒） |
+| 02 危险物与动态关卡变换 | 火灾的四条点火源与灭火路径、潮水/木筏等动态变换 |
+| 03 移动平台传送带与玩家运动学 | 玩家速度链、平台"谁在驾驶"、传送带速度叠加 |
+| 04 关卡配置与对局流程 | 状态机、计分与连击规则、"结束→下一局"链路 |
+| 05 触发器机关系统内核 | 字符串触发总线、8 类触发条件、发现机关被触发的手段 |
+| 06 按钮开关与传送带方向 | 按钮怎么按、传送带方向怎么读、开关↔传送带的连线在哪一层 |
+| 07 消失平台与物件销毁 | 荷叶等"会消失的地面"的物理真相与运行时探测方案 |
+| 08 移动危险物与打滑推挤 | 打滑、击退量级、**该直接拒玩的关卡清单** |
+| 09 分屏双键盘键位权威表 | 两套键盘绑定表的区别、三跳推导出 P1/P2 的确切按键 |
+
+根目录另有两份总纲：`胡闹厨房2-玩法核心逻辑逆向.md`（订单/配方/烹饪/摆盘/计分）、
+`胡闹厨房2-全脚本通关方案v1.md`（整体设计）。
+
+---
+
+## 硬核踩坑速查
+
+这一节是本项目最贵的部分 —— 每一条都是"看起来没问题、实际必然失败"的坑。
+
+### 寻路
+
+- **`GridNavSpace` 不是给厨师用的**。它的 `m_nodeMap` 全工程**只被老鼠 NPC 的
+  `GridNavigator` 消费**（`GridNavigator.cs:18`），而且**只在 `Start()` 建一次、永不刷新**
+  （`GridNavSpace.cs:44-56`）。移动平台的出生格会被这份快照**永久记成墙**，
+  平台后来驶入的格却仍是"可走" —— 两个方向都错。
+- **可走判定只有一条**：`m_nodeMap[x,z] = (GetGridOccupant(index) == null)`。
+  而**水面不是占用物**（它是 `RespawnCollider` 触发器），所以原生寻路会把水面当可走格，
+  直接横穿过去把厨师淹死。
+- 正确做法：自己读 `GridManager` 的公开 API 建图 + 向下射线判地面 + 按 tag 分类，
+  然后把 `MovingPlatform` / `Travelator` 视作可站格、水面/岩浆视作禁行。
+
+### 交互
+
+- **交互半径是 1.0，量的是到碰撞体「表面」的距离**
+  （`PlayerControls.cs:745` → `GetCollidersInArc(1f, PI, ...)`）。
+  停在 1.8 格处按键是够不着台子的。
+- **交互判定是朝向敏感的**：`IsColliderInArc` 用
+  `Dot(transform.forward, 指向目标) >= cos(PI/2) == 0`，**只认前方 180° 半圆**
+  （`InteractWithItemHelper.cs:153-163`）。而厨师的面朝方向 = **它最后一次移动的方向**，
+  绕路过来很可能是背对的 —— 这时按交互键完全没反应，日志只会显示"持有物未变"。
+- 交互是 **JustPressed 边沿触发**，必须"按下 → 松开"，长按不会连续触发。
+
+### 运动与按键
+
+- `PlayerControls.Movement.RunSpeed = 4f`（`PlayerControls.cs:28`），且平地水平速度是
+  **每帧直接赋值**的 ⇒ 没有加速度、没有惯性、没有刹车。
+  **位移 = 4 × 按住秒数，1 格(1.2u) 正好 0.30 秒。**
+- 位移方向取自**输入向量**，与厨师朝向无关 —— 所以轻点一下就能"转头"。
+- 键位有**两套绑定表**，别搞混：`GetDefaultCombinedKeyboardBindings()`（一个键盘当一只手柄）
+  和 `GetDefaultSplitKeyboardBindings()`（一个键盘拆成两个虚拟手柄，**本项目用这套**）。
+  详见 09 号文档。另外游戏实际用的是 `m_UserKeyboardBindings`（玩家自定义键位），
+  所以 `probe_bindings()` 实测兜底必须保留。
+
+### 死亡 / 重生
+
+- 重生全程 ≈ **6 秒**（`m_respawnTime` 5s + 粒子 1s），期间 `PlayerControls.m_bRespawning == true`，
+  **按键完全无效**。把它当成"卡住"去按侧移，只会把超时耗光。
+- 只判 `m_bRespawning` 也不够：**过场压制**（`IsSuppressed()`）和**喷灭火器**
+  （`MovementScale` 被设成 0）一样按不动。
+- **任何一次死亡都会强制切换该手柄的活跃厨师**（`ClientPlayerRespawnBehaviour.cs:177-190`
+  → `PlayerSwitchingManager.cs:118-125`），之后按键驱动的是**另一只厨师而且不报错**。
+
+### 会变的地面
+
+- "荷叶踩过就消失"**不是被销毁的**。工程里没有 `LilyPad`/`Lotus` 类，唯一证据是成对音效
+  `DLC_13_LilyPad_*_Plunge / _Pop`（`GameOneShotAudioTag.cs:317-321`）——
+  说明它踩下去会沉、之后还会浮回来，物理上就是**碰撞体跟着下沉动画走低**。
+  于是**向下射线全程都有命中**，只判"有没有命中"的探测会一路认为这格能走，
+  直到最后一刻才发现，而游戏给的反应窗口只有 **0.2 秒**
+  （`m_timeBeforeFalling`，`PlayerControls.cs:270`）。
+  → 必须校验**落点高度**（本项目的做法：低于 `StepHeightMax = 0.65` 就判不可走）。
+
+### 地图字符表（`map` 命令）
+
+```
+.  可走          #  被墙/橱柜/台面占住
+F  火焰危险物    P  移动平台(能站, 会动)
+T  传送带        H  危险区(水面/岩浆/边界墙)
+V  空洞(脚下没地面)
+v  地板太低(单向落差 / 正在下沉的平台, 例如荷叶)
+```
+
+---
+
+## 已知限制
+
+子代理逆向给出的 **A 级"原理上不应自动游玩"** 关卡（按键是开环控制，这些机制无法可靠应对）：
+
+- **陨石关** —— 落点时刻与格子**双随机**（`MeteorManager.cs:32,40-42`）
+- **弹射物关** —— 落点顺序随机，还可能顺手在随机格点火
+- **车辆关**（`RespawnType.Car`）—— 接触即死，车辆时序在 C# 中完全不可读
+- **荷叶关（DLC13）** —— 同一格可站立性反复翻转，没有可靠落脚点
+
+**B 级"可玩但必须补偿"**：打滑区（输入完全失效 ≈0.8~1.2s）、冰面（按键只占 1.7% 权重）、
+传送带（按 `m_speed` 加减时长）、风区。
+
+另外：`tools/BepInEx_win_x86.zip` 是 BepInEx 的再分发，遵循其自身许可证（LGPL-2.1）。
+
+---
+
+## 重新生成反编译源码
+
+本项目所有逆向结论都来自反编译源码，但**源码本身不随仓库分发** ——
+它是 Team17 的专有代码，公开传播会构成侵权。
+
+你可以自己从**你拥有的正版游戏**重新生成（本项目用 ilspycmd 9.1）：
+
+```bat
+:: 1. 安装反编译器
+dotnet tool install -g ilspycmd
+
+:: 2. 反编译游戏主程序集（注意游戏是 Mono/x86，目标是 Assembly-CSharp.dll）
+ilspycmd -p -o overcooked_decomp ^
+  "E:\SteamLibrary\steamapps\common\Overcooked! 2\Overcooked2_Data\Managed\Assembly-CSharp.dll"
+```
+
+`-p` 会按命名空间建子目录，产出约 2366 个 `.cs` 文件 / 5.2 MB。
+生成后放在仓库根目录的 `overcooked_decomp/` 即可（该目录已在 `.gitignore` 中）。
+
+---
+
+## 目录结构
+
+```
+Overcooked2AI/Game/        BepInEx 插件 (C#)
+  Plugin.cs                入口, 主线程状态刷新
+  BridgeServer.cs          TCP 桥 (行 JSON)
+  StateCollector.cs        主线程"请求-执行"任务泵
+  SceneScanner.cs          台面/厨师/烹饪扫描
+  LevelInfo.cs             整张关卡网格 + 危险区 + 空洞   ← 寻路的地基
+  InteractiveScan.cs       机关/陷阱扫描 (按钮/传送带/触发机器/火)
+  NavPath.cs               原生寻路封装 (仅兜底)
+  OrderCapture.cs          订单读取
+  RecipeReader.cs          配方树读取
+  ItemKnowledge.cs         食材知识表
+  ActionExecutor.cs        动作队列
+neko/                      Python 侧
+  bridge/client.py         桥客户端
+  bridge/keyboard_input.py SendInput 键盘模拟 + 窗口激活
+  engine.py                单个厨师的完整引擎 (导航/交互/各 op)
+  terrain.py               关卡网格模型 + 避开危险格的 A*    ← 寻路的地基
+  map_model.py             台面/厨师语义模型
+  cookbook.py              配方推导 (食材 → 加工链 → 成菜)
+  pathing.py               网格换算 + 运动学常量
+  team.py                  双人订单黑板
+  modes/                   三模式 (合作/失误/捣蛋) 个体状态机
+tools/                     诊断与观测工具
+docs/关卡逆向/              9 篇逆向文档
+tests/                     离线自测 (无需游戏)
+```
+
+---
+
+## 测试
+
+```bat
+python -m pytest tests/ -q          :: 9 passed
+python -u tests\test_terrain.py     :: 20 项: 地形/危险区/绕开水面的 A*
+python -u tests\test_offline.py     :: 配方推导 + 台面语义
+python -u tests\test_modes.py       :: 三模式行为
+```
+
+离线测试全部不需要游戏在运行。
+
+---
+
+## 平台说明
+
+插件是 **x86** 的（游戏是 32 位 Mono），Python 侧用 `SendInput` 走的是
+**游戏原生的分屏双键盘**方案，不依赖任何内核驱动或虚拟手柄
+（早期试过 ViGEm，需要装内核驱动、且换台电脑就得重装，已放弃）。
+这样做的好处是**可移植**：换一台装了正版游戏的 Windows 机器，
+解压 BepInEx + 放一个 dll + 装 Python 就能跑。
