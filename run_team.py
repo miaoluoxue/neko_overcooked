@@ -17,7 +17,7 @@ import sys
 import threading
 import time
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "py"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "neko"))
 
 from bridge.client import BridgeClient              # noqa: E402
 from bridge.keyboard_input import PLAYER1, PLAYER2  # noqa: E402

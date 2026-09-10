@@ -16,7 +16,7 @@ import argparse
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "py"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "neko"))
 
 from bridge.client import BridgeClient   # noqa: E402
 from engine import Engine                # noqa: E402

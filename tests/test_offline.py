@@ -14,7 +14,7 @@ from __future__ import annotations
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "py"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "neko"))
 
 from map_model import KitchenMap                      # noqa: E402
 from cookbook import Knowledge, derive, steps_text, item_from_json  # noqa: E402

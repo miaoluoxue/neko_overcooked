@@ -16,10 +16,10 @@ import sys
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _ROOT)
-sys.path.insert(0, os.path.join(_ROOT, "py"))
+sys.path.insert(0, os.path.join(_ROOT, "neko"))
 
-from py.bridge.client import BridgeClient, BridgeError   # noqa: E402
-from py.terrain import TerrainMap                        # noqa: E402
+from neko.bridge.client import BridgeClient, BridgeError   # noqa: E402
+from neko.terrain import TerrainMap                        # noqa: E402
 
 LEGEND = """
 图例:  .  可走        #  被墙/橱柜/台面占住

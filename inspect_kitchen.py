@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import sys
 
-sys.path.insert(0, "py")
+sys.path.insert(0, "neko")
 
 from bridge.client import BridgeClient          # noqa: E402
 from cookbook import Knowledge, derive, steps_text  # noqa: E402

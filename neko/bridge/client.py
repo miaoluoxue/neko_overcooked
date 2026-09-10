@@ -98,7 +98,7 @@ class BridgeClient:
         return self._send({"cmd": "path", "chef": chef, "tx": tx, "tz": tz})
 
     def get_map(self, force: bool = False) -> dict:
-        """整张关卡网格 + 危险区 + 空洞 + 平台。见 py/terrain.py 的 TerrainMap。"""
+        """整张关卡网格 + 危险区 + 空洞 + 平台。见 neko/terrain.py 的 TerrainMap。"""
         return self._send({"cmd": "map", "arg": "force" if force else ""})
 
     def get_dyn(self) -> dict:

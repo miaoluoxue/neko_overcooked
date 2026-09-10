@@ -9,7 +9,7 @@ from __future__ import annotations
 import sys
 from collections import Counter, defaultdict
 
-sys.path.insert(0, "py")
+sys.path.insert(0, "neko")
 
 from bridge.client import BridgeClient  # noqa: E402
 

@@ -34,7 +34,7 @@ class Engine:
         self.kb = KeyboardPlayer(bindings or PLAYER1)
         self.log = log
         self.board = board       # 双人时的订单黑板(单人传 None)
-        self.mode_state = mode_state   # 三模式的个体状态(py/modes/); None=纯合作不捣蛋
+        self.mode_state = mode_state   # 三模式的个体状态(neko/modes/); None=纯合作不捣蛋
         # 交互半径: 反编译实测是 **1.0**(到碰撞体**表面**的距离, 朝向还要在前 180° 内),
         # 见 pathing.INTERACT_RANGE。这里 1.5 只是"导航粗到半径", 落到 1.5 之后还要靠
         # tight 再收紧 + face() 转身, 才真正进入交互范围。

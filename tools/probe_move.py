@@ -20,8 +20,8 @@ import time
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _ROOT)
 
-from py.bridge.client import BridgeClient, BridgeError      # noqa: E402
-from py.bridge import keyboard_input as ki                  # noqa: E402
+from neko.bridge.client import BridgeClient, BridgeError      # noqa: E402
+from neko.bridge import keyboard_input as ki                  # noqa: E402
 
 
 def chefs(st):

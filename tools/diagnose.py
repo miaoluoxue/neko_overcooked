@@ -32,7 +32,7 @@ import sys
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(ROOT, "py"))
+sys.path.insert(0, os.path.join(ROOT, "neko"))
 
 from bridge.client import BridgeClient                    # noqa: E402
 from bridge.keyboard_input import (activate_game, key_down, key_up,  # noqa: E402
