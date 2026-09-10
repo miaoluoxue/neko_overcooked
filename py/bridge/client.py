@@ -90,8 +90,16 @@ class BridgeClient:
         return self._send({"cmd": "know"})
 
     def get_path(self, tx: float, tz: float, chef: int = 0) -> dict:
-        """问**游戏自己**的寻路网格(GridNavSpace): 边界/橱柜/墙壁全都算障碍。"""
+        """问**游戏自己**的寻路网格(GridNavSpace): 边界/橱柜/墙壁全都算障碍。
+
+        注意: 它**不认得水面和空洞**(水是 RespawnCollider 触发器, 不占格子),
+        所以它给出的路径可能横穿水面, 用之前必须拿 terrain 过滤一遍。
+        """
         return self._send({"cmd": "path", "chef": chef, "tx": tx, "tz": tz})
+
+    def get_map(self, force: bool = False) -> dict:
+        """整张关卡网格 + 危险区 + 空洞 + 平台。见 py/terrain.py 的 TerrainMap。"""
+        return self._send({"cmd": "map", "arg": "force" if force else ""})
 
     def send_action(self, chef: int, kind: str, target: str = "", duration: float = 0.0) -> dict:
         return self._send({"cmd": "action", "chef": chef, "kind": kind,

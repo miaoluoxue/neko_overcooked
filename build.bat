@@ -37,6 +37,7 @@ dotnet %CSC% -nologo -target:library -langversion:7.3 -platform:x86 -nostdlib+ ^
   "%SRC%\Game\RecipeReader.cs" ^
   "%SRC%\Game\ItemKnowledge.cs" ^
   "%SRC%\Game\NavPath.cs" ^
+  "%SRC%\Game\LevelInfo.cs" ^
   "%SRC%\Game\ActionExecutor.cs" ^
   "%SRC%\Game\VirtualGamepad.cs"
 

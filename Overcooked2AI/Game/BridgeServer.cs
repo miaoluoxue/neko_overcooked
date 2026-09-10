@@ -127,6 +127,9 @@ namespace Overcooked2AI.Game
                     "{0},{1},{2}", chef, ptx, ptz);
                 return _collector.RequestJob("path", 6000, arg);
             }
+            // 关卡地图: 整张原生网格 + 危险区(水面/岩浆/边界) + 空洞 + 平台
+            if (line.Contains("\"map\""))
+                return _collector.RequestJob("map", 8000, GetStr(line, "arg", ""));
             if (line.Contains("\"pad\""))
                 return HandlePad(line);
             if (line.Contains("\"action\""))

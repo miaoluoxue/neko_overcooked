@@ -1,4 +1,4 @@
-"""地图模型: 把桥采集的台子/厨师/烹饪状态组织成语义化地图。
+﻿"""地图模型: 把桥采集的台子/厨师/烹饪状态组织成语义化地图。
 
 台子语义归类依据(反编译确认):
   · kind 是组件类型名, 且 C# 侧已按 instanceID 去重(一个物体只归一个类型), 所以 kind 可靠
@@ -64,6 +64,7 @@ class Chef:
     x: float
     z: float
     held: str = ""             # 手上拿着什么
+    player: str = ""           # 归属玩家(Player.One/Two) —— 决定该发哪套键盘
 
 
 @dataclass
@@ -145,7 +146,7 @@ class KitchenMap:
             km.chefs.append(Chef(
                 id=int(c.get("id", i)), name=c.get("name", f"P{i}"),
                 x=float(c.get("x", 0)), z=float(c.get("z", 0)),
-                held=c.get("held", "")))
+                held=c.get("held", ""), player=c.get("player", "")))
         for c in layout.get("cooking") or []:
             km.cooking.append(Cooking(
                 name=c.get("name", ""), ing=c.get("ing", ""),

@@ -1,4 +1,4 @@
-﻿"""自动做菜引擎: 以"当前订单"驱动, 按游戏真实机制执行完整流程。
+"""自动做菜引擎: 以"当前订单"驱动, 按游戏真实机制执行完整流程。
 
 关键机制(全部反编译确认, 不是猜的):
   · 送餐口 = PlateStation —— 把"装了菜的容器"放上去才触发送餐
@@ -44,6 +44,8 @@ class Engine:
         self.assemble_spot: Station | None = None   # 组装台面(放容器的地方)
         self._stove_used = ""                        # 当前占用的灶台(用完释放)
         self._probed = False                         # 是否已实测过键位归属
+        self._terrain = None                         # 关卡地形(含危险区), 见 terrain()
+        self._terrain_scene = ""
 
     # ---------------- 状态 ----------------
     def state(self) -> dict | None:
@@ -69,6 +71,37 @@ class Engine:
             if int(c.get("id", -1)) == self.cid:
                 return float(c.get("x", 0)), float(c.get("z", 0)), c.get("held", "")
         return None, None, ""
+
+    def chef(self, st: dict) -> dict:
+        """当前厨师这一帧的完整信息(位置/手持/归属玩家/是否正在重生)。"""
+        lay = (st or {}).get("layout") or {}
+        for c in lay.get("chefs") or []:
+            if int(c.get("id", -1)) == self.cid:
+                return c
+        return {}
+
+    def is_respawning(self, st: dict) -> bool:
+        """正在死亡重生中(PlayerControls.m_bRespawning)。
+
+        这期间游戏接管了角色, 发任何方向键都不会有反应 —— 旧代码不知道这件事,
+        于是把它当成"卡住", 一边按侧移一边把超时耗光。
+        """
+        return bool(self.chef(st).get("respawning"))
+
+    def wait_respawn(self, budget: float = 9.0) -> bool:
+        """松手等游戏把厨师救回重生点(实测 5s 重生 + 1s 粒子 ≈ 6s)。"""
+        self.kb.release_all()
+        t0 = time.time()
+        while time.time() - t0 < budget:
+            time.sleep(0.4)
+            st = self.state()
+            if not st or not st.get("inRound"):
+                return False
+            if not self.is_respawning(st):
+                self.log(f"[重生] 厨师回来了(等了 {time.time()-t0:.1f}s)")
+                return True
+        self.log(f"[重生] 等了 {budget}s 还没回来")
+        return False
 
     def ensure_knowledge(self, st: dict) -> bool:
         """每场景拉一次食材知识表(切/煮/货源)。"""
@@ -115,6 +148,11 @@ class Engine:
         if not activate_game():
             self.log("[导航] ⚠ 游戏窗口没能拿到前台, 按键会被别的窗口吃掉 —— 先切到游戏窗口")
             return False
+        tm = self.terrain()
+        if tm is not None and tm.ok and tm.is_danger_world(tx, tz):
+            # 以前这里没有这道闸: 目标落在水面上, 厨师就一路走进去淹死
+            self.log(f"[导航] 目标 ({tx:.1f},{tz:.1f}) 落在危险格上, 拒绝前往")
+            return False
         arr = self.arrive if arrive is None else arrive
         t0 = time.time()
         limit = self.step_timeout if step_timeout is None else step_timeout
@@ -135,6 +173,30 @@ class Engine:
                     return False
                 dx, dz = tx - x, tz - z
                 dist = (dx * dx + dz * dz) ** 0.5
+
+                # 死亡重生中: 游戏接管角色, 按键无效。必须松手等, 不能当"卡住"处理 ——
+                # 这是之前"按键探针明明能用、导航却一直卡住"的真凶之一。
+                if self.is_respawning(st):
+                    self.log("[导航] ⚠ 厨师正在死亡重生, 松手等游戏救回来")
+                    if not self.wait_respawn():
+                        return False
+                    t0 = time.time()
+                    last_pos = None
+                    stuck = 0
+                    continue
+
+                # 掉水里 / 踩空: 这时按键完全无效(游戏接管了角色), 硬按只会白等超时。
+                # 正确做法是松手等游戏把他捞回来(重生点), 然后重新开始计时。
+                if tm is not None and tm.ok and tm.is_danger_world(x, z):
+                    self.log("[导航] ⚠ 厨师在危险格上(掉水/坠落), 等游戏救回重生点")
+                    if not self.wait_respawn(4.0):
+                        # 位置还停在危险格但没进入重生态: 先自己往外挪一格再说
+                        self.log("[导航] 没进重生态, 先脱离危险格")
+                    t0 = time.time()
+                    last_pos = None
+                    stuck = 0
+                    continue
+
                 if dist <= arr:
                     if tight is None or dist <= tight:
                         self.kb.release_all()
@@ -231,7 +293,34 @@ class Engine:
         ax, az = (serve.x, serve.z) if serve else (x, z)
         return min(cands, key=lambda s: (s.x - ax) ** 2 + (s.z - az) ** 2)
 
-    # ---------------- 键位自动探测 ----------------
+    # ---------------- 键位归属（权威依据） ----------------
+    #: 游戏的 Player 枚举 → 键盘半区（v1 §3.2: SplitPadHost=Left=WASD, SplitPadGuest=Right=方向键）
+    _PLAYER_TO_KEYS = {"one": "P1", "two": "P2", "three": "P3", "four": "P4"}
+
+    def bind_keys_by_player(self, km: KitchenMap) -> bool:
+        """按**厨师归属的玩家**选键盘 —— 权威依据, 不用猜也不用探测。
+
+        为什么需要: `cid` 只是 `FindObjectsOfType(PlayerControls)` 的枚举序号,
+        与 `Player.One/Two` **没有必然关系** —— 实测遇到过 `cid=0` 其实是 `Player.Two`,
+        于是给它发 WASD 一动不动(四个方向全无反应)。
+        依据: `ClientInputTransmitter.Setup()` 里 `iD = GetComponent<PlayerIDProvider>().GetID()`。
+        """
+        from bridge.keyboard_input import PLAYER1, PLAYER2
+        chef = km.chef(self.cid)
+        if chef is None:
+            return False
+        pid = (getattr(chef, "player", "") or "").strip().lower()
+        if not pid:
+            return False                      # 老 dll 没这个字段 → 交给探测兜底
+        want = self._PLAYER_TO_KEYS.get(pid)
+        if want is None:
+            self.log(f"[键位] 未知的玩家归属 {chef.player!r}")
+            return False
+        self.kb = KeyboardPlayer(PLAYER1 if want == "P1" else PLAYER2)
+        self.log(f"[键位] 厨师#{self.cid} 属于 {chef.player} → 用 {want} 键位")
+        return True
+
+    # ---------------- 键位自动探测（兜底） ----------------
     def probe_bindings(self, candidates=None) -> dict | None:
         """**实测**哪一套键位能驱动我这个厨师（cid）。
 
@@ -530,32 +619,94 @@ class Engine:
         from pathing import to_grid
         return set(to_grid(s.x, s.z) for s in km.stations.values())
 
+    # ------------------------------------------------------------ 关卡地形
+    def terrain(self, force: bool = False):
+        """拿整张关卡网格(含危险区)。同一关卡内缓存, 关卡一变就重取。
+
+        这张图是**寻路的唯一真相来源**: 它同时知道"哪里被占住"和"哪里会淹死/掉下去",
+        而游戏原生 FindPath 只知道前者。开局/换关/强制时刷新。
+        """
+        from terrain import TerrainMap
+        st = self.state()
+        scene = (st or {}).get("scene") or ""
+        if (not force and self._terrain is not None
+                and self._terrain_scene == scene and self._terrain.ok):
+            return self._terrain
+        try:
+            data = self.bridge.get_map(force=force)
+        except Exception as e:
+            self.log(f"[地形] 取图失败: {e}")
+            return self._terrain
+        tm = TerrainMap(data)
+        if tm.error:
+            self.log(f"[地形] 报错: {tm.error}")
+            return self._terrain
+        if not tm.ok:
+            self.log("[地形] 网格数据不完整, 退回旧寻路")
+            return self._terrain
+        if tm.error is None and (self._terrain is None or not self._terrain.ok
+                                 or tm.counts != self._terrain.counts):
+            self.log(f"[地形] {tm.w}x{tm.h} 格 步长({tm.cellx:.2f},{tm.cellz:.2f}) " + tm.describe_dangers())
+        self._terrain = tm
+        self._terrain_scene = scene
+        return tm
+
+    def _native_path_safe(self, tm, pts: list) -> list:
+        """把游戏原生路径里"会淹死人的点"剔掉。
+
+        原生寻路不知道水面, 所以它给的路径可能直接横穿池塘。这里逐点检查:
+        一旦某个点落在危险格上, 就把这条路径整条作废(返回空), 让调用方改用
+        地形 A* —— 半条原生路径比没有路径更危险。
+        """
+        if not pts or tm is None or not tm.ok:
+            return pts
+        for (px, pz) in pts:
+            if tm.is_danger_world(px, pz):
+                return []
+        return pts
+
     def navigate_smart(self, km: KitchenMap, tx: float, tz: float,
                        tight: float = 0.8, replans: int = 3) -> bool:
         """带寻路的导航。
 
-        首选**游戏自己的** GridNavSpace 寻路 —— 它的可走判定是"该格没有占用者",
-        所以边界、橱柜、墙壁、台子全都算障碍; 自己拿台子列表当障碍会漏掉边界与橱柜,
-        厨师就会直着往墙上撞(实测卡在 x=5.0 过不去)。
-        Python 的 A* 只作为兜底(游戏寻路不可用时)。
+        优先级(实测排出来的):
+          1) **地形 A*** —— 用游戏自己的网格(占用物=障碍), 再额外避开水面/空洞。
+             这是唯一既不会撞墙、也不会淹死的方案。
+          2) 游戏原生 GridNavSpace.FindPath —— 兜底。但必须先过滤掉危险点,
+             因为它的可走判定 `GetGridOccupant()==null` 根本看不见水面。
+          3) 拿台子列表当障碍的 Python A* —— 最后兜底(会漏掉边界与橱柜)。
         每段走完位置会变, 所以失败就重新规划。
         """
         from pathing import plan_path
+        tm = self.terrain()
         for attempt in range(replans + 1):
             st = self.state()
             if not st or not st.get("inRound"):
                 return False
+
+            # 地图是**会变**的: 荷叶踩过会消失、按钮会改传送带、火会占格、潮水会吞台面。
+            # 前一轮没走通就重取一次 —— 插件读的是实时的 GetGridOccupant, 而游戏自己的
+            # m_nodeMap 只在 Start 建一次永不刷新, 所以只有重新取图才能看到变化。
+            if attempt > 0:
+                tm = self.terrain(force=True)
+
             x, z, _ = self.pos(st)
             if x is None:
                 return False
             if (tx - x) ** 2 + (tz - z) ** 2 <= (tight or self.arrive) ** 2:
                 return True
 
-            pts = self._game_path(tx, tz)
+            pts = []
+            if tm is not None and tm.ok:
+                pts = tm.find_path(x, z, tx, tz)
+                if not pts:
+                    self.log(f"[导航] 地形 A* 无解 → ({tx:.1f},{tz:.1f}), 试原生寻路")
+            if not pts:
+                pts = self._native_path_safe(tm, self._game_path(tx, tz))
             if not pts:
                 pts = plan_path(x, z, tx, tz, self._obstacles(km))
             if not pts:
-                # 两条路都规划不出来 → 退回直线冲一次
+                # 三条路都规划不出来 → 退回直线冲一次
                 return self.navigate(tx, tz, tight=tight)
 
             # 逐格走。关键: **某个路径点走不到不该让整条路径失败** ——
@@ -564,6 +715,9 @@ class Engine:
             for (px, pz) in pts:
                 if (px - x) ** 2 + (pz - z) ** 2 < 0.09:
                     continue                      # 起点附近的点不用专门走
+                if tm is not None and tm.ok and tm.is_danger_world(px, pz):
+                    self.log(f"[导航] 路径点 ({px:.1f},{pz:.1f}) 是危险格, 跳过")
+                    continue
                 if not self.navigate(px, pz, arrive=0.9, step_timeout=6.0):
                     self.log(f"[导航] 路径点 ({px:.1f},{pz:.1f}) 到不了, 继续下一个")
                     continue                       # 跳过去, 别把整条路径判死
@@ -908,10 +1062,12 @@ class Engine:
                 time.sleep(3)
                 continue
 
-            # 进入对局后**实测**一次键位归属(厨师 id 未必对应键盘左/右半区)
+            # 进入对局后确定键位: 优先按"厨师归属的玩家"(权威), 老 dll 才退到实测探测
             if not self._probed:
                 self._probed = True
-                self.probe_bindings()
+                if not self.bind_keys_by_player(km):
+                    self.log("[键位] dll 未提供 player 字段, 改用实测探测")
+                    self.probe_bindings()
 
             if self.execute(flow):
                 self.log(f"[引擎] ★ 完成 {name}")

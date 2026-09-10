@@ -102,17 +102,72 @@ namespace Overcooked2AI.Game
                             continue;
                         var pos = go.transform.position;
                         string held = ReadHeldItem(go);
+                        // **厨师归属哪个玩家** —— 这是决定用哪套键盘的唯一权威依据。
+                        // 依据 ClientInputTransmitter.Setup(): iD = GetComponent<PlayerIDProvider>().GetID()
+                        // Player.One → 键盘左半(SplitPadHost) → WASD
+                        // Player.Two → 键盘右半(SplitPadGuest) → 方向键
+                        // 注意: 这里的 chefCount 只是"枚举序号", 与 Player 编号**没有必然关系**。
+                        string player = ReadPlayerId(go);
+                        // **是否正在死亡重生** —— 这期间按键完全无效(游戏接管了角色)。
+                        // 依据 PlayerControls.cs:303 的 public 字段 m_bRespawning:
+                        //   置 true 于 ClientPlayerRespawnBehaviour.cs:112, 置 false 于 :165(在 ResumeMovement 之后)。
+                        // 脚本必须据此"松手等", 否则只会一直按键却推不动人(实测表现为"卡住 + 超时")。
+                        string respawning = ReadRespawning(go);
                         if (chefCount > 0)
                             chefs.Append(",");
                         chefs.Append(string.Format(
-                            "{{\"id\":{0},\"name\":\"{1}\",\"x\":{2:F2},\"y\":{3:F2},\"z\":{4:F2},\"held\":\"{5}\"}}",
-                            chefCount, SafeName(go.name), pos.x, pos.y, pos.z, held));
+                            "{{\"id\":{0},\"seq\":{0},\"player\":\"{1}\",\"name\":\"{2}\",\"x\":{3:F2},\"y\":{4:F2},\"z\":{5:F2},\"held\":\"{6}\",\"respawning\":{7}}}",
+                            chefCount, player, SafeName(go.name), pos.x, pos.y, pos.z, held, respawning));
                         chefCount++;
                     }
                 }
                 catch (Exception) { }
             }
             return "[" + chefs + "]";
+        }
+
+        /// <summary>读厨师是不是正在死亡重生中(PlayerControls.m_bRespawning, public bool 字段)。
+        /// 重生全程约 m_respawnTime(5s) + m_particleTime(1s); 这期间发任何键都没用。</summary>
+        private static string ReadRespawning(GameObject chefGo)
+        {
+            try
+            {
+                var pcType = FindType("PlayerControls");
+                if (pcType == null)
+                    return "false";
+                var comp = chefGo.GetComponent(pcType);
+                if (comp == null)
+                    return "false";
+                var f = pcType.GetField("m_bRespawning");
+                if (f == null)
+                    return "false";
+                var v = f.GetValue(comp);
+                return (v is bool && (bool)v) ? "true" : "false";
+            }
+            catch (Exception) { }
+            return "false";
+        }
+
+        /// <summary>读厨师归属的玩家(PlayerIDProvider.GetID() → Player.One/Two/…)。
+        /// 这才是"该给它发哪套键"的依据; 枚举序号 id 不可靠。</summary>
+        private static string ReadPlayerId(GameObject chefGo)
+        {
+            try
+            {
+                var pt = FindType("PlayerIDProvider");
+                if (pt == null)
+                    return "";
+                var provider = chefGo.GetComponent(pt);
+                if (provider == null)
+                    return "";
+                var m = pt.GetMethod("GetID");
+                if (m == null)
+                    return "";
+                var v = m.Invoke(provider, null);
+                return v == null ? "" : v.ToString();
+            }
+            catch (Exception) { }
+            return "";
         }
 
         /// <summary>正在烹饪的物体: 进度/状态/是否烧焦/需要的灶台。
