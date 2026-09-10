@@ -108,16 +108,14 @@ namespace Overcooked2AI.Game
                         // Player.Two → 键盘右半(SplitPadGuest) → 方向键
                         // 注意: 这里的 chefCount 只是"枚举序号", 与 Player 编号**没有必然关系**。
                         string player = ReadPlayerId(go);
-                        // **是否正在死亡重生** —— 这期间按键完全无效(游戏接管了角色)。
-                        // 依据 PlayerControls.cs:303 的 public 字段 m_bRespawning:
-                        //   置 true 于 ClientPlayerRespawnBehaviour.cs:112, 置 false 于 :165(在 ResumeMovement 之后)。
-                        // 脚本必须据此"松手等", 否则只会一直按键却推不动人(实测表现为"卡住 + 超时")。
-                        string respawning = ReadRespawning(go);
+                        // **现在能不能指挥得动这个厨师** —— 见 ReadControl。
+                        // 只判 respawning 不够: 过场压制、喷灭火器(scale=0) 也一样按不动。
+                        string control = ReadControl(go);
                         if (chefCount > 0)
                             chefs.Append(",");
                         chefs.Append(string.Format(
-                            "{{\"id\":{0},\"seq\":{0},\"player\":\"{1}\",\"name\":\"{2}\",\"x\":{3:F2},\"y\":{4:F2},\"z\":{5:F2},\"held\":\"{6}\",\"respawning\":{7}}}",
-                            chefCount, player, SafeName(go.name), pos.x, pos.y, pos.z, held, respawning));
+                            "{{\"id\":{0},\"seq\":{0},\"player\":\"{1}\",\"name\":\"{2}\",\"x\":{3:F2},\"y\":{4:F2},\"z\":{5:F2},\"held\":\"{6}\",{7}}}",
+                            chefCount, player, SafeName(go.name), pos.x, pos.y, pos.z, held, control));
                         chefCount++;
                     }
                 }
@@ -126,26 +124,67 @@ namespace Overcooked2AI.Game
             return "[" + chefs + "]";
         }
 
-        /// <summary>读厨师是不是正在死亡重生中(PlayerControls.m_bRespawning, public bool 字段)。
-        /// 重生全程约 m_respawnTime(5s) + m_particleTime(1s); 这期间发任何键都没用。</summary>
-        private static string ReadRespawning(GameObject chefGo)
+        /// <summary>读厨师"现在能不能被指挥"(PlayerControls 的几个 public 成员)。
+        ///
+        /// respawning / suppressed / scale 三者任何一个不满足, 发方向键都是白费:
+        ///   · m_bRespawning  public 字段        (PlayerControls.cs:303-304)
+        ///   · IsSuppressed() public 方法        (:494-497, 过场/表情/重生期间被压制)
+        ///   · MovementScale  public 属性        (:390, 喷灭火器时被设成 0 完全不能动)
+        /// 只判 respawning 是不够的 —— 这是之前"按键看似有效、导航却原地不动"的隐藏原因之一。</summary>
+        private static string ReadControl(GameObject chefGo)
         {
             try
             {
                 var pcType = FindType("PlayerControls");
                 if (pcType == null)
-                    return "false";
+                    return "";
                 var comp = chefGo.GetComponent(pcType);
                 if (comp == null)
-                    return "false";
-                var f = pcType.GetField("m_bRespawning");
-                if (f == null)
-                    return "false";
-                var v = f.GetValue(comp);
-                return (v is bool && (bool)v) ? "true" : "false";
+                    return "";
+                bool respawning = false;
+                var fr = pcType.GetField("m_bRespawning");
+                if (fr != null)
+                {
+                    var v = fr.GetValue(comp);
+                    respawning = v is bool && (bool)v;
+                }
+                bool suppressed = false;
+                try
+                {
+                    var m = pcType.GetMethod("IsSuppressed");
+                    if (m != null)
+                    {
+                        var v = m.Invoke(comp, null);
+                        suppressed = v is bool && (bool)v;
+                    }
+                }
+                catch (Exception) { }
+                float scale = 1f;
+                try
+                {
+                    var p = pcType.GetProperty("MovementScale");
+                    if (p != null)
+                    {
+                        var v = p.GetValue(comp, null);
+                        if (v is float)
+                            scale = (float)v;
+                    }
+                }
+                catch (Exception) { }
+                var beh = comp as Behaviour;
+                bool enabled = beh == null || beh.enabled;
+                bool can = enabled && !respawning && !suppressed && scale > 0.01f;
+
+                return string.Format(
+                    System.Globalization.CultureInfo.InvariantCulture,
+                    "\"respawning\":{0},\"suppressed\":{1},\"scale\":{2:F2},\"canmove\":{3}",
+                    respawning ? "true" : "false",
+                    suppressed ? "true" : "false",
+                    scale,
+                    can ? "true" : "false");
             }
             catch (Exception) { }
-            return "false";
+            return "";
         }
 
         /// <summary>读厨师归属的玩家(PlayerIDProvider.GetID() → Player.One/Two/…)。

@@ -37,8 +37,13 @@ class Engine:
         self.mode_state = mode_state   # 三模式的个体状态(py/modes/); None=纯合作不捣蛋
         self.arrive = 1.8          # 交互半径
         self.step_timeout = 25.0   # 单步超时(秒)
-        self.tap_hold = 0.12       # 单次方向键按住时长
+        self.tap_hold = 0.12       # 单次方向键按住时长(保留给固定步长用)
         self.tap_gap = 0.05        # 方向键间隔
+        # 精确运动学(反编译标定): PlayerControls.Movement.RunSpeed = 4f (PlayerControls.cs:28),
+        # 平地水平速度每帧直接赋值 ⇒ 无加速度/惯性/刹车 ⇒ 位移 = 4 × 按住秒数。
+        # 乘 0.9 留余量, 宁可多按几次也别冲过头(冲过头就会在目标两侧来回震)。
+        self.speed = 4.0 * 0.9     # 有效推进速度 (u/s)
+        self.max_hold = 0.6        # 单次按键最长按住时长(秒) —— 闭环分多次走, 单次别冲太远
         self.know: Knowledge | None = None
         self.scene = ""
         self.assemble_spot: Station | None = None   # 组装台面(放容器的地方)
@@ -241,7 +246,15 @@ class Engine:
                         d = "up" if dz > 0 else "down"
 
                 key = {"left": "A", "right": "D", "up": "W", "down": "S"}[d]
-                hold = self.tap_hold if dist > 2.0 else max(0.06, self.tap_hold * dist / 2.0)
+                # 按住时长直接由运动学算, 不再靠猜。
+                # 依据: PlayerControls.Movement.RunSpeed = 4f (PlayerControls.cs:28), 且平地
+                # 水平速度是**每帧直接赋值**的(ClientPlayerControlsImpl_Default.cs:414,433-435)
+                # —— 没有加速度、没有惯性、没有刹车, 所以 位移 = 4 × 按住秒数, 1 格(1.2u)=0.30s。
+                # 旧代码固定 tap_hold=0.12 猜: 远了走不到、近了冲过头, 于是来回震。
+                # 一次只推**主导轴**, 所以按主导轴上的距离算。
+                step_dist = max(abs(dx), abs(dz))
+                hold = step_dist / self.speed
+                hold = max(0.05, min(self.max_hold, hold))
                 key_down(key)
                 time.sleep(hold)
                 key_up(key)

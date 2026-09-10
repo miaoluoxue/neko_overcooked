@@ -101,6 +101,10 @@ class BridgeClient:
         """整张关卡网格 + 危险区 + 空洞 + 平台。见 py/terrain.py 的 TerrainMap。"""
         return self._send({"cmd": "map", "arg": "force" if force else ""})
 
+    def get_dyn(self) -> dict:
+        """关卡里的机关/陷阱: 按钮 / 传送带方向 / 触发机器 / 平台 / 正在烧的东西 / 关卡变形。"""
+        return self._send({"cmd": "dyn"})
+
     def send_action(self, chef: int, kind: str, target: str = "", duration: float = 0.0) -> dict:
         return self._send({"cmd": "action", "chef": chef, "kind": kind,
                            "target": target, "duration": duration})

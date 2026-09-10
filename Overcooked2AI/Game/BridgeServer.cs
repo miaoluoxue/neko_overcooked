@@ -130,6 +130,9 @@ namespace Overcooked2AI.Game
             // 关卡地图: 整张原生网格 + 危险区(水面/岩浆/边界) + 空洞 + 平台
             if (line.Contains("\"map\""))
                 return _collector.RequestJob("map", 8000, GetStr(line, "arg", ""));
+            // 机关/陷阱: 按钮 / 传送带方向 / 触发机器 / 平台 / 火 / 关卡变形
+            if (line.Contains("\"dyn\""))
+                return _collector.RequestJob("dyn", 8000);
             if (line.Contains("\"pad\""))
                 return HandlePad(line);
             if (line.Contains("\"action\""))

@@ -66,6 +66,16 @@ def calibrate(up_moved_pos_z: bool):
 # 厨房是 1.2 单位的格子制(实测: 灶台 10.8/12.0/13.2、切菜板 4.8/6.0 间隔都是 1.2)
 GRID = 1.2
 
+# 玩家运动学(反编译标定, 用于把"要走的距离"换算成"要按住多久"):
+#   PlayerControls.Movement.RunSpeed = 4f                        (PlayerControls.cs:28)
+#   平地且脚下无 PlayerPhysicsSurface 时, 水平速度每 1/60 秒被**直接赋值**
+#     (ClientPlayerControlsImpl_Default.cs:414, 433-435)
+#   ⇒ 没有加速度、没有惯性、没有刹车 ⇒ 位移 = 4 × 按住秒数
+#   ⇒ 1 格(1.2u) 正好 0.30 秒
+# 注意位移方向取自**输入向量**, 与厨师朝向无关, 所以不需要先转身。
+PLAYER_SPEED = 4.0
+CELL_SECONDS = GRID / PLAYER_SPEED      # 0.30 s/格
+
 
 def to_grid(x: float, z: float, step: float = GRID) -> tuple:
     return (int(round(x / step)), int(round(z / step)))

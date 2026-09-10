@@ -89,6 +89,41 @@ def main() -> int:
             len(danger), min(xs), max(xs), min(zs), max(zs)))
     else:
         print("这一关没有危险格 —— 脚本可以放心直走。")
+
+    # 机关/陷阱: 静态网格看不见的那一层
+    try:
+        dyn = b.get_dyn()
+    except Exception as e:
+        print("\n(机关扫描不可用: %s)" % e)
+        return 0
+    c = dyn.get("counts") or {}
+    print("\n================ 机关 / 陷阱 ================")
+    print("按钮%d  传送带%d  触发机器%d  平台%d  着火%d  关卡变形%d" % (
+        int(c.get("buttons") or 0), int(c.get("conveyors") or 0), int(c.get("triggers") or 0),
+        int(c.get("platforms") or 0), int(c.get("fires") or 0), int(c.get("transitions") or 0)))
+
+    for x in dyn.get("buttons") or []:
+        print("  [按钮] %-14s (%6.2f,%6.2f)  此刻可按=%s" % (
+            x.get("type"), float(x.get("x") or 0), float(x.get("z") or 0), x.get("pressable")))
+    for x in dyn.get("conveyors") or []:
+        print("  [传送带] %-14s (%6.2f,%6.2f) 开=%s 朝向=%s 速度=%.2f 推送=(%+.2f,%+.2f)" % (
+            x.get("type"), float(x.get("x") or 0), float(x.get("z") or 0), x.get("on"),
+            x.get("dir"), float(x.get("speed") or 0),
+            float(x.get("vx") or 0), float(x.get("vz") or 0)))
+    for x in dyn.get("platforms") or []:
+        print("  [平台] %-14s (%6.2f,%6.2f) %s" % (
+            x.get("type"), float(x.get("x") or 0), float(x.get("z") or 0), x.get("name")))
+    for x in dyn.get("fires") or []:
+        print("  [着火] %-14s (%6.2f,%6.2f)" % (
+            x.get("type"), float(x.get("x") or 0), float(x.get("z") or 0)))
+    for x in dyn.get("transitions") or []:
+        print("  [变形] %-30s (%6.2f,%6.2f) flags=%s" % (
+            x.get("type"), float(x.get("x") or 0), float(x.get("z") or 0), x.get("flags")))
+    for x in (dyn.get("triggers") or [])[:40]:
+        print("  [触发] %-24s (%6.2f,%6.2f) 开=%s" % (
+            x.get("type"), float(x.get("x") or 0), float(x.get("z") or 0), x.get("on")))
+    if len(dyn.get("triggers") or []) > 40:
+        print("  ... 另有 %d 个触发机器未列出" % (len(dyn["triggers"]) - 40))
     return 0
 
 

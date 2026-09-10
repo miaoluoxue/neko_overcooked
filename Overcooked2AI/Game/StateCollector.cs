@@ -80,6 +80,8 @@ namespace Overcooked2AI.Game
                     json = NavPath.PathFromArg(arg);
                 else if (kind == "map")
                     json = LevelInfo.Snapshot(arg);
+                else if (kind == "dyn")
+                    json = InteractiveScan.Snapshot();
                 else
                     json = "{\"error\":\"unknown job\"}";
             }
