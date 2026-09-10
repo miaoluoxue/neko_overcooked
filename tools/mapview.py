@@ -18,8 +18,8 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _ROOT)
 sys.path.insert(0, os.path.join(_ROOT, "py"))
 
-from py.bridge.client import BridgeClient          # noqa: E402
-from py.terrain import TerrainMap                  # noqa: E402
+from py.bridge.client import BridgeClient, BridgeError   # noqa: E402
+from py.terrain import TerrainMap                        # noqa: E402
 
 LEGEND = """
 图例:  .  可走        #  被墙/橱柜/台面占住
@@ -42,8 +42,12 @@ def main() -> int:
             return 2
 
     b = BridgeClient()
-    if not b.connect(retries=2):
-        print("桥连不上 —— 游戏没开, 或者插件没加载")
+    try:
+        if not b.connect(retries=2):
+            print("桥连不上 —— 游戏没开, 或者插件没加载")
+            return 1
+    except BridgeError:
+        print("桥连不上 —— 游戏没开, 或者插件没加载(端口 48778 没人监听)")
         return 1
 
     st = b.get_state()
