@@ -1,4 +1,4 @@
-"""自动做菜引擎: 以"当前订单"驱动, 按游戏真实机制执行完整流程。
+﻿"""自动做菜引擎: 以"当前订单"驱动, 按游戏真实机制执行完整流程。
 
 关键机制(全部反编译确认, 不是猜的):
   · 送餐口 = PlateStation —— 把"装了菜的容器"放上去才触发送餐
@@ -43,6 +43,7 @@ class Engine:
         self.scene = ""
         self.assemble_spot: Station | None = None   # 组装台面(放容器的地方)
         self._stove_used = ""                        # 当前占用的灶台(用完释放)
+        self._probed = False                         # 是否已实测过键位归属
 
     # ---------------- 状态 ----------------
     def state(self) -> dict | None:
@@ -230,7 +231,44 @@ class Engine:
         ax, az = (serve.x, serve.z) if serve else (x, z)
         return min(cands, key=lambda s: (s.x - ax) ** 2 + (s.z - az) ** 2)
 
-    # ---------------- 三模式：把"失误/捣蛋"演出来 ----------------
+    # ---------------- 键位自动探测 ----------------
+    def probe_bindings(self, candidates=None) -> dict | None:
+        """**实测**哪一套键位能驱动我这个厨师（cid）。
+
+        为什么必须实测: 厨师 id 来自 `PlayerControls` 的枚举顺序, 与"键盘左半/右半"
+        没有必然对应 —— 实测遇到过 `cid=0` 其实归「方向键」那一路、而 WASD 完全
+        没绑定到任何玩家的情况。靠假设选错键位, 表现就是"发了一堆按键但人一动不动"。
+        """
+        from bridge.keyboard_input import PLAYER1, PLAYER2, activate_game, key_down, key_up
+        cands = candidates or [("P1(WASD)", PLAYER1), ("P2(方向键)", PLAYER2)]
+        st = self.state()
+        p0 = self.pos(st) if st else (None, None, "")
+        if p0[0] is None:
+            self.log("[键位] 探测失败: 读不到厨师位置")
+            return None
+        if not activate_game():
+            self.log("[键位] 探测失败: 拿不到前台")
+            return None
+        for label, b in cands:
+            for key in (b["up"], b["down"], b["left"], b["right"]):
+                key_down(key)
+                time.sleep(0.22)
+                key_up(key)
+                time.sleep(0.18)
+                p1 = self.pos(self.state())
+                if p1[0] is None:
+                    continue
+                if abs(p1[0] - p0[0]) > 0.05 or abs(p1[1] - p0[1]) > 0.05:
+                    self.log(f"[键位] 探测到可用键位: {label} (按 {key} 使 "
+                             f"P{self.cid + 1} 从 ({p0[0]:.1f},{p0[1]:.1f}) 移到 "
+                             f"({p1[0]:.1f},{p1[1]:.1f}))")
+                    self.kb = KeyboardPlayer(b)
+                    return b
+        self.log(f"[键位] ⚠ 两套键位都驱动不了 P{self.cid + 1} —— "
+                 f"检查: 该玩家是否已加入? 窗口是否真前台?")
+        return None
+
+
     def _urgency(self) -> float:
         """局面紧急度 0..1（订单剩余时间越少越大）—— 供"情境收敛"用（v1 §5.1）。"""
         try:
@@ -520,15 +558,18 @@ class Engine:
                 # 两条路都规划不出来 → 退回直线冲一次
                 return self.navigate(tx, tz, tight=tight)
 
-            ok = True
+            # 逐格走。关键: **某个路径点走不到不该让整条路径失败** ——
+            # 实测 GridNavSpace 的末点常落在台子碰撞体边缘(如 (-1.2,3.6) 紧贴 serve0),
+            # 人物理上过不去, 但那时通常已经站在目标旁边了(距台子 1 格, 交互半径 1.8 够得着)。
             for (px, pz) in pts:
                 if (px - x) ** 2 + (pz - z) ** 2 < 0.09:
                     continue                      # 起点附近的点不用专门走
-                if not self.navigate(px, pz, arrive=0.6, step_timeout=8.0):
-                    ok = False
-                    break
-            if ok:
-                return self.navigate(tx, tz, arrive=1.4, tight=tight)
+                if not self.navigate(px, pz, arrive=0.9, step_timeout=6.0):
+                    self.log(f"[导航] 路径点 ({px:.1f},{pz:.1f}) 到不了, 继续下一个")
+                    continue                       # 跳过去, 别把整条路径判死
+                x, z = px, pz
+            # 最后朝真实目标靠一次(宽松到达即可, 交互判定另算)
+            return self.navigate(tx, tz, arrive=1.4, tight=tight)
         return False
 
     def _game_path(self, tx: float, tz: float) -> list:
@@ -866,6 +907,11 @@ class Engine:
                 self.log("[引擎] --dry: 只打印计划, 不执行")
                 time.sleep(3)
                 continue
+
+            # 进入对局后**实测**一次键位归属(厨师 id 未必对应键盘左/右半区)
+            if not self._probed:
+                self._probed = True
+                self.probe_bindings()
 
             if self.execute(flow):
                 self.log(f"[引擎] ★ 完成 {name}")
