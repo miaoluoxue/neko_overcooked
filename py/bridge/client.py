@@ -1,0 +1,98 @@
+"""桥 client: 连游戏内 C# TCP server, 拉状态/发动作。行协议: 每行一个 JSON。"""
+
+from __future__ import annotations
+
+import json
+import socket
+import time
+
+
+class BridgeError(Exception):
+    pass
+
+
+class BridgeClient:
+    """与 C# 薄桥的 TCP 连接。断线自动重连。"""
+
+    def __init__(self, host="127.0.0.1", port=48778, timeout=3.0, log=print):
+        self.host = host
+        self.port = port
+        self.timeout = timeout
+        self.log = log
+        self._sock: socket.socket | None = None
+        self._file = None
+
+    # ---- 连接 ----
+    def connect(self, retries=999, interval=2.0) -> bool:
+        """阻塞重试直到连上(游戏没开也能等)。返回 True。"""
+        n = 0
+        while True:
+            try:
+                self._sock = socket.create_connection((self.host, self.port), timeout=self.timeout)
+                self._sock.settimeout(self.timeout)
+                self._file = self._sock.makefile("rw", encoding="utf-8", newline="\n")
+                self.log("[桥] 已连接 C# 薄桥")
+                return True
+            except OSError:
+                n += 1
+                if retries is not None and n >= retries:
+                    raise BridgeError("连不上桥")
+                time.sleep(interval)
+
+    def close(self):
+        try:
+            if self._file:
+                self._file.close()
+            if self._sock:
+                self._sock.close()
+        finally:
+            self._file = None
+            self._sock = None
+
+    def reconnect(self):
+        self.close()
+        self.connect(retries=None)
+
+    # ---- 协议 ----
+    def _send(self, payload: dict) -> dict:
+        if self._sock is None:
+            raise BridgeError("未连接")
+        line = json.dumps(payload, ensure_ascii=False)
+        try:
+            self._sock.sendall((line + "\n").encode("utf-8"))
+            resp = self._file.readline()
+            if not resp:
+                raise BridgeError("桥返回空(可能掉线)")
+            return json.loads(resp)
+        except (OSError, ValueError) as exc:
+            self.log(f"[桥] 通信失败: {exc}")
+            raise BridgeError(str(exc)) from exc
+
+    def ping(self) -> bool:
+        try:
+            return bool(self._send({"cmd": "ping"}).get("pong"))
+        except BridgeError:
+            return False
+
+    def get_state(self) -> dict:
+        return self._send({"cmd": "state"})
+
+    def get_raw(self) -> dict:
+        """全量物体组件清单(带 Collider 的物体 + 其游戏自定义组件 + 台面物品)。"""
+        return self._send({"cmd": "raw"})
+
+    def get_live_orders(self) -> dict:
+        """当前挂在订单栏上的订单(含剩余时间比例 t)。"""
+        return self._send({"cmd": "live"})
+
+    def get_knowledge(self) -> dict:
+        """食材知识表: 每个食材/箱子/厨具的加工方式(切/煮/出什么)。"""
+        return self._send({"cmd": "know"})
+
+    def get_path(self, tx: float, tz: float, chef: int = 0) -> dict:
+        """问**游戏自己**的寻路网格(GridNavSpace): 边界/橱柜/墙壁全都算障碍。"""
+        return self._send({"cmd": "path", "chef": chef, "tx": tx, "tz": tz})
+
+    def send_action(self, chef: int, kind: str, target: str = "", duration: float = 0.0) -> dict:
+        return self._send({"cmd": "action", "chef": chef, "kind": kind,
+                           "target": target, "duration": duration})

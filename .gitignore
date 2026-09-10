@@ -1,0 +1,8 @@
+﻿# 构建产物与缓存
+build/
+__pycache__/
+*.pyc
+tools/BepInEx_x86/
+tools/ref/
+*.log
+_sec*.md

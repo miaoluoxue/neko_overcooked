@@ -1,0 +1,15 @@
+{
+  "version": 2,
+  "dgSpecHash": "ZJ2dqHqSJxc=",
+  "success": false,
+  "projectFilePath": "E:\\pythonxx\\tkry\\git同步\\neko_overcooked\\Overcooked2AI\\Overcooked2AI.csproj",
+  "expectedPackageFiles": [],
+  "logs": [
+    {
+      "code": "NU1301",
+      "level": "Error",
+      "message": "无法加载源 https://api.nuget.org/v3/index.json 的服务索引。",
+      "libraryId": "Microsoft.NETFramework.ReferenceAssemblies"
+    }
+  ]
+}
