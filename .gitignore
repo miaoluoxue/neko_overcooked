@@ -11,6 +11,13 @@ tools/ref/
 *.log
 _sec*.md
 
+# 凭据 / 令牌 —— 绝对不允许进仓库
+*令牌*
+github_pat_*
+.git-credentials*
+*.credentials
+token.txt
+
 # 反编译得到的游戏源码 —— 属于 Team17 的专有代码, 不随仓库分发。
 # 需要的话请用你拥有的正版游戏自行生成, 命令见 README「重新生成反编译源码」。
 overcooked_decomp/
