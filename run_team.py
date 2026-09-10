@@ -1,4 +1,4 @@
-"""双人自动做菜: 两个独立的个体各跑一个引擎循环, 共享一块订单黑板。
+﻿"""双人自动做菜: 两个独立的个体各跑一个引擎循环, 共享一块订单黑板。
 
 P1 用 WASD + 左Shift/左Ctrl/左Alt,  P2 用 方向键 + 右Shift/右Ctrl/右Alt
 —— 走的是游戏自带的分屏双键盘, 不需要任何驱动或虚拟手柄(可移植)。
@@ -23,9 +23,10 @@ from bridge.client import BridgeClient              # noqa: E402
 from bridge.keyboard_input import PLAYER1, PLAYER2  # noqa: E402
 from engine import Engine                           # noqa: E402
 from team import OrderBoard                         # noqa: E402
+from modes import Roster, parse_mode_spec           # noqa: E402
 
 
-def worker(cid: int, bindings: dict, board: OrderBoard, dry: bool):
+def worker(cid: int, bindings: dict, board: OrderBoard, dry: bool, roster):
     tag = f"P{cid + 1}"
 
     def log(*a):
@@ -35,7 +36,10 @@ def worker(cid: int, bindings: dict, board: OrderBoard, dry: bool):
     if not bridge.connect(retries=None, interval=2.0):
         log("连不上桥")
         return
-    eng = Engine(bridge, cid=cid, bindings=bindings, board=board, log=log)
+    st = roster.get(cid)
+    log(f"模式={st.mode.value}")
+    eng = Engine(bridge, cid=cid, bindings=bindings, board=board, log=log,
+                 mode_state=st)
     try:
         eng.run(dry=dry)
     except KeyboardInterrupt:
@@ -49,6 +53,7 @@ def worker(cid: int, bindings: dict, board: OrderBoard, dry: bool):
             pass
         bridge.close()
         board.release_all(cid)
+        log(f"退出统计: {st.summary()}")
         log("已退出")
 
 
@@ -68,7 +73,7 @@ def main() -> int:
 
     threads = []
     for cid, bindings in players:
-        t = threading.Thread(target=worker, args=(cid, bindings, board, args.dry),
+        t = threading.Thread(target=worker, args=(cid, bindings, board, args.dry, roster),
                              daemon=True, name=f"chef{cid}")
         t.start()
         threads.append(t)

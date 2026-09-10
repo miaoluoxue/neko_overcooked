@@ -27,12 +27,14 @@ COOK_SEMS = ("hob", "oven", "fryer", "firepit", "barbeque", "floorburner", "flam
 
 
 class Engine:
-    def __init__(self, bridge, cid=0, bindings=None, log=print, board=None):
+    def __init__(self, bridge, cid=0, bindings=None, log=print, board=None,
+                 mode_state=None):
         self.bridge = bridge
         self.cid = cid
         self.kb = KeyboardPlayer(bindings or PLAYER1)
         self.log = log
         self.board = board       # 双人时的订单黑板(单人传 None)
+        self.mode_state = mode_state   # 三模式的个体状态(py/modes/); None=纯合作不捣蛋
         self.arrive = 1.8          # 交互半径
         self.step_timeout = 25.0   # 单步超时(秒)
         self.tap_hold = 0.12       # 单次方向键按住时长
@@ -227,6 +229,92 @@ class Engine:
         serve = km.nearest("serve", x, z)
         ax, az = (serve.x, serve.z) if serve else (x, z)
         return min(cands, key=lambda s: (s.x - ax) ** 2 + (s.z - az) ** 2)
+
+    # ---------------- 三模式：把"失误/捣蛋"演出来 ----------------
+    def _urgency(self) -> float:
+        """局面紧急度 0..1（订单剩余时间越少越大）—— 供"情境收敛"用（v1 §5.1）。"""
+        try:
+            orders = self.live_orders()
+        except Exception:
+            return 0.0
+        if not orders:
+            return 0.0
+        left = min(float(o.get("t", 1.0)) for o in orders)
+        return max(0.0, min(1.0, 1.0 - left))
+
+    def _apply_mischief(self, m, km, st) -> None:
+        """演一次失误/捣蛋。**只做小动作，不改变流程控制**（做完照常继续）。
+
+        形态与强度对齐 v1 §5.1：轻=挡路/慢，中=半成品放错台，重=倒队友菜/烧糊。
+        """
+        from modes import Mischief
+        x, z, held = self.pos(st)
+        if x is None:
+            return
+
+        if m == Mischief.DAZE:                      # 轻：发呆一拍
+            time.sleep(1.2)
+        elif m == Mischief.SLOW:                    # 轻：磨蹭
+            time.sleep(0.9)
+        elif m == Mischief.DETOUR:                  # 轻：绕远路
+            far = max(km.stations.values(),
+                      key=lambda s: (s.x - x) ** 2 + (s.z - z) ** 2)
+            self.navigate_smart(km, far.x, far.z, tight=1.2)
+        elif m == Mischief.OVER_CHOP:               # 中：多切几刀
+            for _ in range(3):
+                self.kb.chop()
+                time.sleep(0.3)
+        elif m == Mischief.WRONG_SPOT:              # 中：手上东西丢到别处
+            if held:
+                spot = self.pick_assemble_spot(km, x, z)
+                if spot is not None:
+                    self.navigate_smart(km, spot.x, spot.z, tight=0.6)
+                    self.interact("pickup", verify_hold_change=False)
+        elif m == Mischief.FORGET_PLATE:            # 中：跑去看一眼盘子又回来
+            src = self._find_item_station(km, "Plate", x, z)
+            if src is not None:
+                self.navigate_smart(km, src.x, src.z, tight=0.8)
+                time.sleep(0.6)
+        elif m == Mischief.SNACK:                   # 中：把手上的丢垃圾桶
+            b = km.nearest("bin", x, z)
+            if b is not None and held:
+                self.navigate_smart(km, b.x, b.z, tight=0.8)
+                self.interact("pickup", verify_hold_change=True)
+        elif m == Mischief.BIN_TEAMMATE:            # 重：倒队友台面上的东西
+            cands = [s for s in km.stations.values()
+                     if s.on and s.id.rstrip("0123456789") not in ("serve", "plates")]
+            b = km.nearest("bin", x, z)
+            if cands and b is not None:
+                t = min(cands, key=lambda s: (s.x - x) ** 2 + (s.z - z) ** 2)
+                self.navigate_smart(km, t.x, t.z, tight=0.8)
+                if self.interact("pickup", verify_hold_change=True):
+                    self.navigate_smart(km, b.x, b.z, tight=0.8)
+                    self.interact("pickup", verify_hold_change=True)
+        elif m == Mischief.BURN:                    # 重：放任灶台烧着
+            time.sleep(3.0)
+        elif m == Mischief.BLOCK:                   # 重：堵一下路
+            time.sleep(2.0)
+        time.sleep(0.2)
+
+    def _maybe_mischief(self, km, st) -> None:
+        """每个空闲决策点调一次：要不要演一次失误/捣蛋（v1 §4/§5）。"""
+        ms = self.mode_state
+        if ms is None:
+            return
+        try:
+            m = ms.roll(urgency=self._urgency())
+        except Exception as e:
+            self.log(f"[模式] 掷骰异常: {e}")
+            return
+        if m is None:
+            return
+        self.log(f"[模式] P{self.cid + 1} {ms.mode.value} → 演 {m.value}")
+        try:
+            self._apply_mischief(m, km, st)
+        except Exception as e:
+            self.log(f"[模式] 演 {m.value} 失败(忽略): {e}")
+        finally:
+            self.kb.release_all()
 
     # ---------------- 各步骤 ----------------
     @staticmethod
@@ -690,6 +778,11 @@ class Engine:
             _loc = f" @({op.at_x:.1f},{op.at_z:.1f})" if (op.at_x or op.at_z) else ""
             _chef = f"  厨师({_c0[0]:.1f},{_c0[1]:.1f}) 手持{_c0[2]!r}" if _c0[0] is not None else ""
             self.log(f"[引擎] ▶ {i+1}/{total} {op.action} {op.target}{_loc}{_chef}")
+            # 三模式：这一步开始前，先看要不要演一次失误/捣蛋（v1 §4/§5）
+            if self.mode_state is not None:
+                _km0 = self.map(_st0) if _st0 else None
+                if _km0 is not None:
+                    self._maybe_mischief(_km0, _st0)
             for attempt in range(retries + 1):
                 st = self.state()
                 if not st or not st.get("inRound"):
