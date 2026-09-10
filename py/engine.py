@@ -35,7 +35,12 @@ class Engine:
         self.log = log
         self.board = board       # 双人时的订单黑板(单人传 None)
         self.mode_state = mode_state   # 三模式的个体状态(py/modes/); None=纯合作不捣蛋
-        self.arrive = 1.8          # 交互半径
+        # 交互半径: 反编译实测是 **1.0**(到碰撞体**表面**的距离, 朝向还要在前 180° 内),
+        # 见 pathing.INTERACT_RANGE。这里 1.5 只是"导航粗到半径", 落到 1.5 之后还要靠
+        # tight 再收紧 + face() 转身, 才真正进入交互范围。
+        # (旧值 1.8 已经大于交互半径本身 —— 停在 1.8 处按键是够不着台子的。)
+        self.arrive = 1.5          # 导航粗到半径
+        self.interact_range = 1.0  # 交互半径(表面距离), 只作参考/日志
         self.step_timeout = 25.0   # 单步超时(秒)
         self.tap_hold = 0.12       # 单次方向键按住时长(保留给固定步长用)
         self.tap_gap = 0.05        # 方向键间隔
@@ -263,6 +268,54 @@ class Engine:
             self.kb.release_all()
 
     # ---------------- 交互 ----------------
+    def face(self, tx: float, tz: float, hold: float = 0.10) -> bool:
+        """朝目标方向轻点一下方向键, 把厨师**转过去**(顺带贴近一点)。
+
+        为什么非做不可(反编译依据):
+          PlayerControls.FindNearbyObjects (PlayerControls.cs:745) 调用
+            InteractWithItemHelper.GetCollidersInArc(1f, PI, m_Transform, ...)
+          其中 IsColliderInArc (InteractWithItemHelper.cs:153-163) 的判定是
+            Dot(_forward, 指向目标的向量) >= cos(arc/2) == cos(PI/2) == 0
+          —— **只认"朝向前方 180° 半圆"内的东西**。
+        而厨师的面朝方向 = 它**最后一次移动的方向**(位移方向取自输入向量, 与朝向解耦)。
+        所以从台子另一侧走过去、或者绕了个弯过来, 面朝很可能是背对的 ——
+        这时按键完全没反应, 而日志只会显示"持有物未变", 看起来像交互坏了。
+
+        位移方向与朝向无关 ⇒ 轻点一下就能转头, 不需要大动作。
+        """
+        from pathing import dir_for_step
+        from bridge.keyboard_input import key_down, key_up
+        st = self.state()
+        if not st or not st.get("inRound"):
+            return False
+        x, z, _ = self.pos(st)
+        if x is None:
+            return False
+        dx, dz = tx - x, tz - z
+        dist = (dx * dx + dz * dz) ** 0.5
+        if dist < 0.05:
+            return True
+
+        # 别为了转身把自己送进危险格(转身会实际位移 0.4 格左右)
+        tm = self.terrain()
+        if tm is not None and tm.ok:
+            look = min(0.6, dist)
+            nx = x + dx / dist * look
+            nz = z + dz / dist * look
+            if tm.is_danger_world(nx, nz):
+                self.log("[朝向] 目标方向是危险格, 不转身")
+                return False
+
+        d = dir_for_step(dx, dz, deadzone=0.02)
+        if not d:
+            return True
+        key = {"left": "A", "right": "D", "up": "W", "down": "S"}[d]
+        key_down(key)
+        time.sleep(hold)
+        key_up(key)
+        time.sleep(0.08)
+        return True
+
     def interact(self, kind: str = "pickup", verify_hold_change=True) -> bool:
         st = self.state()
         if not st or not st.get("inRound"):
@@ -735,8 +788,12 @@ class Engine:
                     self.log(f"[导航] 路径点 ({px:.1f},{pz:.1f}) 到不了, 继续下一个")
                     continue                       # 跳过去, 别把整条路径判死
                 x, z = px, pz
-            # 最后朝真实目标靠一次(宽松到达即可, 交互判定另算)
-            return self.navigate(tx, tz, arrive=1.4, tight=tight)
+            # 最后朝真实目标靠一次(宽松到达即可), 并且**转过去面对它** ——
+            # 交互判定是朝向敏感的(只认前方 180° 半圆), 背对着按交互键等于没按。
+            ok = self.navigate(tx, tz, arrive=1.4, tight=tight)
+            if ok:
+                self.face(tx, tz)
+            return ok
         return False
 
     def _game_path(self, tx: float, tz: float) -> list:

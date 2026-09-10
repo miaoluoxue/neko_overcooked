@@ -76,6 +76,16 @@ GRID = 1.2
 PLAYER_SPEED = 4.0
 CELL_SECONDS = GRID / PLAYER_SPEED      # 0.30 s/格
 
+# 交互半径(反编译标定, 必须记住, 否则会"走过去却拿不到东西"):
+#   PlayerControls.FindNearbyObjects (PlayerControls.cs:745)
+#     → InteractWithItemHelper.GetCollidersInArc(1f, Mathf.PI, ...)
+#   · 半径 = **1.0**, 量的是到**碰撞体表面**的距离(不是到物体中心)
+#   · 角度 = PI, 判定是 Dot(forward, 指向目标) >= cos(PI/2) == 0
+#     ⇒ **只认朝向前方 180° 半圆** —— 背对着按交互键完全无效
+#   台面宽 1.2(半宽 0.6), 所以站在相邻格中心(距中心 1.2 → 距表面 0.6)是够得着的;
+#   但停在 1.8 格(距中心 1.8 → 距表面 1.2)就**超出**了。
+INTERACT_RANGE = 1.0
+
 
 def to_grid(x: float, z: float, step: float = GRID) -> tuple:
     return (int(round(x / step)), int(round(z / step)))
