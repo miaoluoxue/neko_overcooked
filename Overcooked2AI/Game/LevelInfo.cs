@@ -32,6 +32,7 @@ namespace Overcooked2AI.Game
     ///   'F'  被 "Hazard" 占用(火焰)     'P'  被 "MovingPlatform" 占用(会动, 能站)
     ///   'T'  被 "Travelator" 占用(传送带)'H'  危险区(水面/岩浆) —— 空着, 但踩上去会死
     ///   'V'  空洞(空着, 但脚下没地面)
+    ///   'v'  地板太低(单向落差 / 正在下沉的平台, 例如会沉的荷叶)
     /// </summary>
     public static class LevelInfo
     {
@@ -170,7 +171,8 @@ namespace Overcooked2AI.Game
 
             // ---- 第二遍: 出字符 ----
             var sb = new StringBuilder(total);
-            int nFree = 0, nBlocked = 0, nHaz = 0, nVoid = 0, nPlat = 0, nTravel = 0, nFire = 0;
+            int nFree = 0, nBlocked = 0, nHaz = 0, nVoid = 0, nVoidLow = 0,
+                nPlat = 0, nTravel = 0, nFire = 0;
             for (int n = 0; n < total; n++)
             {
                 char ch;
@@ -182,13 +184,14 @@ namespace Overcooked2AI.Game
                 {
                     ch = 'H';
                 }
-                else if (!HasFloor(xs[n], zs[n], floorY))
+                else if (IsPointHazard(xs[n], zs[n]))
                 {
-                    ch = 'V';
+                    ch = 'H';
                 }
                 else
                 {
-                    ch = '.';
+                    char fc = FloorChar(xs[n], zs[n], floorY);
+                    ch = (fc == '\0') ? '.' : fc;
                 }
 
                 sb.Append(ch);
@@ -198,6 +201,7 @@ namespace Overcooked2AI.Game
                     case '#': nBlocked++; break;
                     case 'H': nHaz++; break;
                     case 'V': nVoid++; break;
+                    case 'v': nVoidLow++; break;
                     case 'P': nPlat++; break;
                     case 'T': nTravel++; break;
                     case 'F': nFire++; break;
@@ -257,6 +261,7 @@ namespace Overcooked2AI.Game
              .Append(",\"blocked\":").Append(nBlocked)
              .Append(",\"hazard\":").Append(nHaz)
              .Append(",\"void\":").Append(nVoid)
+             .Append(",\"voidLow\":").Append(nVoidLow)
              .Append(",\"platform\":").Append(nPlat)
              .Append(",\"travelator\":").Append(nTravel)
              .Append(",\"fire\":").Append(nFire).Append("}");
@@ -300,16 +305,39 @@ namespace Overcooked2AI.Game
             return '#';
         }
 
-        private static bool HasFloor(float x, float z, float floorY)
+        /// <summary>这一格脚下有没有**能站**的地面。返回 '\0' 表示正常, 否则返回该格该用的字符。
+        ///
+        /// 两条判定, 第二条是踩过坑之后加的:
+        ///   · 射线完全打不中 → 'V' 空洞(脚下什么都没有, 掉下去)
+        ///   · 打中了但落点**明显更低** → 'v' 单向落差 / 正在下沉的平台
+        ///
+        /// 为什么必须看落点高度: **"会消失的平台"并不是被销毁的**。
+        /// 以 DLC13 的荷叶为例 —— 全工程没有 LilyPad/Lotus 类, 唯一证据是 5 条音效枚举
+        ///   DLC_13_LilyPad_{Lrg,Sml}_{Plunge,Pop,_Step}  (GameOneShotAudioTag.cs:317-321)
+        /// "Plunge"(下沉) 与 "Pop"(浮起) 成对出现, 说明它是**踩下去再浮回来的循环体**,
+        /// 物理上就是碰撞体跟着下沉动画走低。
+        /// 所以对格子打向下射线**全程都会命中** —— 只判"命中与否"的脚本会一直认为这格能走,
+        /// 直到最后一刻才发现, 而游戏给的反应窗口只有 m_timeBeforeFalling = 0.2s
+        /// (PlayerControls.cs:270)。
+        ///
+        /// 落差阈值取 StepHeightMax = 0.65 (PlayerControls.cs:50):
+        /// 比这更低就是"跳下去爬不回来"的落差, 对按格子走路的脚本等同不可走。
+        /// </summary>
+        private static char FloorChar(float x, float z, float floorY)
         {
             try
             {
                 RaycastHit hit;
-                return Physics.Raycast(new Vector3(x, floorY + 0.6f, z), Vector3.down, out hit, 1.4f);
+                if (!Physics.Raycast(new Vector3(x, floorY + 0.6f, z), Vector3.down,
+                                     out hit, 1.8f))
+                    return 'V';
+                if (hit.point.y < floorY - 0.6f)
+                    return 'v';
+                return '\0';
             }
             catch (Exception)
             {
-                return true;   // 射线失败就别误判成空洞
+                return '\0';   // 射线失败就别误判成空洞
             }
         }
 

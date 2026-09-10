@@ -12,6 +12,17 @@
   'T' 传送带(能站, 会推着走)
   'H' 危险区(水面/岩浆/边界墙 —— 空着, 但踩上去会死)
   'V' 空洞(空着, 但脚下没地面, 会掉下去)
+  'v' 地板太低(单向落差 / **正在下沉的平台**, 例如会沉的荷叶)
+
+关于 'v' —— 这是最容易骗过脚本的一种:
+  "会消失的平台"**不是被销毁的**。以 DLC13 的荷叶为例, 全工程没有 LilyPad/Lotus 类,
+  唯一证据是成对音效 DLC_13_LilyPad_*_Plunge / _Pop (GameOneShotAudioTag.cs:317-321),
+  说明它踩下去会沉、之后还会浮回来, 物理上就是**碰撞体跟着下沉动画走低**。
+  于是对格子打向下射线**全程都有命中** —— 只判"有没有命中"的探测会一路认为这格能走,
+  直到最后一刻才发现, 而游戏给的反应窗口只有 m_timeBeforeFalling = 0.2s
+  (PlayerControls.cs:270)。
+  所以插件侧改判"命中点比参考地面低过 StepHeightMax(0.65) 就算不可走"
+  (PlayerControls.cs:50), 并单独标成 'v' 而不是混进 'V', 日志里一眼能看出是哪一种。
 
 本模块只做三件事: 读这张图、按世界坐标定位格子、在**安全格**上跑 A*。
 """
@@ -29,8 +40,9 @@ CH_BLOCKED = "#"      # 占用物
 CH_FIRE = "F"         # 火焰
 CH_HAZARD = "H"       # 水面 / 岩浆 / 边界
 CH_VOID = "V"         # 空洞
+CH_VOID_LOW = "v"     # 地板太低(单向落差 / 正在下沉的平台)
 
-DANGER_CHARS = CH_FIRE + CH_HAZARD + CH_VOID
+DANGER_CHARS = CH_FIRE + CH_HAZARD + CH_VOID + CH_VOID_LOW
 
 
 class TerrainMap:
@@ -201,11 +213,14 @@ class TerrainMap:
                 float(hz.get("x0") or 0), float(hz.get("x1") or 0),
                 float(hz.get("z0") or 0), float(hz.get("z1") or 0)))
         c = self.counts
-        summary = "可走%d 障碍%d 危险%d 空洞%d 平台%d 传送带%d 火%d" % (
+        summary = "可走%d 障碍%d 危险%d 空洞%d 低地板%d 平台%d 传送带%d 火%d" % (
             int(c.get("free") or 0), int(c.get("blocked") or 0),
             int(c.get("hazard") or 0), int(c.get("void") or 0),
+            int(c.get("voidLow") or 0),
             int(c.get("platform") or 0), int(c.get("travelator") or 0),
             int(c.get("fire") or 0))
+        if int(c.get("voidLow") or 0) > 0:
+            summary += " ⚠低地板格>0: 这一关有会下沉/单向落差的地面(如荷叶), 上面站不住"
         if not parts:
             return summary + "; 无危险区"
         return summary + "; 危险区: " + "; ".join(parts)

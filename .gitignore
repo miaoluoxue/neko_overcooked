@@ -1,7 +1,9 @@
-﻿# 构建产物与缓存
+# 构建产物与缓存
 build/
 __pycache__/
 *.pyc
+.pytest_cache/
+pytest-cache-files-*/
 tools/BepInEx_x86/
 tools/ref/
 *.log

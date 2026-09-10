@@ -101,6 +101,15 @@ def main():
     voidm = make_map(["..VVV..", ".......", ".......", ".......", "......."])
     check("空洞不可走", not voidm.walkable(2, 4) and voidm.is_danger(2, 4))
 
+    # 低地板(单向落差 / 正在下沉的平台, 例如会沉的荷叶)也不能走。
+    # 荷叶"消失"其实是碰撞体跟着下沉动画走低, 射线全程都有命中 ——
+    # 只判"有没有命中"就会一直认为这格能走, 所以必须靠落点高度区分出来。
+    lowm = make_map(["..vvv..", ".......", ".......", ".......", "......."],
+                    counts={"voidLow": 3})
+    check("低地板不可走", not lowm.walkable(2, 4) and lowm.is_danger(2, 4))
+    check("低地板会在诊断里告警", "低地板" in lowm.describe_dangers(),
+          lowm.describe_dangers())
+
     # 坏数据要能识别, 而不是拿去寻路
     bad = TerrainMap({"w": 3, "h": 3, "grid": ".."})
     check("网格长度不符时 ok=False", not bad.ok)
