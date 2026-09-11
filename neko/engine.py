@@ -718,34 +718,60 @@ class Engine:
             if not cands:
                 self.log("[接近] ⚠ 找不到能站的相邻格(旁边全被占, 或不连通) —— 只能直接朝它走")
             else:
-                self.log("[接近] 目标 (%.1f,%.1f), 候选站位 %d 个, 现在距目标 %.2f 格"
-                         % (tx, tz, len(cands),
+                # **只试最合适的少数几个**。
+                # 原来把 ±2 格里十几个候选挨个走过去试, 厨师满厨房乱窜(用户实测:
+                # "开局人物就会乱跑一段"), 而且大部分根本到不了(卡住/超时)。
+                # 现在: 就近取 3 个; 都不行就**就地微调**, 不再跨半个厨房换位置。
+                trial = cands[:3]
+                self.log("[接近] 目标 (%.1f,%.1f), 候选站位 %d 个(只试最近 %d 个), 现在距目标 %.2f 格"
+                         % (tx, tz, len(cands), len(trial),
                             ((tx - cx) ** 2 + (tz - cz) ** 2) ** 0.5))
-                last_df = None
-                for (sx, sz) in cands:
+                for (sx, sz) in trial:
                     self.navigate_smart(km, sx, sz, tight=min(tight, 0.5))
-                    self.face(tx, tz)          # 先转身, 交互只认前 180°
+                    self.face(tx, tz)
                     st2 = self.state()
                     px, pz, _ = self.pos(st2) if st2 else (None, None, "")
                     if px is None:
                         continue
                     df = ((tx - px) ** 2 + (tz - pz) ** 2) ** 0.5
-                    last_df = df
-                    # **以游戏自己的判定为准** —— 见 _aim_ok 的说明
-                    if want:
-                        ok_aim = self._aim_ok(st2, want)
-                        pick, use = self.interaction_targets(st2)
-                        self.log("[接近] 试站位(%.1f,%.1f) → (%.1f,%.1f) 距 %.2f 格; "
-                                 "游戏说可作用: 抓取=%r 工位=%r %s"
-                                 % (sx, sz, px, pz, df, pick, use,
-                                    "✓ 就是它" if ok_aim else "✗ 不是它/不在范围"))
-                        if ok_aim:
-                            return True
-                    elif df <= 1.0:
+                    pick, use = self.interaction_targets(st2)
+                    if (not want) or self._aim_ok(st2, want):
+                        self.log("[接近] (%.1f,%.1f) 距 %.2f 格, 游戏说可作用: 抓取=%r ✓"
+                                 % (px, pz, df, pick))
                         return True
-                if last_df is not None:
-                    self.log("[接近] ✗ 所有站位游戏都说作用不到目标(最近 %.2f 格) —— 这一步做不了"
-                             % last_df)
+                    self.log("[接近] (%.1f,%.1f) 距 %.2f 格, 游戏说: 抓取=%r ✗ 不是它"
+                             % (px, pz, df, pick))
+
+                # ---- 就地微调: 不换站位, 只朝目标小步挪 + 转身, 每步问一次游戏 ----
+                # 这是"范围交互"的正解: 不必走到某个精确点, 只要进入范围且朝向对。
+                if want:
+                    self.log("[接近] 就地微调, 朝目标靠近直到游戏说能作用")
+                    for k in range(8):
+                        st3 = self.state()
+                        px, pz, _ = self.pos(st3) if st3 else (None, None, "")
+                        if px is None:
+                            break
+                        if self._aim_ok(st3, want):
+                            self.log("[接近] 微调 %d 次后到位 (%.1f,%.1f) ✓" % (k, px, pz))
+                            return True
+                        dx, dz = tx - px, tz - pz
+                        d = (dx * dx + dz * dz) ** 0.5
+                        if d < 0.35:
+                            self.face(tx, tz)
+                            continue
+                        # 只走一小步: 位移 = 速度 × 时长, 用运动学算, 最多 0.25 秒
+                        hold = min(0.25, max(0.08, (d - 0.9) / self.speed))
+                        key = self._key("D" if abs(dx) >= abs(dz) and dx > 0 else
+                                        "A" if abs(dx) >= abs(dz) else
+                                        "W" if dz > 0 else "S")
+                        from bridge.keyboard_input import key_down, key_up
+                        key_down(key)
+                        time.sleep(hold)
+                        key_up(key)
+                        time.sleep(0.08)
+                    st4 = self.state()
+                    pick, use = self.interaction_targets(st4)
+                    self.log("[接近] ✗ 微调后游戏仍说作用不到目标(抓取=%r 工位=%r)" % (pick, use))
 
         # 兜底: 地形不可用 / 找不到能站的格子 —— 退回老办法
         if attempt <= 0:
