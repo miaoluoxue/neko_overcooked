@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import time
 
-from bridge.keyboard_input import KeyboardPlayer, PLAYER1, PLAYER2, activate_game
+from bridge.keyboard_input import KeyboardPlayer, PLAYER1, PLAYER2, ensure_focus, game_focused, panic_pressed
 from map_model import KitchenMap, Station
 from pathing import dir_for_step
 from cookbook import Knowledge, derive, Op, DishFlow
@@ -49,6 +49,9 @@ class Engine:
         # 乘 0.9 留余量, 宁可多按几次也别冲过头(冲过头就会在目标两侧来回震)。
         self.speed = 4.0 * 0.9     # 有效推进速度 (u/s)
         self.max_hold = 0.6        # 单次按键最长按住时长(秒) —— 闭环分多次走, 单次别冲太远
+        # 焦点策略: 游戏不在前台时**等多久**(秒)。等不到就松手放弃这一步。
+        # 默认不抢焦点(见 keyboard_input.FOCUS_POLICY), 这样跑脚本时电脑照样能用。
+        self.focus_wait = 0.5
         self.know: Knowledge | None = None
         self.scene = ""
         self.assemble_spot: Station | None = None   # 组装台面(放容器的地方)
@@ -154,9 +157,11 @@ class Engine:
         为什么要精到: 相邻台子只隔 1.2 格, 停在 1.8 格处会同时落在两三个台子的交互范围内,
         按交互键就会拿错东西。先粗到保证不卡在障碍上, 再限时收紧到 tight。
         """
-        from bridge.keyboard_input import key_down, key_up
-        if not activate_game():
-            self.log("[导航] ⚠ 游戏窗口没能拿到前台, 按键会被别的窗口吃掉 —— 先切到游戏窗口")
+        from bridge.keyboard_input import key_down, key_up, ensure_focus
+        # 默认**不抢焦点**: 游戏不在前台就松手等一会儿。以前这里直接 SetForegroundWindow,
+        # 用户一按别的窗口就被抢回来, 等于跑脚本时电脑没法用。
+        if not ensure_focus(wait_s=self.focus_wait):
+            self.log("[导航] 游戏不在前台 —— 脚本暂停(不会抢你的焦点), 切回游戏即继续")
             return False
         tm = self.terrain()
         if tm is not None and tm.ok and tm.is_danger_world(tx, tz):
@@ -394,15 +399,15 @@ class Engine:
         没有必然对应 —— 实测遇到过 `cid=0` 其实归「方向键」那一路、而 WASD 完全
         没绑定到任何玩家的情况。靠假设选错键位, 表现就是"发了一堆按键但人一动不动"。
         """
-        from bridge.keyboard_input import PLAYER1, PLAYER2, activate_game, key_down, key_up
+        from bridge.keyboard_input import PLAYER1, PLAYER2, ensure_focus, key_down, key_up
         cands = candidates or [("P1(WASD)", PLAYER1), ("P2(方向键)", PLAYER2)]
         st = self.state()
         p0 = self.pos(st) if st else (None, None, "")
         if p0[0] is None:
             self.log("[键位] 探测失败: 读不到厨师位置")
             return None
-        if not activate_game():
-            self.log("[键位] 探测失败: 拿不到前台")
+        if not ensure_focus(wait_s=self.focus_wait):
+            self.log("[键位] 探测失败: 游戏不在前台(脚本不抢焦点)")
             return None
         for label, b in cands:
             for key in (b["up"], b["down"], b["left"], b["right"]):
@@ -1099,7 +1104,30 @@ class Engine:
     # ---------------- 主循环 ----------------
     def run(self, dry: bool = False):
         self.log("[引擎] 启动, 等对局...")
+        self.log("[引擎] 焦点策略: 不抢你的焦点 —— 切出去干活时脚本会自动暂停并松开所有键;")
+        self.log("[引擎]           按 " + (os.environ.get("NEKO_PANIC_KEY") or "F12") +
+                 " 可以急停(只读按键状态, 不影响你在游戏里的操作)")
+        _warned_unfocused = False
         while True:
+            # ---- 焦点/急停闸门 ----
+            # SendInput 是系统级注入, 键会发给**当前前台窗口**。所以游戏不在前台时
+            # 绝不能发键 —— 一是会打进别人家窗口, 二是用户根本没法用电脑。
+            if panic_pressed():
+                self.kb.release_all()
+                self.log("[引擎] 急停键被按住 —— 松手即继续 (停止请按 Ctrl+C)")
+                time.sleep(0.3)
+                continue
+            if not game_focused():
+                self.kb.release_all()
+                if not _warned_unfocused:
+                    self.log("[引擎] 游戏不在前台 —— 已暂停并松开所有键, 切回游戏自动继续")
+                    _warned_unfocused = True
+                time.sleep(0.4)
+                continue
+            if _warned_unfocused:
+                self.log("[引擎] 游戏回到前台, 继续")
+                _warned_unfocused = False
+
             st = self.state()
             if not st:
                 time.sleep(1)

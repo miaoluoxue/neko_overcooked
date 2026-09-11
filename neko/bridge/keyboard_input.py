@@ -10,6 +10,7 @@ SendInput 是 Windows 原生输入注入, 游戏兼容性最好。
 from __future__ import annotations
 
 import ctypes
+import os
 import threading
 import time
 from ctypes import wintypes
@@ -172,19 +173,45 @@ _PROC_NAME = "Overcooked2"
 
 
 def _game_hwnds():
-    """按进程名+精确标题找游戏窗口句柄(避免误匹配其它窗口)。"""
-    import subprocess
-    out = subprocess.run(
-        ["powershell", "-NoProfile", "-Command",
-         f"Get-Process {_PROC_NAME} -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id"],
-        capture_output=True, text=True)
-    pids = [int(l.strip()) for l in out.stdout.split() if l.strip().isdigit()]
-    if not pids:
-        return []
+    """找游戏窗口句柄。
+
+    **优先按窗口标题精确匹配**(GetWindowTextW == "Overcooked2"), 不起子进程 ——
+    原先靠 `powershell Get-Process` 找 PID, 每次要 0.8 秒; 而焦点检查在运行循环里
+    每 0.4 秒就要调一次, 那样等于一直在起进程。标题匹配零成本, 也更可移植。
+    标题匹配失败才退回按 PID 找(应对标题被改过的情况)。
+    """
     user32 = ctypes.windll.user32
     found = []
 
     def _cb(hwnd, _):
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        buf = ctypes.create_unicode_buffer(512)
+        user32.GetWindowTextW(hwnd, buf, 512)
+        title = buf.value.strip()
+        if title == _PROC_NAME or title.startswith(_PROC_NAME):
+            found.append(hwnd)
+        return True
+
+    user32.EnumWindows(WNDENUMPROC(_cb), 0)
+    if found:
+        return found
+
+    # 兜底: 按进程名找 PID(贵, 只在标题匹配不到时才走)
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             f"Get-Process {_PROC_NAME} -ErrorAction SilentlyContinue | "
+             f"Select-Object -ExpandProperty Id"],
+            capture_output=True, text=True, timeout=8)
+        pids = [int(l.strip()) for l in out.stdout.split() if l.strip().isdigit()]
+    except Exception:
+        return []
+    if not pids:
+        return []
+
+    def _cb2(hwnd, _):
         if not user32.IsWindowVisible(hwnd):
             return True
         pid = wintypes.DWORD()
@@ -192,27 +219,33 @@ def _game_hwnds():
         if pid.value in pids:
             buf = ctypes.create_unicode_buffer(512)
             user32.GetWindowTextW(hwnd, buf, 512)
-            if buf.value.strip():  # 有标题的顶层窗口
+            if buf.value.strip():
                 found.append(hwnd)
         return True
 
-    user32.EnumWindows(WNDENUMPROC(_cb), 0)
+    user32.EnumWindows(WNDENUMPROC(_cb2), 0)
     return found
 
 
 _hwnd_cache = None
-_hwnd_lock = threading.Lock()
+_hwnd_fail_at = 0.0
+_HWND_RETRY_S = 3.0        # 找不到窗口时, 3 秒内不再重找(避免每次焦点检查都去枚举/起进程)
 
 
 def _resolve_hwnd():
-    """解出游戏窗口句柄, 优先用缓存(找 PID 要起子进程, 很贵, 不能每次导航都做)。"""
-    global _hwnd_cache
+    """解出游戏窗口句柄, 优先用缓存。**失败也缓存一小段时间**。"""
+    global _hwnd_cache, _hwnd_fail_at
     user32 = ctypes.windll.user32
     hwnd = _hwnd_cache
     if hwnd and user32.IsWindow(hwnd):
         return hwnd
+    now = time.time()
+    if now - _hwnd_fail_at < _HWND_RETRY_S:
+        return None
     hwnds = _game_hwnds()
     _hwnd_cache = hwnds[0] if hwnds else None
+    if _hwnd_cache is None:
+        _hwnd_fail_at = now
     return _hwnd_cache
 
 
@@ -246,13 +279,97 @@ def _force_foreground(hwnd) -> bool:
     return user32.GetForegroundWindow() == hwnd
 
 
+def _game_hwnd():
+    """拿到游戏窗口句柄(**只读, 不抢焦点**), 走缓存。"""
+    return _resolve_hwnd()
+
+
+def game_focused() -> bool:
+    """游戏窗口是不是当前前台窗口。**只读, 没有任何副作用。**
+
+    为什么要单独有它: SendInput 是系统级注入, 键会发给**当前前台窗口**。
+    所以脚本必须在"游戏就是前台"时才发键 —— 否则键会打到用户正在用的别的程序里。
+    """
+    user32 = ctypes.windll.user32
+    hwnd = _game_hwnd()
+    if not hwnd:
+        return False
+    return user32.GetForegroundWindow() == hwnd
+
+
+# ---- 焦点策略 ----
+#   "never"  (默认) —— **绝不抢焦点**。游戏不在前台就暂停等待, 用户随时可以切出去干活。
+#   "once"           —— 只在启动时抢一次, 之后不再抢。
+#   "always"         —— 每次都要抢(旧行为: 会把用户锁死, 跑脚本时啥也干不了)。
+# 用环境变量 NEKO_FOCUS 覆盖。
+FOCUS_POLICY = (os.environ.get("NEKO_FOCUS") or "never").strip().lower()
+
+# 急停键: 用户按一下就暂停脚本。只**读**状态(GetAsyncKeyState), 不吞按键,
+# 所以不会影响用户在游戏里的操作。
+PANIC_VK = VK.get(os.environ.get("NEKO_PANIC_KEY", "F12").upper(), 0x7B)  # 0x7B = F12
+
+_stole_once = [False]
+
+
+def panic_pressed() -> bool:
+    """急停键是否被按住。只读, 无副作用。"""
+    if not PANIC_VK:
+        return False
+    try:
+        return bool(ctypes.windll.user32.GetAsyncKeyState(PANIC_VK) & 0x8000)
+    except Exception:
+        return False
+
+
+def ensure_focus(steal: bool = None, wait_s: float = 0.0, poll: float = 0.25) -> bool:
+    """确保游戏在前台。**默认不抢**, 只等 —— 这是为了不把用户锁死。
+
+    旧实现每次都 SetForegroundWindow, 用户一按别的窗口就被抢回来, 等于电脑没法用。
+    现在:
+      · 已经在前台      -> 立刻 True
+      · 不在前台且不抢  -> 等 wait_s 秒(0 = 不等), 期间松开所有键
+      · 策略是 always   -> 才真的去抢
+    """
+    if game_focused():
+        return True
+
+    pol = FOCUS_POLICY if steal is None else ("always" if steal else "never")
+    if pol == "always" or (pol == "once" and not _stole_once[0]):
+        _stole_once[0] = True
+        if activate_game():
+            return True
+        if pol == "once":
+            return False
+
+    # 不抢: 松手等着用户切回来
+    if wait_s <= 0:
+        return False
+    t0 = time.time()
+    _release_all_safe()
+    while time.time() - t0 < wait_s:
+        time.sleep(poll)
+        if game_focused():
+            return True
+    return False
+
+
+def _release_all_safe():
+    """尽力把可能按住的键松开(不知道是哪个玩家, 所以两组都松)。"""
+    try:
+        for grp in (PLAYER1, PLAYER2):
+            for k in ("up", "down", "left", "right"):
+                vk = grp.get(k)
+                if vk:
+                    _send_key(_key_code(vk), up=True)
+    except Exception:
+        pass
+
+
 def activate_game() -> bool:
     """把游戏窗口激活到前台(按进程定位, 精确)。返回是否**确实**拿到了前台。
 
-    性能关键: navigate() 每 ~0.17s 就调一次, 所以
-      · 窗口句柄必须缓存 —— 否则每次都起 powershell 找 PID
-      · 已经在前台就直接返回 —— 否则每次都折腾窗口
-    多线程安全(双人时两个引擎线程都会调)。
+    ⚠ 这会**抢焦点**。默认策略下不要直接调用它 —— 用 ensure_focus()。
+    保留它是为了策略设为 always/once 时使用, 以及手工诊断。
     """
     global _hwnd_cache
     with _hwnd_lock:

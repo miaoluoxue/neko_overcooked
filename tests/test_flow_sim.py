@@ -292,11 +292,18 @@ def run_flow(order_name: str, max_ticks: int = 4000):
     details = [d for d in DETAILS if d["name"] == order_name]
     br = FakeBridge(game, details)
 
-    # 屏蔽真实键鼠/窗口: key_down 变成移动一步, activate_game 变 no-op
+    # 屏蔽真实键鼠/窗口: key_down 变成移动一步, 焦点检查一律返回"在前台"。
+    # 注意引擎现在走的是 ensure_focus / game_focused(默认**不抢焦点**),
+    # 只桩 activate_game 不够 —— 那样测试会一直等焦点而挂住。
     cid = 0
     ki.key_down = lambda k: game.press(cid, k)
     ki.key_up = lambda k: None
-    eng_mod.activate_game = lambda: True
+    ki.ensure_focus = lambda steal=None, wait_s=0.0, poll=0.25: True
+    ki.game_focused = lambda: True
+    ki.panic_pressed = lambda: False
+    eng_mod.ensure_focus = ki.ensure_focus
+    eng_mod.game_focused = ki.game_focused
+    eng_mod.panic_pressed = ki.panic_pressed
 
     logs = []
     eng = Engine(br, cid=cid, log=lambda *a: logs.append(" ".join(str(x) for x in a)))
