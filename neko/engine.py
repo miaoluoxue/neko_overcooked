@@ -628,6 +628,30 @@ class Engine:
                     best_d, best = d, (wx, wz)
         return best
 
+    def _stand_cells(self, tm, tx: float, tz: float, cx: float, cz: float,
+                     max_di: int = 2) -> list:
+        """目标的**所有**能站相邻格, 按离厨师远近排序。
+
+        为什么要"所有"而不是"最近那个": 实测拿食材时厨师停在离箱子 2.24 格处
+        (交互半径只有 1.0), 一直按 pickup 抓不到 —— 那个方位够不着, 换个方位就行。
+        """
+        if tm is None or not tm.ok:
+            return []
+        i, j = tm.cell_of(tx, tz)
+        reach = tm.reachable_from(cx, cz)
+        out = []
+        for dj in range(-max_di, max_di + 1):
+            for di in range(-max_di, max_di + 1):
+                if di == 0 and dj == 0:
+                    continue
+                c = (i + di, j + dj)
+                if not tm.walkable(*c) or c not in reach:
+                    continue
+                wx, wz = tm.world_of(*c)
+                out.append((((wx - cx) ** 2 + (wz - cz) ** 2), wx, wz))
+        out.sort()
+        return [(wx, wz) for _, wx, wz in out]
+
     def _approach(self, km: KitchenMap, tx: float, tz: float, attempt: int = 0,
                   tight: float = 0.8) -> bool:
         """接近一个台子并**转身面向它**。
@@ -647,13 +671,35 @@ class Engine:
                 px, pz = tx + 1.3 * math.cos(ang), tz + 1.3 * math.sin(ang)
                 if tm.walkable(*tm.cell_of(px, pz)):
                     gx, gz = px, pz
-            spot = self._stand_cell(tm, gx, gz, cx, cz)
-            if spot is not None:
-                sx, sz = spot
-                ok = self.navigate_smart(km, sx, sz, tight=min(tight, 0.5))
-                if ok:
-                    self.face(tx, tz)    # 站好之后转身面向真正要交互的台子
-                return ok
+            # 目标的**所有**相邻能站格, 按离厨师远近排序, 逐个试。
+            # 只试"最近那个"是不够的 —— 实测 s_sushi_1_1 拿食材时厨师停在
+            # 离箱子 2.24 格的地方(交互半径只有 1.0), 一直在按 pickup 却什么也抓不到。
+            # 那个方向的相邻格多半被挡住/够不着, 换个方位站就好了。
+            cands = self._stand_cells(tm, gx, gz, cx, cz)
+            if not cands:
+                self.log("[接近] ⚠ 找不到能站的相邻格(旁边全被占, 或不连通) —— 只能直接朝它走")
+            else:
+                self.log("[接近] 目标 (%.1f,%.1f), 候选站位 %d 个, 现在距目标 %.2f 格"
+                         % (tx, tz, len(cands),
+                            ((tx - cx) ** 2 + (tz - cz) ** 2) ** 0.5))
+                last_df = None
+                for (sx, sz) in cands:
+                    self.navigate_smart(km, sx, sz, tight=min(tight, 0.5))
+                    st2 = self.state()
+                    px, pz, _ = self.pos(st2) if st2 else (None, None, "")
+                    if px is None:
+                        continue
+                    df = ((tx - px) ** 2 + (tz - pz) ** 2) ** 0.5
+                    last_df = df
+                    self.log("[接近] 试站位(%.1f,%.1f) → 实到位(%.1f,%.1f), 离目标 %.2f 格 %s"
+                             % (sx, sz, px, pz, df,
+                                "✓" if df <= 1.5 else "✗ 仍太远"))
+                    if df <= 1.5:
+                        self.face(tx, tz)      # 站好之后转身面向真正要交互的台子
+                        return True
+                if last_df is not None:
+                    self.log("[接近] ✗ 所有站位都够不到目标(最近 %.2f 格) —— 这一步多半做不了"
+                             % last_df)
 
         # 兜底: 地形不可用 / 找不到能站的格子 —— 退回老办法
         if attempt <= 0:
