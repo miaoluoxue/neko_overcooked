@@ -224,6 +224,79 @@ ilspycmd -p -o overcooked_decomp ^
 
 ---
 
+## 离线读关卡资产（不用进游戏）
+
+这一层是从**文件**里拿数据，不必让游戏跑起来 —— 排查问题和做批量分析时快得多。
+
+### 关卡在哪
+
+整机只有一个场景 `Assets/Scenes/Boot.unity`，**所有关卡都是运行时从 AssetBundle 加载的**，
+就在：
+
+```
+Overcooked2_Data\StreamingAssets\Windows\
+  s_sushi_4_1   5.73 MB      ← 文件名 == 桥报的 scene 名
+  s_sushi_4_5  10.18 MB
+  movingplatform2 ~ 5 / s_beach_* / s_chinatown_* / worldmap ...
+```
+
+### tag 表和 layer 表
+
+`tools/parse_unity_tables.py` 直接从 `globalgamemanagers` 里按"长度前缀字符串"顺序解析出
+工程完整的 tag 表和 32 个 layer 槽位（不能靠正则捞，否则拿不到 layer 下标，而下标就是位掩码的位数）。
+
+### 关卡内容清单
+
+```bat
+pip install UnityPy
+python -u tools\dump_level_objects.py --list              :: 列出所有关卡包
+python -u tools\dump_level_objects.py s_sushi_4_1 --detail :: 详细清单
+python -u tools\dump_level_objects.py s_sushi_4_1 --summary :: 一行结论(便于批量扫)
+python -u tools\bundle_index.py                            :: 各包大小与内嵌资源名
+```
+
+输出示例（`s_sushi_4_1`，与运行时扫描结果**逐项吻合**）：
+
+```
+[Plate]           ×3     Plate 5 (1)(2)(3)
+[PlateReturn]     ×1     workstation_plate_return
+[Crate]           ×1     dispenser_crate_01
+[CookingUtensil]  ×2     utensil_pot_01
+[ChoppingStation] ×2     countertop_01_chopping_board_wood_...
+[PlateStation]    ×1     workstation_plate_station
+[CookingStation]  ×2     workstation_cooker_01
+组件层另有: ConveyorStation×8  RespawnCollider×7  Flammable×15  RubbishBin×2  WashingStation×1
+```
+
+### tag 的编码方式（踩过的坑）
+
+AssetBundle 里 `GameObject.m_Tag` 是**下标**，名字不在包里：
+
+- 内置 tag 的实际下标**不连续**：`0=Untagged 1=Respawn 2=Finish 3=EditorOnly 5=MainCamera 6=Player 7=GameController`
+  （实测 `Player 1..4` 是 6、`Camera` 是 5、`CampaignGameEnvironment` 是 7，中间空了一位）
+- **自定义 tag 用 `20000 + 下标`**：`Plate=20000`、`PlateReturn=20002`、`Crate=20006`、
+  `CookingUtensil=20007`、`ChoppingStation=20008`、`PlateStation=20009`、`CookingStation=20012`
+
+### 台面的角色写在 tag 上，不是组件上
+
+这点很关键（也是绕了一圈才确认的）：**光看组件类型分不出"这个台面是灶台还是回收台"**。
+游戏的 `ServerUtensilRespawnBehaviour.cs:123` 就是这么判的 ——
+`CompareTag("CookingStation")` / `("PlateReturn")` / `("PlateStation")`
+加 `RequestComponent<RubbishBin/ConveyorStation/WashingStation>()`。
+
+所以分类是**tag + 组件混合**：
+
+| 角色 | 靠什么 |
+|---|---|
+| 灶台 / 送餐口 / 盘子回收 / 菜板 / 食材箱 / 锅 / 盘子 | **tag** |
+| 垃圾桶 / 洗手池 / 台面传送带 / 按钮 | **组件** |
+
+`GameUtils.cs:504-707` 是游戏自己的"读地图" API，也全是「按 tag 取一批 + 按组件筛」：
+`GetIngredientCrates("Crate")`、`FindEmptyContainers("Plate")`、`GetPlayerHeldItems("Player")`、
+`GetAllIngredients("Pre-Ingredient"|"Ingredient")`。
+
+---
+
 ## 目录结构
 
 ```
