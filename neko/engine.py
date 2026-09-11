@@ -60,6 +60,7 @@ class Engine:
         self._probed = False                         # 是否已实测过键位归属
         self._terrain = None                         # 关卡地形(含危险区), 见 terrain()
         self._terrain_scene = ""
+        self._last_fail_step = ""                    # 最后失败在哪一步(供主循环判断重复失败)
 
     # ---------------- 状态 ----------------
     def state(self) -> dict | None:
@@ -722,7 +723,7 @@ class Engine:
             #    **这一步必须在"等传送带"之前** —— 实测 s_sushi_1_3 这关
             #    `台面传送带0`(压根没有传送带), 却先傻等 20 秒, 三步重试白烧掉 60 秒,
             #    一局只有 150 秒。箱子就在那儿, 直接去拿就行。
-            has_belt = any(s.sem == "conveyor" for s in km.stations.values())
+            has_belt = bool(km.of("conveyor"))   # 语义编码在 id 前缀里, 用 of() 查, Station 上没有 sem 字段
             if op.at_x or op.at_z:
                 tx, tz = op.at_x, op.at_z
                 self.log(f"[步骤] 取 {op.target} @已知货源({tx:.1f},{tz:.1f})")
@@ -1204,6 +1205,8 @@ class Engine:
                 self.log(f"[引擎] 第 {i+1} 步失败, 重试 {attempt+1}/{retries}")
             if not done:
                 self.log(f"[引擎] ✗ 放弃: {op.action} {op.target}")
+                # 记下失败在哪一步, 供主循环判断"是不是同一个 bug 在反复失败"
+                self._last_fail_step = f"{i+1}.{op.action} {op.target}"
                 return False
             self.log(f"[引擎] ✓ {op.action} {op.target}")
         return True
@@ -1238,6 +1241,7 @@ class Engine:
         self.log("[引擎]           按 " + (os.environ.get("NEKO_PANIC_KEY") or "F12") +
                  " 可以急停(只读按键状态, 不影响你在游戏里的操作)")
         _warned_unfocused = False
+        _fail_sig, _fail_n = None, 0
         while True:
             # ---- 焦点/急停闸门 ----
             # SendInput 是系统级注入, 键会发给**当前前台窗口**。所以游戏不在前台时
@@ -1299,8 +1303,26 @@ class Engine:
 
             if self.execute(flow):
                 self.log(f"[引擎] ★ 完成 {name}")
+                _fail_sig, _fail_n = None, 0
             else:
                 self.log(f"[引擎] 订单 {name} 未完成")
+                # ---- 同一步反复同样失败 → 立刻停下报错, 别把整局烧光 ----
+                # 实测: 一个 bug(Station.sem)让引擎把 150 秒整局都耗在
+                # "重试 3 次 → 放弃 → 重新规划同一单 → 再来一遍" 上, 白白烧完一局。
+                # 现在记住"订单+失败在哪一步"的指纹, 连续 3 次一样就停。
+                sig = (name, getattr(self, "_last_fail_step", ""))
+                if sig == _fail_sig:
+                    _fail_n += 1
+                else:
+                    _fail_sig, _fail_n = sig, 1
+                if _fail_n >= 3:
+                    self.log("")
+                    self.log("=" * 62)
+                    self.log(f"[引擎] ⛔ 同一步连续失败 {_fail_n} 次: {name} / {sig[1]}")
+                    self.log("[引擎]    这多半是代码 bug 而不是运气问题, 已停止以免烧完整局。")
+                    self.log("[引擎]    把上面第一次失败的日志发给开发者。")
+                    self.log("=" * 62)
+                    return
             if self.board is not None:
                 self.board.release_order(name, self.cid)
             time.sleep(0.5)
