@@ -245,9 +245,9 @@ class Engine:
                 if stuck >= 8:
                     self.log("[导航] 卡住, 侧移脱困")
                     if abs(dx) >= abs(dz):
-                        key = "W" if dz > 0 else "S"
+                        key = self._key("W" if dz > 0 else "S")
                     else:
-                        key = "D" if dx > 0 else "A"
+                        key = self._key("D" if dx > 0 else "A")
                     key_down(key)
                     time.sleep(0.35)
                     key_up(key)
@@ -268,7 +268,7 @@ class Engine:
                     else:
                         d = "up" if dz > 0 else "down"
 
-                key = {"left": "A", "right": "D", "up": "W", "down": "S"}[d]
+                key = self._key({"left": "A", "right": "D", "up": "W", "down": "S"}[d])
                 # 按住时长直接由运动学算, 不再靠猜。
                 # 依据: PlayerControls.Movement.RunSpeed = 4f (PlayerControls.cs:28), 且平地
                 # 水平速度是**每帧直接赋值**的(ClientPlayerControlsImpl_Default.cs:414,433-435)
@@ -327,7 +327,7 @@ class Engine:
         d = dir_for_step(dx, dz, deadzone=0.02)
         if not d:
             return True
-        key = {"left": "A", "right": "D", "up": "W", "down": "S"}[d]
+        key = self._key({"left": "A", "right": "D", "up": "W", "down": "S"}[d])
         key_down(key)
         time.sleep(hold)
         key_up(key)
@@ -528,6 +528,29 @@ class Engine:
             self.kb.release_all()
 
     # ---------------- 各步骤 ----------------
+    # WASD 字母 → 逻辑方向(绑定表是按逻辑方向索引的, 不是按字母)
+    _WASD2DIR = {"W": "up", "S": "down", "A": "left", "D": "right"}
+
+    def _key(self, wasd: str) -> str:
+        """把"逻辑方向"翻译成**这个厨师实际绑定的物理键**。
+
+        为什么必须走这里(实测踩的大坑):
+          分屏双人时两个厨师用的是**两套完全不同的键**:
+            Player.One → WASD 区(左半键盘)      Player.Two → 方向键区(右半键盘)
+          而导航里原先把这个映射**硬编码成 WASD**:
+              key = {"left": "A", "right": "D", "up": "W", "down": "S"}[d]
+          于是:
+            · 上一关厨师是 Player.One → 硬编码碰巧对上, 看着"能用"
+            · 这一关厨师是 Player.Two → 导航发出的是 WASD, 而它只听方向键
+              ⇒ 厨师**一步都没动**, 日志却只有"卡住/超时(还差 1.0 格)", 极难定位
+          交互走的是 self.kb(已按玩家绑定), 所以"取东西"看起来正常 —— 只有移动坏掉。
+        现在所有移动键一律过这里, 与 interact 用同一套绑定。
+        """
+        d = self._WASD2DIR.get((wasd or "").upper())
+        if d is None:
+            return wasd                    # 不是方向键的原样返回
+        return self.kb.b.get(d, wasd)       # 取不到就退回字母本身
+
     @staticmethod
     def _norm(s: str) -> str:
         """只留字母数字, 用于比物品名。
