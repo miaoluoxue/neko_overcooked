@@ -159,11 +159,23 @@ class Engine:
         按交互键就会拿错东西。先粗到保证不卡在障碍上, 再限时收紧到 tight。
         """
         from bridge.keyboard_input import key_down, key_up, ensure_focus
-        # 默认**不抢焦点**: 游戏不在前台就松手等一会儿。以前这里直接 SetForegroundWindow,
-        # 用户一按别的窗口就被抢回来, 等于跑脚本时电脑没法用。
-        if not ensure_focus(wait_s=self.focus_wait):
-            self.log("[导航] 游戏不在前台 —— 脚本暂停(不会抢你的焦点), 切回游戏即继续")
-            return False
+        # 默认**不抢焦点**: 游戏不在前台就暂停等它回来。
+        #
+        # ⚠ 这里必须"等", 不能直接 return False —— 这是踩过的坑:
+        #   一 return False, navigate_smart 就把它当成"这个路径点到不了"而跳过,
+        #   于是用户每看一眼终端, 就把当前路径上的点逐个判死, 整条路径报废。
+        #   实测日志: 一连串 "[导航] 游戏不在前台 → 路径点 (2.4,7.2) 到不了 → 继续下一个"。
+        _told = False
+        while not ensure_focus(wait_s=1.0):
+            if not _told:
+                self.log("[导航] 游戏不在前台 —— 暂停等它回来(失焦不算导航失败)")
+                _told = True
+            self.kb.release_all()
+            st0 = self.state()
+            if not st0 or not st0.get("inRound"):
+                return False            # 对局结束了才真的放弃
+        if _told:
+            self.log("[导航] 游戏回到前台, 继续走")
         tm = self.terrain()
         if tm is not None and tm.ok and tm.is_danger_world(tx, tz):
             # 以前这里没有这道闸: 目标落在水面上, 厨师就一路走进去淹死
@@ -518,8 +530,17 @@ class Engine:
     # ---------------- 各步骤 ----------------
     @staticmethod
     def _norm(s: str) -> str:
-        """只留字母数字, 用于比物品名(游戏里实例名常带 (Clone) 之类后缀)。"""
-        return "".join(ch for ch in (s or "").lower() if ch.isalnum())
+        """只留字母数字, 用于比物品名。
+
+        先去掉实例编号后缀: 场景里同一类物品的实例叫 "SushiPrawn (2)"、"Plate 5 (3)"
+        "utensil_pot_01 (1)" —— 计划里用的是 "SushiPrawn"。不剥掉后缀就只能靠
+        "子串包含"兜底, 那会误判(例如 SushiPrawn 与 SushiPrawnCooked 互相包含)。
+        """
+        import re as _re
+        t = (s or "").strip()
+        t = _re.sub(r"\s*\(\d+\)\s*$", "", t)      # 去掉结尾的 " (2)"
+        t = _re.sub(r"\s+\d+\s*$", "", t)          # 去掉结尾的 " 5"
+        return "".join(ch for ch in t.lower() if ch.isalnum())
 
     def _held_is(self, held: str, want: str) -> bool:
         """手上拿的是不是想要的那个东西。"""
@@ -614,21 +635,32 @@ class Engine:
             tx, tz = live.x, live.z
             self.log(f"[步骤] 取 {op.target} @{live.id}({tx:.1f},{tz:.1f}) 实时")
         else:
-            # 2) 等它出现(传送带会把食材送过来)
-            self.log(f"[步骤] 台面上暂时没有 {op.target}, 等传送带送来...")
-            live = self._wait_for_item(op.target, x, z, timeout=20.0)
-            if live is not None:
-                tx, tz = live.x, live.z
-                self.log(f"[步骤] {op.target} 到了 @{live.id}({tx:.1f},{tz:.1f})")
-            else:
-                # 3) 退化到 know 表给的坐标(箱子/静态货源)
+            # 2) 计划里已经知道货源坐标(know 表给的箱子/静置台面) → 直接去。
+            #    **这一步必须在"等传送带"之前** —— 实测 s_sushi_1_3 这关
+            #    `台面传送带0`(压根没有传送带), 却先傻等 20 秒, 三步重试白烧掉 60 秒,
+            #    一局只有 150 秒。箱子就在那儿, 直接去拿就行。
+            has_belt = any(s.sem == "conveyor" for s in km.stations.values())
+            if op.at_x or op.at_z:
                 tx, tz = op.at_x, op.at_z
-                if not tx and not tz:
-                    src = km.find_source(op.target, x, z)
-                    if src is None:
-                        self.log(f"[步骤] 找不到 {op.target} 的货源")
-                        return False
-                    tx, tz = src.x, src.z
+                self.log(f"[步骤] 取 {op.target} @已知货源({tx:.1f},{tz:.1f})")
+            elif has_belt:
+                # 3) 这关真有传送带, 才值得等它把食材送过来(等短一点, 别烧掉整局)
+                self.log(f"[步骤] 台面上暂时没有 {op.target}, 等传送带送来(最多 8 秒)...")
+                live = self._wait_for_item(op.target, x, z, timeout=8.0)
+                if live is not None:
+                    tx, tz = live.x, live.z
+                    self.log(f"[步骤] {op.target} 到了 @{live.id}({tx:.1f},{tz:.1f})")
+                else:
+                    tx, tz = x, z
+                    self.log(f"[步骤] 等不到 {op.target} 送过来")
+                    return False
+            else:
+                # 4) 没有传送带又没有已知货源 → 退回 find_source 兜底
+                src = km.find_source(op.target, x, z)
+                if src is None:
+                    self.log(f"[步骤] 找不到 {op.target} 的货源(这关没有传送带, 也没有已知箱子)")
+                    return False
+                tx, tz = src.x, src.z
                 self.log(f"[步骤] 取 {op.target} @({tx:.1f},{tz:.1f})")
         # 先粗到再收紧: 相邻台子太近, 站远了会拿错
         if not self._approach(km, tx, tz, attempt):
