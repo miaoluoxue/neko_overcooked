@@ -125,7 +125,9 @@ namespace Overcooked2AI.Game
                         if (go == null)
                             continue;
                         var pos = go.transform.position;
-                        string held = ReadHeldItem(go);
+                        // 手上拿着什么 —— 优先服务端权威值, 客户端那份会晚一帧(见 ReadHeldItems)
+                        string held, heldC;
+                        ReadHeldItems(go, out held, out heldC);
                         // **厨师归属哪个玩家** —— 这是决定用哪套键盘的唯一权威依据。
                         // 依据 ClientInputTransmitter.Setup(): iD = GetComponent<PlayerIDProvider>().GetID()
                         // Player.One → 键盘左半(SplitPadHost) → WASD
@@ -140,9 +142,9 @@ namespace Overcooked2AI.Game
                         if (chefCount > 0)
                             chefs.Append(",");
                         chefs.Append(string.Format(
-                            "{{\"id\":{0},\"seq\":{0},\"player\":\"{1}\",\"name\":\"{2}\",\"x\":{3:F2},\"y\":{4:F2},\"z\":{5:F2},\"held\":\"{6}\",{7}{8}}}",
-                            chefCount, player, SafeName(go.name), pos.x, pos.y, pos.z, held,
-                            control, inter));
+                            "{{\"id\":{0},\"seq\":{0},\"player\":\"{1}\",\"name\":\"{2}\",\"x\":{3:F2},\"y\":{4:F2},\"z\":{5:F2},\"held\":\"{6}\",\"heldc\":\"{7}\",{8}{9}}}",
+                            chefCount, player, SafeName(go.name), pos.x, pos.y, pos.z,
+                            held, heldC, control, inter));
                         chefCount++;
                     }
                 }
@@ -751,31 +753,63 @@ namespace Overcooked2AI.Game
         }
 
         /// <summary>读厨师手里拿的物品名(ICarrierPlacement.InspectCarriedItem)。</summary>
-        private static string ReadHeldItem(GameObject chefGo)
+        /// <summary>读厨师手上拿着什么。
+        ///
+        /// 依据(游戏自己的读法): GameUtils.cs:693-707 GetPlayerHeldItems()
+        ///     ICarrier carrier = go.RequireInterface&lt;ICarrier&gt;();
+        ///     GameObject item = carrier.InspectCarriedItem();
+        ///   ICarrier : ICarrierPlacement, InspectCarriedItem() 定义在 ICarrierPlacement.cs:5。
+        ///
+        /// **必须优先读 Server 那一份**(用户指出的"拿了又放下"就出在这里):
+        ///   ServerPlayerAttachmentCarrier.InspectCarriedItem()  (ServerPlayerAttachmentCarrier.cs:100)
+        ///     读的是 m_carriedObjects[Default], **拾取时服务端立即写入** —— 权威值。
+        ///   ClientPlayerAttachmentCarrier.InspectCarriedItem()  (ClientPlayerAttachmentCarrier.cs:69)
+        ///     两边实现**一模一样**, 但客户端这份靠同步消息更新, 而环回消息要等
+        ///     MultiplayerController.LateUpdate 的 Dispatch() 才送达 —— **会晚一帧**。
+        ///   原来先读 Client: 刚拿到的一瞬间可能读成空 → 脚本判定"没拿到" → 重试时
+        ///   **再按一次 pickup 把东西放下**。拿/放是同一个键的开关, 误判的代价是毁掉战果。
+        ///
+        /// 两份都返回, 便于发现"客户端滞后"这类问题。
+        /// </summary>
+        private static void ReadHeldItems(GameObject chefGo, out string serverHeld,
+                                          out string clientHeld)
+        {
+            serverHeld = "";
+            clientHeld = "";
+            try
+            {
+                clientHeld = ReadFromCarrier(chefGo, "ClientPlayerAttachmentCarrier");
+                serverHeld = ReadFromCarrier(chefGo, "ServerPlayerAttachmentCarrier");
+                if (serverHeld.Length == 0 && clientHeld.Length == 0)
+                    serverHeld = ReadFromCarrier(chefGo, "PlayerAttachmentCarrier");
+            }
+            catch (Exception) { }
+        }
+
+        private static string ReadFromCarrier(GameObject chefGo, string typeName)
         {
             try
             {
-                // 先从厨师身上找 carrier 组件
-                string[] carrierNames = { "ClientPlayerAttachmentCarrier", "PlayerAttachmentCarrier" };
-                foreach (var cn in carrierNames)
-                {
-                    var ct = FindType(cn);
-                    if (ct == null)
-                        continue;
-                    var carrier = chefGo.GetComponentInChildren(ct);
-                    if (carrier == null)
-                        continue;
-                    var m = ct.GetMethod("InspectCarriedItem");
-                    if (m == null)
-                        continue;
-                    var item = m.Invoke(carrier, null) as UnityEngine.Object;
-                    if (item != null)
-                        return SafeName(item.name);
+                var ct = FindType(typeName);
+                if (ct == null)
                     return "";
-                }
+                var carrier = chefGo.GetComponentInChildren(ct);
+                if (carrier == null)
+                    return "";
+                var m = ct.GetMethod("InspectCarriedItem");
+                if (m == null)
+                    return "";
+                var item = m.Invoke(carrier, null) as UnityEngine.Object;
+                return item == null ? "" : SafeName(item.name);
             }
-            catch (Exception) { }
-            return "";
+            catch (Exception) { return ""; }
+        }
+
+        private static string ReadHeldItem(GameObject chefGo)
+        {
+            string s, c;
+            ReadHeldItems(chefGo, out s, out c);
+            return s.Length > 0 ? s : c;
         }
 
         private static string SafeName(string n)
