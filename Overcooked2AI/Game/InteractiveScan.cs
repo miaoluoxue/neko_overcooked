@@ -141,6 +141,12 @@ namespace Overcooked2AI.Game
             }
             o.Append(",\"fires\":[").Append(fire).Append("]");
 
+            // ---- tag 总表: 游戏自己就是靠 tag 找东西的, 这张表就是关卡的对象字典 ----
+            // 依据 GameUtils.cs:504-707 的 GetIngredientCrates("Crate") / FindEmptyContainers("Plate") /
+            // GetPlayerHeldItems("Player") / GetAllIngredients("Pre-Ingredient"|"Ingredient") 等。
+            var tags = TagInventory();
+            o.Append(",\"tags\":").Append(tags);
+
             // ---- 关卡正在变形? ----
             var tr = new StringBuilder();
             int ntr = 0;
@@ -261,6 +267,90 @@ namespace Overcooked2AI.Game
             sb.Append(",\"stepz\":").Append(F(stepZ));
             if (on && speed > 0f)
                 sb.Append(",\"secPerCell\":").Append(F(cellsPerSecond ? 1f / speed : 1.2f / speed));
+            return sb.ToString();
+        }
+
+        // ---------------------------------------------------------------- tag 总表
+        /// <summary>列出这一关里所有 tag 及数量 + 一个样例物体名。
+        ///
+        /// 为什么这张表重要: **游戏自己就是靠 tag 找东西的**。
+        /// GameUtils.cs:504-707 一整套查找器全是"按 tag 取一批, 再按组件筛":
+        ///   · GetIngredientCrates(node)  → FindGameObjectsWithTag("Crate")
+        ///   · GetAllIngredients()        → "Pre-Ingredient" ∪ "Ingredient"
+        ///   · FindEmptyContainers(tag)   → 调用方传 "Plate"
+        ///   · GetPlayerHeldItems()       → "Player"
+        ///   · ServerUtensilRespawnBehaviour.cs:123 用 CompareTag("CookingStation") /
+        ///     ("PlateReturn") / ("PlateStation") 判断台面角色
+        /// 所以台面的真实角色写在 tag 上, 光看组件类型是分不出来的。
+        /// 另外 tag 是 prefab 层数据, .cs 里读不到 —— 只能运行时枚举, 这张表就是答案。
+        /// </summary>
+        private static string TagInventory(int maxKinds = 60)
+        {
+            var counts = new Dictionary<string, int>();
+            var sample = new Dictionary<string, string>();
+            try
+            {
+                var scene = UnityEngine.SceneManagement.SceneManager.GetActiveScene();
+                if (!scene.IsValid())
+                    return "[]";
+                var roots = scene.GetRootGameObjects();
+                if (roots == null)
+                    return "[]";
+                int guard = 0;
+                for (int i = 0; i < roots.Length; i++)
+                {
+                    if (roots[i] == null)
+                        continue;
+                    // 含未激活物体: 关卡里有些机关平时是关着的
+                    var all = roots[i].GetComponentsInChildren<Transform>(true);
+                    if (all == null)
+                        continue;
+                    for (int k = 0; k < all.Length; k++)
+                    {
+                        if (++guard > 40000)
+                            break;                 // 防御: 绝不无界遍历(卡死主线程的教训)
+                        var t = all[k];
+                        if (t == null)
+                            continue;
+                        string tag;
+                        try { tag = t.gameObject.tag; }
+                        catch (Exception) { continue; }
+                        if (string.IsNullOrEmpty(tag) || tag == "Untagged")
+                            continue;
+                        int n;
+                        counts.TryGetValue(tag, out n);
+                        counts[tag] = n + 1;
+                        if (!sample.ContainsKey(tag))
+                            sample[tag] = t.gameObject.name;
+                    }
+                    if (guard > 40000)
+                        break;
+                }
+            }
+            catch (Exception) { }
+
+            var order = new List<string>(counts.Keys);
+            order.Sort(delegate (string a, string b)
+            {
+                int c = counts[b].CompareTo(counts[a]);
+                return c != 0 ? c : string.CompareOrdinal(a, b);
+            });
+
+            var sb = new StringBuilder();
+            sb.Append("[");
+            int shown = 0;
+            foreach (var tag in order)
+            {
+                if (shown >= maxKinds)
+                    break;
+                if (shown > 0)
+                    sb.Append(",");
+                sb.Append("{\"tag\":\"").Append(Safe(tag)).Append("\"");
+                sb.Append(",\"n\":").Append(counts[tag]);
+                sb.Append(",\"eg\":\"").Append(Safe(sample[tag])).Append("\"}");
+                shown++;
+            }
+            sb.Append("]");
             return sb.ToString();
         }
 

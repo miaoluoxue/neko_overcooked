@@ -289,6 +289,12 @@ def main() -> int:
             x.get("type"), float(x.get("x") or 0), float(x.get("z") or 0), x.get("on")))
     if len(dyn.get("triggers") or []) > 40:
         print("  ... 另有 %d 个触发机器未列出" % (len(dyn["triggers"]) - 40))
+
+    tags = dyn.get("tags") or []
+    if tags:
+        print("\n--- 关卡 tag 总表 (游戏自己就是靠 tag 找东西的) ---")
+        for t in tags:
+            print("  %-20s ×%-5s 例: %s" % (t.get("tag"), t.get("n"), t.get("eg")))
     return 0
 
 

@@ -504,6 +504,24 @@ namespace Overcooked2AI.Game
         {
             var sb = new StringBuilder();
 
+            // **游戏自己的角色分类就是 tag**。
+            // 依据 GameUtils.cs:504-707 的一整套查找器, 它们全是"按 tag 找 + 按组件筛":
+            //   GetAllIngredients     → tag "Pre-Ingredient" ∪ "Ingredient"
+            //   GetIngredientCrates   → tag "Crate"
+            //   FindEmptyContainers   → tag "Plate"
+            //   GetPlayerHeldItems    → tag "Player"
+            // 以及 ServerUtensilRespawnBehaviour.cs:123 用
+            //   CompareTag("CookingStation") / ("PlateReturn") / ("PlateStation")
+            //   加 RequestComponent<RubbishBin/ConveyorStation/WashingStation>() 区分台面角色。
+            // 也就是说: 光看组件类型分不出"这个台面是灶台还是回收台", tag 才是权威。
+            try
+            {
+                string tag = go.tag;
+                if (!string.IsNullOrEmpty(tag) && tag != "Untagged")
+                    sb.Append(string.Format(",\"tag\":\"{0}\"", SafeName(tag)));
+            }
+            catch (Exception) { }
+
             // CookingStation.m_stationType (Hob/Oven/Fryer...)
             if (typeName == "CookingStation")
             {
