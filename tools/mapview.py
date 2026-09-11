@@ -295,6 +295,17 @@ def main() -> int:
         print("\n--- 关卡 tag 总表 (游戏自己就是靠 tag 找东西的) ---")
         for t in tags:
             print("  %-20s ×%-5s 例: %s" % (t.get("tag"), t.get("n"), t.get("eg")))
+
+    layers = dyn.get("layers") or []
+    if layers:
+        print("\n--- 关键 layer 的运行时编号 (地面探测用 Ground|SlopedGround) ---")
+        for L in layers:
+            idx = L.get("index")
+            if idx is None or int(idx) < 0:
+                print("  %-22s 未定义" % L.get("name"))
+            else:
+                print("  %-22s index=%-3s mask=0x%08X" % (
+                    L.get("name"), idx, int(L.get("mask") or 0)))
     return 0
 
 

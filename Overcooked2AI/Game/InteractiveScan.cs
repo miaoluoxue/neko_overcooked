@@ -147,6 +147,9 @@ namespace Overcooked2AI.Game
             var tags = TagInventory();
             o.Append(",\"tags\":").Append(tags);
 
+            // ---- 层编号: 由游戏运行时回答, 不靠离线解析猜 ----
+            o.Append(",\"layers\":").Append(LayerReport());
+
             // ---- 关卡正在变形? ----
             var tr = new StringBuilder();
             int ntr = 0;
@@ -267,6 +270,46 @@ namespace Overcooked2AI.Game
             sb.Append(",\"stepz\":").Append(F(stepZ));
             if (on && speed > 0f)
                 sb.Append(",\"secPerCell\":").Append(F(cellsPerSecond ? 1f / speed : 1.2f / speed));
+            return sb.ToString();
+        }
+
+        // ---------------------------------------------------------------- 层编号
+        /// <summary>报出关键 layer 的**运行时下标**。
+        ///
+        /// 层名清单已经从游戏工程的 LayerManager 解析出来(见 tools/parse_unity_tables.py):
+        ///   Ground / SlopedGround / Worktops / Walls / KillPlane / PlayerTriggerZone /
+        ///   Players / TableBlock / BinBlock / PlateStationBlock / CookingStationBlock ...
+        /// 但下标(位掩码的第几位)不该靠离线解析猜 —— 让游戏用 LayerMask.NameToLayer 自己答。
+        /// 地面探测就该用 Ground|SlopedGround, 这正是 ClientChefSynchroniser 的做法;
+        /// KillPlane 是独立一层, 带上地面掩码就自然不会打到它。
+        /// </summary>
+        private static readonly string[] KeyLayers =
+        {
+            "Default", "Ground", "SlopedGround", "Worktops", "Walls", "KillPlane",
+            "PlayerTriggerZone", "Players", "TableBlock", "BinBlock",
+            "PlateStationBlock", "CookingStationBlock", "PushedObjectBounds",
+        };
+
+        private static string LayerReport()
+        {
+            var sb = new StringBuilder();
+            sb.Append("[");
+            int n = 0;
+            for (int i = 0; i < KeyLayers.Length; i++)
+            {
+                int idx;
+                try { idx = LayerMask.NameToLayer(KeyLayers[i]); }
+                catch (Exception) { idx = -2; }
+                if (n > 0)
+                    sb.Append(",");
+                sb.Append("{\"name\":\"").Append(Safe(KeyLayers[i])).Append("\"");
+                sb.Append(",\"index\":").Append(idx);
+                if (idx >= 0 && idx < 32)
+                    sb.Append(",\"mask\":").Append((uint)(1 << idx));
+                sb.Append("}");
+                n++;
+            }
+            sb.Append("]");
             return sb.ToString();
         }
 

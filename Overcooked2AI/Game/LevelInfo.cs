@@ -61,6 +61,41 @@ namespace Overcooked2AI.Game
         /// <summary>ConveyorStation 的类型, 缓存给 OccupantChar 用。</summary>
         private static Type _conveyorType;
 
+        /// <summary>地面层掩码 = Ground | SlopedGround —— **游戏自己就是这么探地面的**。
+        ///
+        /// 层名来自游戏工程的 LayerManager(已从 globalgamemanagers 解析出来):
+        ///   Default / TransparentFX / Ignore Raycast / Water / UI /
+        ///   Players / Ground / Walls / Worktops / PlayersRespawn / AttachedBackpack /
+        ///   Attachments / HeldAttachments / Beings / PlayerTriggerZone /
+        ///   PlateStationBlock / CookingStationBlock / BinBlock / PushedObject /
+        ///   PushedObjectBounds / TableBlock / Administration / SlopedGround /
+        ///   Camera / **KillPlane** / PausableUI
+        ///
+        /// 关键点: **KillPlane 是独立的一层**。之前我的向下射线不带掩码, 会打到铺满全图的
+        /// KillPlane, 于是每个格子都"有地面", 空洞检测形同虚设。带上 Ground|SlopedGround
+        /// 之后 KillPlane 自然被排除 —— 这才是正统修法(组件判断只是兜底)。
+        /// 这里**运行时用 NameToLayer 解析下标**, 不硬编码数字 —— 换版本/换平台都不会错。</summary>
+        private static int _groundMask;
+
+        private static int ResolveGroundMask()
+        {
+            try
+            {
+                int g = LayerMask.NameToLayer("Ground");
+                int s = LayerMask.NameToLayer("SlopedGround");
+                int m = 0;
+                if (g >= 0 && g < 32)
+                    m |= (1 << g);
+                if (s >= 0 && s < 32)
+                    m |= (1 << s);
+                return m;
+            }
+            catch (Exception)
+            {
+                return 0;
+            }
+        }
+
         /// <summary>桥 Job: kind="map", arg 可含 "force" 强制重建。</summary>
         public static string Snapshot(string arg)
         {
@@ -122,6 +157,7 @@ namespace Overcooked2AI.Game
 
             // ---- 第一遍: 只判占用物, 顺便数出"空格子"总数 ----
             _conveyorType = SceneScanner.FindType("ConveyorStation");
+            _groundMask = ResolveGroundMask();
             var occ = new char[total];
             var xs = new float[total];
             var zs = new float[total];
@@ -348,13 +384,18 @@ namespace Overcooked2AI.Game
             try
             {
                 RaycastHit hit;
-                if (!Physics.Raycast(new Vector3(x, floorY + 0.6f, z), Vector3.down,
-                                     out hit, 1.8f))
+                // 只打地面层(Ground|SlopedGround) —— 游戏自己就是这么做的,
+                // 顺带把 KillPlane 层排除掉。掩码为 0 时退回全层(再加组件兜底)。
+                bool hitSomething = (_groundMask != 0)
+                    ? Physics.Raycast(new Vector3(x, floorY + 0.6f, z), Vector3.down,
+                                      out hit, 1.8f, _groundMask)
+                    : Physics.Raycast(new Vector3(x, floorY + 0.6f, z), Vector3.down,
+                                      out hit, 1.8f);
+                if (!hitSomething)
                     return 'V';
-                // **打到 RespawnCollider 不算地面**。这是实测踩到的坑:
-                // s_sushi_4_5 里真正的 KillPlane 是 x[-28,42] y[-1.50,-0.50] z[-30,40]
-                // —— 铺满整张图, 顶面在 y=-0.5。而本射线从 floorY+0.6 往下 1.8, 正好到 y=-1.2,
-                // 于是**每一个格子都会命中它**, 空洞检测形同虚设(换到真有坑的地图就会掉下去)。
+                // 兜底: 万一掩码没生效(层名变了), 打到 RespawnCollider 也不算地面。
+                // s_sushi_4_5 实测真 KillPlane 是 x[-28,42] y[-1.50,-0.50] z[-30,40],
+                // 铺满整图且顶面 y=-0.5, 而射线从 floorY+0.6 往下 1.8 正好到 y=-1.2。
                 if (_respawnType != null && hit.collider != null &&
                     hit.collider.gameObject.GetComponent(_respawnType) != null)
                     return 'V';
