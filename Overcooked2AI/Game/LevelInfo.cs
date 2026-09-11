@@ -364,7 +364,7 @@ namespace Overcooked2AI.Game
         {
             try
             {
-                if (gm == null || _haz.Count == 0)
+                if (gm == null)
                     return;
                 Vector3 p0 = gm.GetPosFromGridLocation(new GridIndex(0, 0, 0));
                 Vector3 p1 = gm.GetPosFromGridLocation(new GridIndex(1, 0, 0));
@@ -378,7 +378,12 @@ namespace Overcooked2AI.Game
                 int limX0 = -half.X - margin, limX1 = half.X + margin;
                 int limZ0 = -half.Z - margin, limZ1 = half.Z + margin;
 
-                int wx0 = gx0, wx1 = gx1, wz0 = gz0, wz1 = gz1;
+                // **兜底最小扩展**: 万一这一关没有可判定的边界墙(危险区全被判为世界体积),
+                // 光靠危险区就一点也不扩, 又会退回"厨师被困住"。所以至少往外扩 6 格,
+                // 多出来的格子能不能走由地面射线决定, 走不到的自成连通块会被自然排除。
+                int minMargin = 6;
+                int wx0 = gx0 - minMargin, wx1 = gx1 + minMargin;
+                int wz0 = gz0 - minMargin, wz1 = gz1 + minMargin;
                 for (int i = 0; i < _haz.Count; i++)
                 {
                     var hzr = _haz[i];
