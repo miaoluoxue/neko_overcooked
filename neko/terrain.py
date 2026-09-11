@@ -213,12 +213,16 @@ class TerrainMap:
                 float(hz.get("x0") or 0), float(hz.get("x1") or 0),
                 float(hz.get("z0") or 0), float(hz.get("z1") or 0)))
         c = self.counts
-        summary = "可走%d 障碍%d 危险%d 空洞%d 低地板%d 平台%d 传送带%d 火%d" % (
+        summary = "可走%d 障碍%d 台面传送带%d 危险%d 空洞%d 低地板%d 平台%d 地面传送带%d 火%d" % (
             int(c.get("free") or 0), int(c.get("blocked") or 0),
+            int(c.get("conveyor") or 0),
             int(c.get("hazard") or 0), int(c.get("void") or 0),
             int(c.get("voidLow") or 0),
             int(c.get("platform") or 0), int(c.get("travelator") or 0),
             int(c.get("fire") or 0))
+        if int(c.get("conveyor") or 0) > 0:
+            summary += (" ⚠有台面传送带(ConveyorStation): 放上去的物品会被一格一格传走 —— "
+                        "切好的料不能存在上面")
         if int(c.get("voidLow") or 0) > 0:
             summary += " ⚠低地板格>0: 这一关有会下沉/单向落差的地面(如荷叶), 上面站不住"
         if not parts:
