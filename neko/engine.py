@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 
 from bridge.keyboard_input import KeyboardPlayer, PLAYER1, PLAYER2, ensure_focus, game_focused, panic_pressed

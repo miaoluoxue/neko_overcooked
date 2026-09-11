@@ -229,6 +229,7 @@ def _game_hwnds():
 
 _hwnd_cache = None
 _hwnd_fail_at = 0.0
+_hwnd_lock = threading.Lock()      # activate_game 用(双人两个引擎线程可能同时调)
 _HWND_RETRY_S = 3.0        # 找不到窗口时, 3 秒内不再重找(避免每次焦点检查都去枚举/起进程)
 
 
