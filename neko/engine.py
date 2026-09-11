@@ -61,6 +61,9 @@ class Engine:
         self._terrain = None                         # 关卡地形(含危险区), 见 terrain()
         self._terrain_scene = ""
         self._last_fail_step = ""                    # 最后失败在哪一步(供主循环判断重复失败)
+        #: 台面传送带的"每格往哪传"表 + 速度, 按场景缓存(来自插件 dyn)
+        self._belt_dirs_cache = None
+        self._belt_speeds_cache = {}
 
     # ---------------- 状态 ----------------
     def state(self) -> dict | None:
@@ -588,7 +591,8 @@ class Engine:
             return False
         return h == w or h.startswith(w)
 
-    def _stand_cell(self, tm, tx: float, tz: float, cx: float, cz: float):
+    def _stand_cell(self, tm, tx: float, tz: float, cx: float, cz: float,
+                    max_di: int = 2, ortho_only: bool = False):
         """找一个"能站、够得着目标、且离厨师最近"的格子 —— 该站哪儿去拿东西。
 
         为什么不能直接朝台面坐标走(用户实测指出的问题):
@@ -607,10 +611,12 @@ class Engine:
         i, j = tm.cell_of(tx, tz)
         reach = tm.reachable_from(cx, cz)
         best, best_d = None, None
-        for dj in range(-2, 3):
-            for di in range(-2, 3):
+        for dj in range(-max_di, max_di + 1):
+            for di in range(-max_di, max_di + 1):
                 if di == 0 and dj == 0:
                     continue
+                if ortho_only and (di != 0 and dj != 0):
+                    continue          # 只要正上下左右: 斜角距 1.70 格, 够不着(交互半径 1.0)
                 c = (i + di, j + dj)
                 if not tm.walkable(*c):
                     continue
@@ -781,25 +787,105 @@ class Engine:
             return False
         return True
 
+    # ---------------- 传送带拦截 ----------------
+    #: 传送带上物品的格子速度(格/秒)。插件 dyn 里每条都带 speed, 这里只是兜底值。
+    BELT_SPEED = 0.5
+    #: 厨师速度(u/s)与冲刺时的估算速度。依据 PlayerControls.Movement.RunSpeed = 4f,
+    #: Dash 是 1 秒的 S 曲线加速(8 → 4 u/s, 全程约 6 单位)。
+    CHEF_SPEED = 4.0
+    CHEF_SPEED_DASH = 6.0
+
+    def _belt_dirs(self):
+        """台面传送带的"每格往哪传"表: {(i,j): (stepx, stepz)}。按场景缓存一次。
+
+        这是"提前量拦截"必需的数据 —— 不知道它往哪走, 就只能傻追。
+        来自插件的 dyn 命令(InteractiveScan 已经把 ConveyorStation 的
+        m_conveyanceDirectionXZ + transform.right 算成了轴向步长)。
+        """
+        if self._belt_dirs_cache is not None:
+            return self._belt_dirs_cache
+        m = {}
+        speeds = {}
+        try:
+            dyn = self.bridge.get_dyn()
+            tm = self.terrain()
+            for c in dyn.get("conveyors") or []:
+                if c.get("type") == "Travelator":
+                    continue                    # 推人的地面传送带是另一套, 不管
+                try:
+                    x, z = float(c.get("x") or 0), float(c.get("z") or 0)
+                    sx = int(round(float(c.get("stepx") or 0)))
+                    sz = int(round(float(c.get("stepz") or 0)))
+                    sp = float(c.get("speed") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if tm is None or not tm.ok:
+                    break
+                cell = tm.cell_of(x, z)
+                if sx or sz:
+                    m[cell] = (sx, sz)
+                if sp > 0:
+                    speeds[cell] = sp
+        except Exception as e:
+            self.log(f"[传送带] 取方向失败: {e}")
+        self._belt_dirs_cache = m
+        self._belt_speeds_cache = speeds
+        return m
+
+    def _plan_intercept(self, tm, live, cx: float, cz: float):
+        """算出"该提前去哪个格子等它" —— 真正的拦截, 而不是追。
+
+        为什么这样对(用户指出的): 厨师 4 u/s(冲刺 ~6), 食材只有 0.5~0.6 格/秒,
+        **厨师快 6~13 倍** —— 只要去它**下游**等着, 一定能截住。
+        原来的做法是朝食材"当前位置"走, 每步都有开销, 到了它又走了一格, 看起来像"追不上"。
+
+        做法: 沿传送带往下游扫 1..9 格, 找第一个"厨师赶得到、且食材还没过去"的点。
+
+        返回 (站位世界坐标, 拦截格世界坐标, 预计等待秒数) 或 None。
+        """
+        dirs = self._belt_dirs()
+        cell = tm.cell_of(live.x, live.z)
+        step = dirs.get(cell)
+        if step is None:
+            return None
+        ci, cj = cell
+        belt_speed = max(0.1, self._belt_speeds_cache.get(cell, self.BELT_SPEED))
+        cell_len = abs(tm.cellx) or 1.2
+
+        for k in range(1, 10):
+            ti, tj = ci + step[0] * k, cj + step[1] * k
+            if not tm.inside(ti, tj):
+                break
+            wx, wz = tm.world_of(ti, tj)
+            # 拦截点必须是**传送带路径上**的格子(还在传), 否则等不到
+            if tm.cell_of(wx, wz) not in dirs and not tm.walkable(ti, tj):
+                # 该格可能已经出了传送带(到垃圾桶了) —— 那就在它之前截
+                break
+            # 拦截点必须**紧邻**拦截格(max_di=1) —— 站位离拦截点太远就够不着了
+            # (交互半径 1.0; 站到 ±2 格那样 2.4 格开外, 食材经过时抓不到)
+            spot = self._stand_cell(tm, wx, wz, cx, cz, max_di=1, ortho_only=True)
+            if spot is None:
+                continue
+            dist = ((spot[0] - cx) ** 2 + (spot[1] - cz) ** 2) ** 0.5
+            t_chef = dist / self.CHEF_SPEED_DASH        # 用冲刺速度估, 偏乐观一点
+            t_item = (k * cell_len) / belt_speed
+            if t_chef <= t_item + 1.2:                  # 留 1.2 秒余量
+                return (spot, (wx, wz), max(0.0, t_item - t_chef))
+        return None
+
     def _grab_from_belt(self, km: KitchenMap, op: Op, x: float, z: float,
-                        budget: float = 12.0) -> bool:
-        """在传送带旁边**等**食材漂过来再抓 —— 不要去追。
+                        budget: float = 14.0) -> bool:
+        """提前去下游拦截传送带上的食材, 然后等它到手边再抓。
 
-        为什么不能追(实测数据):
-          食材在台面传送带上以 0.5 格/秒移动。日志里三次重试的目标分别是
-              conveyor57(26.4,10.8) → conveyor28(25.2,10.8) → conveyor7(24.0,10.8)
-          每次正好差 1.2 = **一格** —— 也就是说每次重试时它已经又走了一格。
-          厨师去追的话, 闭环控制的每一步都有开销(读状态/发键/等确认), 有效速度
-          远低于"它跑我追"所需的提前量, 永远差一格。
-        人玩这一关也是**站在传送带边上等它过来** —— 照做就行。
-
-        还会做两件事:
-          · 每次按键前重新 face() 朝向食材**当前**位置(交互只认前方 180°)
-          · 只站到旁边能站、且真的到得了的格子(传送带本身走不上去)
+        用户指出的两条都用上了:
+          · 远距离先**冲刺**(Dash 键, 1 秒 S 曲线加速)缩短赶路时间
+          · 去**下一个能拿到的地方**等, 而不是追它当前位置
+        兜底: 算不出拦截点(没有方向数据)时, 退化成"站到它旁边等它漂过来"。
         """
         tm = self.terrain()
         t_end = time.time() + budget
         grabs = 0
+        dashed = False
         while time.time() < t_end:
             if not self.round_active():
                 return False
@@ -808,7 +894,7 @@ class Engine:
             if cx is None:
                 return False
             if self._held_is(held, op.target):
-                return True                      # 已经拿到了
+                return True
 
             live = self._find_item_station(km, op.target, cx, cz)
             if live is None:
@@ -817,8 +903,7 @@ class Engine:
 
             d = ((live.x - cx) ** 2 + (live.z - cz) ** 2) ** 0.5
             if d <= 1.5:
-                # 够得着了: 先转身面向它**当前**的位置, 再抓
-                self.face(live.x, live.z)
+                self.face(live.x, live.z)      # 朝它**当前**位置转身(只认前方 180°)
                 if self.interact("pickup", verify_hold_change=True):
                     return True
                 grabs += 1
@@ -827,14 +912,30 @@ class Engine:
                 time.sleep(0.2)
                 continue
 
-            # 还太远: 挪到它旁边一个能站的格子, 然后继续等
+            plan = self._plan_intercept(tm, live, cx, cz) if (tm is not None and tm.ok) else None
+            if plan is not None:
+                spot, aim, wait_s = plan
+                dist = ((spot[0] - cx) ** 2 + (spot[1] - cz) ** 2) ** 0.5
+                if dist > 3.0 and not dashed:
+                    # 距离远, 先冲刺一次再把路走完 —— 冲刺是 1 秒的加速, 别一直按
+                    self.kb.dash()
+                    dashed = True
+                    time.sleep(0.2)
+                self.log(f"[步骤] {op.target} 在下游 {aim[0]:.1f},{aim[1]:.1f} 会经过, "
+                         f"提前去等(约 {wait_s:.1f}s)")
+                self.navigate_smart(km, spot[0], spot[1], tight=0.5)
+                self.face(aim[0], aim[1])
+                time.sleep(min(2.0, wait_s + 0.4))
+                continue
+
+            # 兜底: 没有方向数据 —— 站到它旁边等它漂过来
             if tm is not None and tm.ok:
                 spot = self._stand_cell(tm, live.x, live.z, cx, cz)
                 if spot is not None:
                     self.navigate_smart(km, spot[0], spot[1], tight=0.5)
                     self.face(live.x, live.z)
             time.sleep(0.15)
-        self.log(f"[步骤] 等了 {budget:.0f} 秒 {op.target} 也没漂到够得着的地方")
+        self.log(f"[步骤] 等了 {budget:.0f} 秒 {op.target} 也没到手边")
         return False
 
     def op_take_plate(self, km, x, z, op: Op, flow: DishFlow) -> bool:
@@ -1348,6 +1449,8 @@ class Engine:
                 if self.scene:
                     self.log("[引擎] 对局结束, 清空缓存")
                 self.know, self.scene, self.assemble_spot = None, "", None
+                self._belt_dirs_cache, self._belt_speeds_cache = None, {}
+                self._terrain, self._terrain_scene = None, ""
                 time.sleep(1)
                 continue
 
