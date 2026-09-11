@@ -155,6 +155,29 @@ namespace Overcooked2AI.Game
             Vector3 gB = gm.GetPosFromGridLocation(new GridIndex(hx, 0, hz));
             CollectHazards(floorY, Mathf.Abs(gB.x - gA.x), Mathf.Abs(gB.z - gA.z));
 
+            // ================= 关键: 把网格扩到关卡边界 =================
+            // GridManager.GetGridHalfSize() 只覆盖"厨房"那一小块。实测 s_sushi_4_1:
+            //   网格只有 21x7 格 (x 12.8~36.8, z 1.2~8.4)
+            //   但关卡边界墙在 x[7.9,39.9] z[-4.7,15.1], 地板(FloorCollision 一整块大板)
+            //   更是一直铺到 x[2.1,41.4] z[-3.3,29.6]
+            // 那一关的中央是一条从 z=1.2 到 8.4 连着的岛台(x=20), 左右两个厨房区在
+            // **网格范围内根本不连通** —— 通路在网格外面(绕过岛台)。
+            // 只用 GetGridHalfSize 建图, 寻路就会认为"厨师被困在 28 格里", 什么都干不了。
+            // 所以这里按**危险区(边界墙)的世界范围**把索引范围扩大, 超出的格子靠
+            // 向下射线判有没有地面来决定可走性。
+            int gx0 = -hx, gx1 = hx, gz0 = -hz, gz1 = hz;
+            ExpandRangeByHazards(gm, ref gx0, ref gx1, ref gz0, ref gz1, 20);
+
+            w = gx1 - gx0 + 1;
+            h = gz1 - gz0 + 1;
+            total = w * h;
+            if (total > 8000)
+                return "{\"error\":\"grid too large\"}";
+
+            // 缩略图: 原始网格矩形(便于说明"扩了多少")
+            int natW = 2 * hx + 1, natH = 2 * hz + 1;
+            // ==========================================================
+
             // ---- 第一遍: 只判占用物, 顺便数出"空格子"总数 ----
             _conveyorType = SceneScanner.FindType("ConveyorStation");
             _groundMask = ResolveGroundMask();
@@ -167,10 +190,13 @@ namespace Overcooked2AI.Game
                 for (int i = 0; i < w; i++)
                 {
                     int n = j * w + i;
-                    var idx = new GridIndex(i - hx, 0, j - hz);
+                    var idx = new GridIndex(gx0 + i, 0, gz0 + j);
                     Vector3 pos = gm.GetPosFromGridLocation(idx);
                     xs[n] = pos.x;
                     zs[n] = pos.z;
+                    // 注意: 索引超出 GridManager 自身的范围时 GetGridOccupant 会返回 null
+                    // (字典里没有这一项) —— 这正是我们要的: 网格外面没有台面占用,
+                    // 能不能走交给地面射线判。
                     GameObject occObj = gm.GetGridOccupant(idx);
                     if (occObj != null)
                     {
@@ -259,13 +285,15 @@ namespace Overcooked2AI.Game
             }
 
             // ---- 世界坐标映射 ----
+            // 用**扩展后**的索引范围(gx0..gz1), 不是原始的 ±half —— 否则 Python 侧
+            // 按 ox + i*cell 反算出来的坐标会整体错位。
             Vector3 p00 = gm.GetPosFromGridLocation(new GridIndex(0, 0, 0));
             Vector3 p10 = gm.GetPosFromGridLocation(new GridIndex(1, 0, 0));
             Vector3 p01 = gm.GetPosFromGridLocation(new GridIndex(0, 0, 1));
-            Vector3 pLast = gm.GetPosFromGridLocation(new GridIndex(hx, 0, hz));
+            Vector3 pLast = gm.GetPosFromGridLocation(new GridIndex(gx1, 0, gz1));
             float cellX = p10.x - p00.x;
             float cellZ = p01.z - p00.z;
-            Vector3 pMin = gm.GetPosFromGridLocation(new GridIndex(-hx, 0, -hz));
+            Vector3 pMin = gm.GetPosFromGridLocation(new GridIndex(gx0, 0, gz0));
             float ox = pMin.x;
             float oz = pMin.z;
             bool regular = Mathf.Abs(ox + (w - 1) * cellX - pLast.x) < 0.05f
@@ -317,6 +345,60 @@ namespace Overcooked2AI.Game
              .Append(",\"fire\":").Append(nFire).Append("}");
             o.Append("}");
             return o.ToString();
+        }
+
+        /// <summary>按危险区(关卡边界墙)的世界范围扩大索引范围。
+        ///
+        /// 为什么必须扩: `GridManager.GetGridHalfSize()` 只覆盖"厨房"那一小块,
+        /// 而关卡的可走地板往往比它大得多(实测 s_sushi_4_1 的地板是一整块
+        /// FloorCollision, x[2.1,41.4] z[-3.3,29.6], 而网格只有 21x7 格)。
+        /// 不扩的话, 两个厨房区之间"绕岛台走"的通路就完全在网格外,
+        /// 寻路会误判成"厨师被困住"。
+        ///
+        /// 扩出来的格子靠向下射线判地面 —— 网格外没有台面占用(字典里没这一项),
+        /// 所以能不能走完全由地面决定, 这是对的。
+        /// 同时用 margin 封顶, 避免某些关卡的危险区特别大时把网格撑爆。
+        /// </summary>
+        private static void ExpandRangeByHazards(GridManager gm, ref int gx0, ref int gx1,
+                                                 ref int gz0, ref int gz1, int margin)
+        {
+            try
+            {
+                if (gm == null || _haz.Count == 0)
+                    return;
+                Vector3 p0 = gm.GetPosFromGridLocation(new GridIndex(0, 0, 0));
+                Vector3 p1 = gm.GetPosFromGridLocation(new GridIndex(1, 0, 0));
+                Vector3 p2 = gm.GetPosFromGridLocation(new GridIndex(0, 0, 1));
+                float cx = p1.x - p0.x;
+                float cz = p2.z - p0.z;
+                if (Mathf.Abs(cx) < 0.01f || Mathf.Abs(cz) < 0.01f)
+                    return;
+
+                Point3 half = gm.GetGridHalfSize();
+                int limX0 = -half.X - margin, limX1 = half.X + margin;
+                int limZ0 = -half.Z - margin, limZ1 = half.Z + margin;
+
+                int wx0 = gx0, wx1 = gx1, wz0 = gz0, wz1 = gz1;
+                for (int i = 0; i < _haz.Count; i++)
+                {
+                    var hzr = _haz[i];
+                    if (!hzr.Kills)
+                        continue;             // 只按真正的危险区(边界墙/水面)扩
+                    int a = Mathf.FloorToInt((hzr.X0 - p0.x) / cx);
+                    int b = Mathf.CeilToInt((hzr.X1 - p0.x) / cx);
+                    int c = Mathf.FloorToInt((hzr.Z0 - p0.z) / cz);
+                    int d = Mathf.CeilToInt((hzr.Z1 - p0.z) / cz);
+                    if (a < wx0) wx0 = a;
+                    if (b > wx1) wx1 = b;
+                    if (c < wz0) wz0 = c;
+                    if (d > wz1) wz1 = d;
+                }
+                gx0 = Mathf.Max(wx0, limX0);
+                gx1 = Mathf.Min(wx1, limX1);
+                gz0 = Mathf.Max(wz0, limZ0);
+                gz1 = Mathf.Min(wz1, limZ1);
+            }
+            catch (Exception) { }
         }
 
         private static GridManager ResolveGridManager()
