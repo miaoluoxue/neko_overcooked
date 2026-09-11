@@ -574,21 +574,81 @@ class Engine:
             return False
         return h == w or h.startswith(w)
 
+    def _stand_cell(self, tm, tx: float, tz: float, cx: float, cz: float):
+        """找一个"能站、够得着目标、且离厨师最近"的格子 —— 该站哪儿去拿东西。
+
+        为什么不能直接朝台面坐标走(用户实测指出的问题):
+          台面(含**台面传送带 ConveyorStation**)本身就是**障碍格**, 厨师站不上去。
+          直接 navigate(tx,tz) 等于顶着橱柜往里推 —— 表现就是"卡住 + 超时(还差 1.0 格)"。
+          s_sushi_4_5 的传送带是**环绕四周一整圈**的, 食材就在这一圈上跑;
+          玩家能拿到的只有"这一圈旁边那些没被遮挡的格子"。
+        所以正确做法: 从目标的相邻格里挑一个 **可走 + 从厨师出发真的到得了** 的,
+        站进那一格中心, 再转身面向目标交互
+        (交互半径 1.0, 格距 1.2 —— 站在相邻格刚好够得着)。
+
+        返回 (世界x, 世界z) 或 None。
+        """
+        if tm is None or not tm.ok:
+            return None
+        i, j = tm.cell_of(tx, tz)
+        reach = tm.reachable_from(cx, cz)
+        best, best_d = None, None
+        for dj in range(-2, 3):
+            for di in range(-2, 3):
+                if di == 0 and dj == 0:
+                    continue
+                c = (i + di, j + dj)
+                if not tm.walkable(*c):
+                    continue
+                if c not in reach:
+                    continue          # 站得到但过不去, 等于没用
+                wx, wz = tm.world_of(*c)
+                d = (wx - cx) ** 2 + (wz - cz) ** 2
+                if best_d is None or d < best_d:
+                    best_d, best = d, (wx, wz)
+        return best
+
     def _approach(self, km: KitchenMap, tx: float, tz: float, attempt: int = 0,
                   tight: float = 0.8) -> bool:
-        """接近一个台子。
+        """接近一个台子并**转身面向它**。
 
-        第 1 次寻路直取。若拿错了(相邻台子只隔 1.2 格, 游戏是靠"朝向"决定交互哪个),
-        就换个方向绕过去: 先到侧面一个点, 再朝目标走最后一段 ——
-        这样最后一步的朝向一定对着目标, 交互就会选中它。
+        先站到"能站的相邻格", 再转身 —— 而不是朝台面本身推(那是障碍格)。
+        attempt>0(上一次拿错了)时换个方位站: 相邻台子只隔 1.2 格, 游戏靠朝向决定
+        交互哪一个, 换个方向最后一步的朝向就不同。
         """
+        st = self.state()
+        cx, cz, _ = self.pos(st) if st else (None, None, "")
+        if cx is not None:
+            tm = self.terrain()
+            gx, gz = tx, tz
+            if attempt > 0 and tm is not None and tm.ok:
+                import math
+                ang = attempt * 2.39996          # 黄金角, 每次方位都不同
+                px, pz = tx + 1.3 * math.cos(ang), tz + 1.3 * math.sin(ang)
+                if tm.walkable(*tm.cell_of(px, pz)):
+                    gx, gz = px, pz
+            spot = self._stand_cell(tm, gx, gz, cx, cz)
+            if spot is not None:
+                sx, sz = spot
+                ok = self.navigate_smart(km, sx, sz, tight=min(tight, 0.5))
+                if ok:
+                    self.face(tx, tz)    # 站好之后转身面向真正要交互的台子
+                return ok
+
+        # 兜底: 地形不可用 / 找不到能站的格子 —— 退回老办法
         if attempt <= 0:
-            return self.navigate_smart(km, tx, tz, tight=tight)
+            ok = self.navigate_smart(km, tx, tz, tight=tight)
+            if ok:
+                self.face(tx, tz)
+            return ok
         import math
-        ang = attempt * 2.39996          # 黄金角, 保证每次来的方向都不同
+        ang = attempt * 2.39996
         px, pz = tx + 1.6 * math.cos(ang), tz + 1.6 * math.sin(ang)
         self.navigate_smart(km, px, pz, tight=0.6)
-        return self.navigate_smart(km, tx, tz, tight=max(0.45, tight - 0.3))
+        ok = self.navigate_smart(km, tx, tz, tight=max(0.45, tight - 0.3))
+        if ok:
+            self.face(tx, tz)
+        return ok
 
     def _find_item_station(self, km: KitchenMap, target: str,
                            x: float = None, z: float = None,
@@ -849,9 +909,23 @@ class Engine:
                     self.log(f"[导航] 路径点 ({px:.1f},{pz:.1f}) 到不了, 继续下一个")
                     continue                       # 跳过去, 别把整条路径判死
                 x, z = px, pz
-            # 最后朝真实目标靠一次(宽松到达即可), 并且**转过去面对它** ——
-            # 交互判定是朝向敏感的(只认前方 180° 半圆), 背对着按交互键等于没按。
-            ok = self.navigate(tx, tz, arrive=1.4, tight=tight)
+            # 最后一步: **别朝台面本身推**。
+            # 台面(含台面传送带)是障碍格, 厨师站不上去 —— 朝它走就是顶着橱柜推,
+            # 表现成"卡住 + 超时(还差 1.0 格)"。目标是障碍格时改成站到旁边能站的格,
+            # 然后转身面对它(交互半径 1.0、格距 1.2, 站相邻格刚好够得着)。
+            goal_walk = (tm is not None and tm.ok and tm.walkable(*tm.cell_of(tx, tz)))
+            if goal_walk:
+                ok = self.navigate(tx, tz, arrive=1.4, tight=tight)
+            else:
+                spot = None
+                st3 = self.state()
+                cx3, cz3, _ = self.pos(st3) if st3 else (None, None, "")
+                if tm is not None and tm.ok and cx3 is not None:
+                    spot = self._stand_cell(tm, tx, tz, cx3, cz3)
+                if spot is not None:
+                    ok = self.navigate(spot[0], spot[1], arrive=1.2, tight=tight)
+                else:
+                    ok = self.navigate(tx, tz, arrive=1.4, tight=tight)
             if ok:
                 self.face(tx, tz)
             return ok
