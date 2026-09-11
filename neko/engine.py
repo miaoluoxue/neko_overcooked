@@ -346,17 +346,30 @@ class Engine:
             self.kb.chop()
         elif kind == "dash":
             self.kb.dash()
-        time.sleep(0.35)
         if not verify_hold_change:
+            time.sleep(0.35)
             return True
-        st2 = self.state()
-        if not st2 or not st2.get("inRound"):
-            return False
-        _, _, held_after = self.pos(st2)
-        changed = (held_before or "") != (held_after or "")
-        if not changed:
-            self.log(f"[交互] {kind}: 持有物未变({held_before!r}→{held_after!r})")
-        return changed
+
+        # **轮询确认, 而不是只看一眼**。
+        # 实测踩的坑: 用户看到"厨师拿了东西又放下"。原因是原来只等 0.35 秒读一次 held,
+        # 读到空就判失败 → execute 重试 → **再按一次 pickup 把刚拿到的东西放回去了**。
+        # 拿/放是同一个键的开关, 所以"误判失败"的代价不是白跑一趟, 而是把战果毁掉。
+        # 这里最多轮询 1.6 秒, 只要中途看到变了就算成功。
+        seen = [(held_before or "")]
+        t0 = time.time()
+        while time.time() - t0 < 1.6:
+            time.sleep(0.18)
+            st2 = self.state()
+            if not st2 or not st2.get("inRound"):
+                return False
+            _, _, held_after = self.pos(st2)
+            cur = held_after or ""
+            seen.append(cur)
+            if cur != (held_before or ""):
+                return True
+        self.log("[交互] %s: 持有物始终未变(%s) —— 可能没站到位/没朝向目标"
+                 % (kind, "→".join(repr(s) for s in seen[:4])))
+        return False
 
     # ---------------- 组装台面 ----------------
     def pick_assemble_spot(self, km: KitchenMap, x: float, z: float) -> Station | None:
@@ -746,6 +759,15 @@ class Engine:
                     return False
                 tx, tz = src.x, src.z
                 self.log(f"[步骤] 取 {op.target} @({tx:.1f},{tz:.1f})")
+
+        # **食材在台面传送带上**: 会自己移动, 追不上 —— 站旁边等它漂过来。
+        # (实测三次重试的目标每次只差一格: 26.4 → 25.2 → 24.0, 就是它在跑)
+        if live is not None and live.id.startswith("conveyor"):
+            self.log(f"[步骤] {op.target} 在传送带上 @{live.id}({tx:.1f},{tz:.1f}), 站旁边等它过来")
+            if self._grab_from_belt(km, op, x, z):
+                return True
+            return False
+
         # 先粗到再收紧: 相邻台子太近, 站远了会拿错
         if not self._approach(km, tx, tz, attempt):
             return False
@@ -758,6 +780,62 @@ class Engine:
             self.interact("pickup", verify_hold_change=False)
             return False
         return True
+
+    def _grab_from_belt(self, km: KitchenMap, op: Op, x: float, z: float,
+                        budget: float = 12.0) -> bool:
+        """在传送带旁边**等**食材漂过来再抓 —— 不要去追。
+
+        为什么不能追(实测数据):
+          食材在台面传送带上以 0.5 格/秒移动。日志里三次重试的目标分别是
+              conveyor57(26.4,10.8) → conveyor28(25.2,10.8) → conveyor7(24.0,10.8)
+          每次正好差 1.2 = **一格** —— 也就是说每次重试时它已经又走了一格。
+          厨师去追的话, 闭环控制的每一步都有开销(读状态/发键/等确认), 有效速度
+          远低于"它跑我追"所需的提前量, 永远差一格。
+        人玩这一关也是**站在传送带边上等它过来** —— 照做就行。
+
+        还会做两件事:
+          · 每次按键前重新 face() 朝向食材**当前**位置(交互只认前方 180°)
+          · 只站到旁边能站、且真的到得了的格子(传送带本身走不上去)
+        """
+        tm = self.terrain()
+        t_end = time.time() + budget
+        grabs = 0
+        while time.time() < t_end:
+            if not self.round_active():
+                return False
+            st = self.state()
+            cx, cz, held = self.pos(st) if st else (None, None, "")
+            if cx is None:
+                return False
+            if self._held_is(held, op.target):
+                return True                      # 已经拿到了
+
+            live = self._find_item_station(km, op.target, cx, cz)
+            if live is None:
+                time.sleep(0.4)
+                continue
+
+            d = ((live.x - cx) ** 2 + (live.z - cz) ** 2) ** 0.5
+            if d <= 1.5:
+                # 够得着了: 先转身面向它**当前**的位置, 再抓
+                self.face(live.x, live.z)
+                if self.interact("pickup", verify_hold_change=True):
+                    return True
+                grabs += 1
+                if grabs >= 5:
+                    return False
+                time.sleep(0.2)
+                continue
+
+            # 还太远: 挪到它旁边一个能站的格子, 然后继续等
+            if tm is not None and tm.ok:
+                spot = self._stand_cell(tm, live.x, live.z, cx, cz)
+                if spot is not None:
+                    self.navigate_smart(km, spot[0], spot[1], tight=0.5)
+                    self.face(live.x, live.z)
+            time.sleep(0.15)
+        self.log(f"[步骤] 等了 {budget:.0f} 秒 {op.target} 也没漂到够得着的地方")
+        return False
 
     def op_take_plate(self, km, x, z, op: Op, flow: DishFlow) -> bool:
         """摆盘: 准备好"装着菜的容器"。
