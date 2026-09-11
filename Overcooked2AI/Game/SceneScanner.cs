@@ -786,6 +786,8 @@ namespace Overcooked2AI.Game
             catch (Exception) { }
         }
 
+        private static volatile string _lastReflectErr = "";
+
         private static string ReadFromCarrier(GameObject chefGo, string typeName)
         {
             try
@@ -796,13 +798,37 @@ namespace Overcooked2AI.Game
                 var carrier = chefGo.GetComponentInChildren(ct);
                 if (carrier == null)
                     return "";
-                var m = ct.GetMethod("InspectCarriedItem");
+                // ⚠ **必须显式给空参数列表**:
+                //   这两个类各有**两个重载**
+                //       ClientPlayerAttachmentCarrier.cs:69  InspectCarriedItem()
+                //       ClientPlayerAttachmentCarrier.cs:74  InspectCarriedItem(PlayerAttachTarget)
+                //       ServerPlayerAttachmentCarrier.cs:100 / :105 同上
+                //   而 Type.GetMethod("名字") 在名字匹配到多个重载时会抛
+                //   **AmbiguousMatchException** —— 之前这个异常被 catch(Exception){} 吞掉,
+                //   于是 held 永远读成空串: 引擎以为"没拿到" -> 重试再按一次 pickup
+                //   -> **把刚拿到的东西放回去**。这就是"拿了又放下"的真正根因,
+                //   而且从第一版起就存在。
+                var m = ct.GetMethod("InspectCarriedItem", Type.EmptyTypes);
                 if (m == null)
+                {
+                    _lastReflectErr = typeName + ".InspectCarriedItem 找不到无参重载";
                     return "";
+                }
                 var item = m.Invoke(carrier, null) as UnityEngine.Object;
                 return item == null ? "" : SafeName(item.name);
             }
-            catch (Exception) { return ""; }
+            catch (Exception ex)
+            {
+                // 不要再静默吞掉 —— 这个 bug 被 catch{} 藏了很久
+                _lastReflectErr = typeName + ": " + ex.GetType().Name + " " + ex.Message;
+                return "";
+            }
+        }
+
+        /// <summary>把最近一次反射错误吐给桥, 便于在日志里看到(不再静默失败)。</summary>
+        public static string LastReflectError()
+        {
+            return _lastReflectErr;
         }
 
         private static string ReadHeldItem(GameObject chefGo)

@@ -382,10 +382,13 @@ class Engine:
             seen.append(cur)
             if cur != (held_before or ""):
                 return True
-        self.log("[交互] %s: 持有物始终未变(%s); 游戏说此刻可作用: 抓取=%r 工位=%r"
+        c = self.chef(self.state() or {})
+        self.log("[交互] %s: 持有物始终未变(%s); 游戏说此刻可作用: 抓取=%r 工位=%r; "
+                 "手持(服务端)=%r 手持(客户端)=%r 位置=(%.1f,%.1f)"
                  % (kind, "→".join(repr(s) for s in seen[:3]),
-                    (self.chef(self.state() or {}).get("pick") or "(空, 新版dll才有)"),
-                    (self.chef(self.state() or {}).get("use") or "(空, 新版dll才有)")))
+                    (c.get("pick") or "(空)"), (c.get("use") or "(空)"),
+                    (c.get("held") or ""), (c.get("heldc") or ""),
+                    float(c.get("x") or 0), float(c.get("z") or 0)))
         return False
 
     # ---------------- 组装台面 ----------------
@@ -666,8 +669,30 @@ class Engine:
         out.sort()
         return [(wx, wz) for _, wx, wz in out]
 
+    def _aim_ok(self, st: dict, want: str) -> bool:
+        """**用游戏自己的判定**确认"现在按交互键能作用到目标 want"。
+
+        为什么不能靠比距离(实测教训):
+          第一单拿到食材时厨师离目标 1.03 格; 第二单离 1.33 格时游戏说
+          "抓取=(空) 工位=(空)" —— 什么都不在范围内。
+          我原来用"距离 <= 1.5 就算到位"的阈值是**我自己编的**, 和游戏不一致。
+          而交互真实判据是 InteractWithItemHelper.IsColliderInArc
+          (InteractWithItemHelper.cs:153-163): 到**碰撞体表面**的距离 < 1.0
+          且朝向前 180°。台面有体积, 拿"格子中心距离"比根本没有可比性。
+          所以直接比对游戏报的 pick/use 名字。
+        """
+        pick, use = self.interaction_targets(st)
+        w = self._norm(want)
+        if not w:
+            return bool(pick or use)
+        for got in (pick, use):
+            g = self._norm(got)
+            if g and (g == w or w in g or g in w):
+                return True
+        return False
+
     def _approach(self, km: KitchenMap, tx: float, tz: float, attempt: int = 0,
-                  tight: float = 0.8) -> bool:
+                  tight: float = 0.8, want: str = "") -> bool:
         """接近一个台子并**转身面向它**。
 
         先站到"能站的相邻格", 再转身 —— 而不是朝台面本身推(那是障碍格)。
@@ -699,20 +724,27 @@ class Engine:
                 last_df = None
                 for (sx, sz) in cands:
                     self.navigate_smart(km, sx, sz, tight=min(tight, 0.5))
+                    self.face(tx, tz)          # 先转身, 交互只认前 180°
                     st2 = self.state()
                     px, pz, _ = self.pos(st2) if st2 else (None, None, "")
                     if px is None:
                         continue
                     df = ((tx - px) ** 2 + (tz - pz) ** 2) ** 0.5
                     last_df = df
-                    self.log("[接近] 试站位(%.1f,%.1f) → 实到位(%.1f,%.1f), 离目标 %.2f 格 %s"
-                             % (sx, sz, px, pz, df,
-                                "✓" if df <= 1.5 else "✗ 仍太远"))
-                    if df <= 1.5:
-                        self.face(tx, tz)      # 站好之后转身面向真正要交互的台子
+                    # **以游戏自己的判定为准** —— 见 _aim_ok 的说明
+                    if want:
+                        ok_aim = self._aim_ok(st2, want)
+                        pick, use = self.interaction_targets(st2)
+                        self.log("[接近] 试站位(%.1f,%.1f) → (%.1f,%.1f) 距 %.2f 格; "
+                                 "游戏说可作用: 抓取=%r 工位=%r %s"
+                                 % (sx, sz, px, pz, df, pick, use,
+                                    "✓ 就是它" if ok_aim else "✗ 不是它/不在范围"))
+                        if ok_aim:
+                            return True
+                    elif df <= 1.0:
                         return True
                 if last_df is not None:
-                    self.log("[接近] ✗ 所有站位都够不到目标(最近 %.2f 格) —— 这一步多半做不了"
+                    self.log("[接近] ✗ 所有站位游戏都说作用不到目标(最近 %.2f 格) —— 这一步做不了"
                              % last_df)
 
         # 兜底: 地形不可用 / 找不到能站的格子 —— 退回老办法
@@ -834,8 +866,10 @@ class Engine:
                 return True
             return False
 
-        # 先粗到再收紧: 相邻台子太近, 站远了会拿错
-        if not self._approach(km, tx, tz, attempt):
+        # 先粗到再收紧: 相邻台子太近, 站远了会拿错。
+        # want=目标台面的名字 —— 让游戏自己确认"现在按抓取键能作用到它"。
+        want_name = live.name if live is not None else ""
+        if not self._approach(km, tx, tz, attempt, want=want_name):
             return False
         if not self.interact("pickup", verify_hold_change=True):
             return False

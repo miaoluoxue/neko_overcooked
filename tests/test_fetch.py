@@ -79,8 +79,9 @@ class FakeBridge:
 
 def make_engine(lay):
     e = Engine(FakeBridge(lay), cid=0, log=lambda *a: None)
-    # 屏蔽掉真正会走路的两个动作, 只测"货源决策"这一段
-    e._approach = lambda km, tx, tz, attempt=0, tight=0.8: True
+    # 屏蔽掉真正会走路的两个动作, 只测"货源决策"这一段。
+    # 注意用 **k 兜住将来新增的关键字参数 —— 否则签名一变测试就假失败。
+    e._approach = lambda km, tx, tz, attempt=0, tight=0.8, **k: True
     e.interact = lambda *a, **k: True
     e.terrain = lambda force=False: None
     return e
