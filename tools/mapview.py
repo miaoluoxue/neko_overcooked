@@ -20,6 +20,128 @@ sys.path.insert(0, os.path.join(_ROOT, "neko"))
 
 from neko.bridge.client import BridgeClient, BridgeError   # noqa: E402
 from neko.terrain import TerrainMap                        # noqa: E402
+from neko.map_model import KitchenMap                      # noqa: E402
+
+# 语义 → 台面分布图里的字母。地形图和台面图用**不同**的字母集, 免得两套含义打架
+# (地形图里 'C' 是台面传送带格子, 台面图里 'C' 也只是同一个意思, 但 'S'/'W' 等只属于台面图)。
+SEM_LETTER = {
+    "serve": "S",           # 送餐口
+    "plates": "P",          # 干净盘子堆
+    "dirty_plates": "D",    # 脏盘子堆
+    "return_plates": "R",   # 盘子回收
+    "board": "B",           # 切菜板
+    "hob": "K", "oven": "K", "fryer": "K", "heat": "K",   # 灶台/加热
+    "mix": "M",             # 搅拌
+    "auto": "A",            # 自动工位
+    "wash": "W",            # 洗手池
+    "bin": "X",             # 垃圾桶
+    "crate": "G",           # 食材箱/分发器
+    "counter": "c",         # 普通台面
+    "conveyor": "C",        # 台面传送带
+    "switch": "U",          # 按钮
+    "teleport": "O",        # 传送门
+    "terminal": "N",        # 驾驶台
+    "cannon": "Z",          # 大炮
+    "pushable": "Q",        # 可推物体
+    "cooking_region": "Y",  # 烹饪区域
+    "hazard": "!",          # 危险物
+}
+
+SEM_NAME = {
+    "serve": "送餐口", "plates": "干净盘子堆", "dirty_plates": "脏盘子堆",
+    "return_plates": "盘子回收", "board": "切菜板", "hob": "灶台/锅",
+    "oven": "烤箱", "fryer": "炸锅", "heat": "加热台", "mix": "搅拌台",
+    "auto": "自动工位", "wash": "洗手池", "bin": "垃圾桶", "crate": "食材箱",
+    "counter": "普通台面", "conveyor": "台面传送带", "switch": "按钮",
+    "teleport": "传送门", "terminal": "驾驶台", "cannon": "大炮",
+    "pushable": "可推物体", "cooking_region": "烹饪区域", "hazard": "危险物",
+}
+
+# 台面清单的分组顺序(按做菜流程排, 不是字母序)
+SEM_ORDER = ["crate", "board", "hob", "oven", "fryer", "heat", "mix", "auto",
+             "plates", "dirty_plates", "return_plates", "serve", "wash", "bin",
+             "counter", "conveyor", "switch", "teleport", "terminal", "cannon",
+             "pushable", "cooking_region", "hazard"]
+
+
+def _sem_of(s: dict) -> str:
+    return KitchenMap.classify(s.get("name", ""), s.get("kind", ""),
+                               s.get("sub", ""), s.get("spawn", ""))
+
+
+def _print_stations(st: dict, tm, at=None) -> list:
+    """把台面层画成第二张图 + 分组清单。
+
+    为什么要单独一张图: 在地形图里所有台面都是 '#' —— 因为都走不上去。
+    于是"哪是菜板、哪是送餐口、哪是垃圾桶"完全看不出来, 而这些恰恰是脚本要交互的目标。
+    """
+    stations = ((st or {}).get("layout") or {}).get("stations") or []
+    print("\n================ 台面分布 ================")
+    if not stations:
+        print("(这一帧没有读到台面 —— 不在对局里? 或者需要 --force)")
+        return []
+
+    cellmap = {}
+    for s in stations:
+        try:
+            i, j = tm.cell_of(float(s.get("x") or 0), float(s.get("z") or 0))
+        except (TypeError, ValueError):
+            continue
+        cellmap.setdefault((i, j), []).append(s)
+
+    mark = tm.cell_of(at[0], at[1]) if at else None
+
+    for j in range(tm.h - 1, -1, -1):
+        line = []
+        for i in range(tm.w):
+            if mark == (i, j):
+                line.append("@")
+                continue
+            lst = cellmap.get((i, j))
+            if not lst:
+                # 非台面格: 显示地形(只保留 走/墙 两种, 免得跟台面字母混)
+                ch = tm.at(i, j)
+                line.append(ch if ch in "#." else ".")
+                continue
+            line.append(SEM_LETTER.get(_sem_of(lst[0]), "?"))
+        print("".join(line))
+
+    # 图例按字母去重(K/烤箱/炸锅/加热台 共用一个字母, 别重复列四遍)
+    seen_letter = []
+    for k in SEM_ORDER:
+        if k not in SEM_LETTER:
+            continue
+        L = SEM_LETTER[k]
+        if L in [x[0] for x in seen_letter]:
+            continue
+        seen_letter.append((L, SEM_NAME.get(k, k)))
+    print("台面图例: " + "  ".join("%s=%s" % (L, nm) for L, nm in seen_letter))
+
+    groups = {}
+    for s in stations:
+        groups.setdefault(_sem_of(s), []).append(s)
+    print("\n--- 台面清单 (%d 个) ---" % len(stations))
+    keys = [k for k in SEM_ORDER if k in groups] + \
+           [k for k in sorted(groups) if k not in SEM_ORDER]
+    for sem in keys:
+        lst = sorted(groups[sem],
+                     key=lambda a: (float(a.get("z") or 0), float(a.get("x") or 0)))
+        print("  [%s] %s ×%d" % (SEM_LETTER.get(sem, "?"), SEM_NAME.get(sem, sem), len(lst)))
+        for s in lst:
+            bits = []
+            if s.get("sub"):
+                bits.append("子类=%s" % s["sub"])
+            if s.get("spawn"):
+                bits.append("产出=%s" % s["spawn"])
+            if s.get("ing"):
+                bits.append("内含=%s" % s["ing"])
+            n = s.get("n")
+            if n:
+                bits.append("台上%d件%s" % (int(n), s.get("on") or []))
+            print("      %-24s (%6.2f,%6.2f)  %s" % (
+                s.get("id", "?"), float(s.get("x") or 0), float(s.get("z") or 0),
+                "  ".join(bits)))
+    return stations
 
 LEGEND = """
 图例:  .  可走        #  被墙/橱柜/台面占住
@@ -91,6 +213,9 @@ def main() -> int:
             len(danger), min(xs), max(xs), min(zs), max(zs)))
     else:
         print("这一关没有危险格 —— 脚本可以放心直走。")
+
+    # 台面层: 地形图之外真正要交互的那一层
+    _print_stations(st, tm, at)
 
     # 机关/陷阱: 静态网格看不见的那一层
     try:

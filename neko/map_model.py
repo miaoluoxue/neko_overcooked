@@ -15,17 +15,33 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 # kind(组件类型名) → 语义
+# 键一律小写, 对应 SceneScanner.StationTypes 里的类型名。
 _KIND_SEM = {
+    # 盘子体系
     "platestation": "serve",          # 送餐口
     "cleanplatestack": "plates",      # 干净盘子堆(取盘)
     "dirtyplatestack": "dirty_plates",
     "platereturnstation": "return_plates",
-    "rubbishbin": "bin",
-    "washingstation": "wash",
-    "conveyorstation": "conveyor",   # 台面传送带: 放上去的东西会被传走, 别当普通台面用
+    # 功能台
+    "rubbishbin": "bin",              # 垃圾桶
+    "washingstation": "wash",         # 洗手池
+    "conveyorstation": "conveyor",    # 台面传送带: 放上去的东西会被传走, 别当普通台面用
+    "switchstation": "switch",        # 按钮(交互键可按)
+    # 灶台类(HeatedCookingStation 是 CookingStation 的派生类, 由 classify 里单独分流)
+    "heatedstation": "heat",          # 加热容器台
     "mixingstation": "mix",
     "autoworkstation": "auto",
-    "switchstation": "switch",
+    # 关卡机关
+    "teleportal": "teleport",         # 传送门
+    "terminal": "terminal",           # 驾驶台(移动平台的操控)
+    "cannon": "cannon",               # 大炮
+    "pushableobject": "pushable",     # 可推物体(会把厨师推开)
+    "cookingregion": "cooking_region",
+    # 生成器 = 食材箱 / 分发器
+    "pickupitemspawner": "crate",
+    "attachitemspawner": "crate",
+    "placementitemspawner": "crate",
+    # 危险物
     "firehazard": "hazard",
     "splathazard": "hazard",
 }

@@ -14,24 +14,48 @@ namespace Overcooked2AI.Game
         //   PlateStation   = 送餐口(放上"装了菜的盘子"才算送餐)
         //   CleanPlateStack= 干净盘子堆 —— 盘子唯一的来源(PlateStation.m_createPlateTime 是废弃字段, 不放盘子)
         //   Workstation    = 切菜板(负责 chop); AttachStation = 普通台面(只能放/拿)
+        //
+        // **顺序有语义**: 这个循环是"先匹配到的类型赢"(见 Scan() 里的 seen 去重), 而
+        // FindObjectsOfType(基类) 会把子类实例也返回, 所以**派生类必须排在基类前面**。
+        // 实测踩到: HeatedCookingStation : CookingStation, 原来 "CookingStation" 排在前面,
+        // 于是加热灶台全被记成普通灶台, 子类型信息直接丢了。
+        //
+        // 清单来源: MultiplayerController.m_EntitySerialiser.AddSynchronisedType(...)
+        //   (MultiplayerController.cs:273-556) —— 游戏自己登记的全部可同步玩法对象。
         private static readonly string[] StationTypes =
         {
-            "PlateStation",
-            "CleanPlateStack",
-            "DirtyPlateStack",
-            "PlateReturnStation",
-            "CookingStation",
-            "HeatedCookingStation",
-            "MixingStation",
-            "AutoWorkstation",
-            "ConveyorStation",
-            "WashingStation",
-            "SwitchStation",
-            "RubbishBin",
+            // 盘子体系
+            "PlateStation",          // 送餐口
+            "CleanPlateStack",       // 干净盘子堆(取盘)
+            "DirtyPlateStack",       // 脏盘子堆
+            "PlateReturnStation",    // 盘子回收
+            // 灶台: 派生类在前
+            "HeatedCookingStation",  // 加热型灶台(烤箱/炸锅一类)
+            "HeatedStation",         // 加热容器台(单独一类, 见 HeatedStation.cs)
+            "CookingStation",        // 普通灶台(锅)
+            "MixingStation",         // 搅拌
+            "AutoWorkstation",       // 自动工位
+            // 功能台
+            "WashingStation",        // 洗手池(洗盘子)
+            "RubbishBin",            // 垃圾桶
+            "ConveyorStation",       // 台面传送带(物品会被传走)
+            "SwitchStation",         // 按钮(交互键可按)
+            // 关卡机关(MultiplayerController 注册表里确认存在)
+            "Teleportal",            // 传送门
+            "Terminal",              // 驾驶台(移动平台的操控)
+            "Cannon",                // 大炮
+            "PushableObject",        // 可推物体
+            "CookingRegion",         // 烹饪区域
+            // 生成器: 食材箱/分发器。箱子可能只挂这些, 不挂 AttachStation
+            "PickupItemSpawner",
+            "AttachItemSpawner",
+            "PlacementItemSpawner",
+            // 基础台
+            "Workstation",           // 切菜板
+            "AttachStation",         // 普通台面(兜底, 必须靠后)
+            // 危险物
             "FireHazard",
             "SplatHazard",
-            "Workstation",
-            "AttachStation",
         };
 
         private static readonly string[] ChefMarkers =
