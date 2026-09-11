@@ -33,6 +33,7 @@ namespace Overcooked2AI.Game
     ///   'T'  被 "Travelator" 占用(传送带)'H'  危险区(水面/岩浆) —— 空着, 但踩上去会死
     ///   'V'  空洞(空着, 但脚下没地面)
     ///   'v'  地板太低(单向落差 / 正在下沉的平台, 例如会沉的荷叶)
+    ///   'C'  台面传送带(ConveyorStation): 走不上去, 而且放上去的东西会被传走
     /// </summary>
     public static class LevelInfo
     {
@@ -46,12 +47,19 @@ namespace Overcooked2AI.Game
             public string Type;
             public float X0, X1, Z0, Z1, Y0, Y1;
             public bool KillPlane;
-            public bool Kills;     // 类型致命 且 与本地板同高
-            public bool Use;       // 最终真的拿来当危险格
-            public int Cells;      // 覆盖了多少个空格子
+            public bool WorldVolume;   // 体积远大于整个网格 = 世界级体积(真·KillPlane), 不是本地危险区
+            public bool Kills;         // 类型致命 且 与本地板同高 且 不是世界级体积
+            public bool Use;           // 最终真的拿来当危险格
+            public int Cells;          // 覆盖了多少个空格子
         }
 
         private static readonly List<Haz> _haz = new List<Haz>();
+
+        /// <summary>RespawnCollider 的类型, 缓存给 FloorChar 用。</summary>
+        private static Type _respawnType;
+
+        /// <summary>ConveyorStation 的类型, 缓存给 OccupantChar 用。</summary>
+        private static Type _conveyorType;
 
         /// <summary>桥 Job: kind="map", arg 可含 "force" 强制重建。</summary>
         public static string Snapshot(string arg)
@@ -107,9 +115,13 @@ namespace Overcooked2AI.Game
             int total = w * h;
 
             float floorY = ReadChefFloorY();
-            CollectHazards(floorY);
+            // 网格的世界尺寸 —— 用来识别"世界级体积"(铺满整图的 KillPlane)
+            Vector3 gA = gm.GetPosFromGridLocation(new GridIndex(-hx, 0, -hz));
+            Vector3 gB = gm.GetPosFromGridLocation(new GridIndex(hx, 0, hz));
+            CollectHazards(floorY, Mathf.Abs(gB.x - gA.x), Mathf.Abs(gB.z - gA.z));
 
             // ---- 第一遍: 只判占用物, 顺便数出"空格子"总数 ----
+            _conveyorType = SceneScanner.FindType("ConveyorStation");
             var occ = new char[total];
             var xs = new float[total];
             var zs = new float[total];
@@ -159,7 +171,11 @@ namespace Overcooked2AI.Game
                 }
                 else if (hzr.Type == "Drowning")
                 {
-                    hzr.Use = covered > 0;               // 水面/岩浆: 一律致命
+                    // 水面/岩浆基本一律致命, 但仍要留一道保险丝:
+                    // s_sushi_4_5 实测那个"真 KillPlane"的类型就是 **Drowning**
+                    // (x[-28,42] y[-1.50,-0.50] z[-30,40], 比整张图还大)。
+                    // 覆盖超过 80% 可走格的水面不可能"绕过去", 那它就不是本地危险区。
+                    hzr.Use = covered > 0 && covered * 5 <= freeCount * 4;
                 }
                 else
                 {
@@ -172,17 +188,13 @@ namespace Overcooked2AI.Game
             // ---- 第二遍: 出字符 ----
             var sb = new StringBuilder(total);
             int nFree = 0, nBlocked = 0, nHaz = 0, nVoid = 0, nVoidLow = 0,
-                nPlat = 0, nTravel = 0, nFire = 0;
+                nPlat = 0, nTravel = 0, nFire = 0, nConveyor = 0;
             for (int n = 0; n < total; n++)
             {
                 char ch;
                 if (occ[n] != '\0')
                 {
                     ch = occ[n];
-                }
-                else if (IsPointHazard(xs[n], zs[n]))
-                {
-                    ch = 'H';
                 }
                 else if (IsPointHazard(xs[n], zs[n]))
                 {
@@ -204,6 +216,7 @@ namespace Overcooked2AI.Game
                     case 'v': nVoidLow++; break;
                     case 'P': nPlat++; break;
                     case 'T': nTravel++; break;
+                    case 'C': nConveyor++; break;
                     case 'F': nFire++; break;
                     default: nBlocked++; break;
                 }
@@ -264,6 +277,7 @@ namespace Overcooked2AI.Game
              .Append(",\"voidLow\":").Append(nVoidLow)
              .Append(",\"platform\":").Append(nPlat)
              .Append(",\"travelator\":").Append(nTravel)
+             .Append(",\"conveyor\":").Append(nConveyor)
              .Append(",\"fire\":").Append(nFire).Append("}");
             o.Append("}");
             return o.ToString();
@@ -302,6 +316,12 @@ namespace Overcooked2AI.Game
                 return 'P';
             if (tag == "Travelator")
                 return 'T';
+            // 台面传送带 (s_sushi_4_5 实测 83 个): 台面上放了东西会被**一格一格传走**,
+            // 所以它既是障碍(走不上去), 又是"不能久放物品"的台面。
+            // 依据 ConveyorStation.cs:3 的 RequireComponent(TabletopConveyenceReceiver, ...)
+            // 与 ServerConveyorStation.ConveyTo —— 它搬的是**物品**, 不是厨师。
+            if (_conveyorType != null && occ.GetComponent(_conveyorType) != null)
+                return 'C';
             return '#';
         }
 
@@ -330,6 +350,13 @@ namespace Overcooked2AI.Game
                 RaycastHit hit;
                 if (!Physics.Raycast(new Vector3(x, floorY + 0.6f, z), Vector3.down,
                                      out hit, 1.8f))
+                    return 'V';
+                // **打到 RespawnCollider 不算地面**。这是实测踩到的坑:
+                // s_sushi_4_5 里真正的 KillPlane 是 x[-28,42] y[-1.50,-0.50] z[-30,40]
+                // —— 铺满整张图, 顶面在 y=-0.5。而本射线从 floorY+0.6 往下 1.8, 正好到 y=-1.2,
+                // 于是**每一个格子都会命中它**, 空洞检测形同虚设(换到真有坑的地图就会掉下去)。
+                if (_respawnType != null && hit.collider != null &&
+                    hit.collider.gameObject.GetComponent(_respawnType) != null)
                     return 'V';
                 if (hit.point.y < floorY - 0.6f)
                     return 'v';
@@ -362,17 +389,21 @@ namespace Overcooked2AI.Game
             }
         }
 
-        private static void CollectHazards(float floorY)
+        /// <summary>收集所有 RespawnCollider。gridW/gridD 是整张网格的世界尺寸, 用来识别"世界级体积"。</summary>
+        private static void CollectHazards(float floorY, float gridW, float gridD)
         {
             _haz.Clear();
+            _respawnType = null;
             try
             {
                 var hazType = SceneScanner.FindType("RespawnCollider");
                 if (hazType == null)
                     return;
+                _respawnType = hazType;
                 var objs = UnityEngine.Object.FindObjectsOfType(hazType);
                 if (objs == null)
                     return;
+                float gridArea = Mathf.Max(1f, gridW * gridD);
                 for (int i = 0; i < objs.Length; i++)
                 {
                     var comp = objs[i] as Component;
@@ -400,13 +431,19 @@ namespace Overcooked2AI.Game
                     try { name = comp.gameObject.name; }
                     catch (Exception) { }
 
-                    bool isKillPlane = name.IndexOf("KillPlane", StringComparison.OrdinalIgnoreCase) >= 0;
+                    // 名字**只作参考**。实测 s_sushi_4_5 里 4 面边界墙分别叫
+                    // KillPlane / KillPlane (1) / (2) / (3), 真 KillPlane 反而叫 "KillPlane" ——
+                    // 按名字一刀切会把边界墙也排除掉。
+                    bool nameLooksKillPlane =
+                        name.IndexOf("KillPlane", StringComparison.OrdinalIgnoreCase) >= 0;
 
                     // 只有 水面/岩浆(Drowning) 和 掉下去(FallDeath) 会弄死这一层的厨师。
                     // Hit / Car 不是地形危险, 不管。
                     bool deadlyType = type == "Drowning" || type == "FallDeath";
-                    // KillPlane 在关卡地板**下方**很远, 不该算作同层危险
-                    bool sameLevel = b.max.y >= floorY - 1.0f;
+                    // 在关卡地板**下方**的(真 KillPlane 顶面 y=-0.5 而地板 y=0), 不算同层危险
+                    bool sameLevel = b.max.y >= floorY - 0.4f;
+                    // 体积远大于整张网格 ⇒ 是世界级体积(整图铺满的 KillPlane), 不是"能绕过去的本地危险区"
+                    bool worldVolume = (b.size.x * b.size.z) > gridArea * 4f;
 
                     var hz = new Haz();
                     hz.Name = name;
@@ -417,8 +454,9 @@ namespace Overcooked2AI.Game
                     hz.Z1 = b.max.z;
                     hz.Y0 = b.min.y;
                     hz.Y1 = b.max.y;
-                    hz.KillPlane = isKillPlane;
-                    hz.Kills = deadlyType && sameLevel && !isKillPlane;
+                    hz.KillPlane = nameLooksKillPlane;
+                    hz.WorldVolume = worldVolume;
+                    hz.Kills = deadlyType && sameLevel && !worldVolume;
                     hz.Use = false;
                     hz.Cells = 0;
                     _haz.Add(hz);

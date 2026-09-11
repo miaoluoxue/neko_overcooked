@@ -97,6 +97,13 @@ def main():
     check("传送带格可走", plat.walkable(2, 3) and plat.at(2, 3) == "T")
     check("平台可关掉(不想上平台时)", not plat.walkable(2, 4, allow_platform=False))
 
+    # 台面传送带 'C' —— 走不上去(它是台面), 但它和普通 '#' 有本质区别:
+    # 放上去的物品会被 ConveyTo 一格一格传走(ServerConveyorStation.cs:198-203),
+    # 所以脚本绝不能把切好的料存在上面。s_sushi_4_5 实测有 83 个。
+    conv = make_map(["..CCC..", ".......", ".......", ".......", "......."])
+    check("台面传送带不可走", not conv.walkable(2, 4) and conv.at(2, 4) == "C")
+    check("台面传送带算障碍但不危险", not conv.walkable(2, 4) and not conv.is_danger(2, 4))
+
     # 空洞不能走
     voidm = make_map(["..VVV..", ".......", ".......", ".......", "......."])
     check("空洞不可走", not voidm.walkable(2, 4) and voidm.is_danger(2, 4))

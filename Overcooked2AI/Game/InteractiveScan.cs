@@ -169,43 +169,98 @@ namespace Overcooked2AI.Game
         }
 
         // ---------------------------------------------------------------- 传送带
+        /// <summary>传送带的方向与速度。
+        ///
+        /// 这游戏里有两套完全不同的"传送带", 必须分开, 否则会得出"这关没有传送带"的错误结论:
+        ///
+        ///   · **Travelator** —— 地面传送带, 推的是**厨师**。
+        ///       字段: m_speed(public) / m_directionXZ(private)
+        ///       方向: Leftwards => transform.right, Rightwards => -transform.right (Travelator.cs:167-175)
+        ///       速度单位: **世界单位/秒** (GetSurfaceVelocity = m_speed × 方向)
+        ///
+        ///   · **ConveyorStation** —— **台面**传送带, 推的是**物品**。s_sushi_4_5 实测 83 个。
+        ///       RequireComponent(TabletopConveyenceReceiver, StaticGridLocation, AttachStation)
+        ///       (ConveyorStation.cs:3-5) —— 它的"Tabletop"就说明搬的是台面上的东西。
+        ///       台面上放了物品, 就会被一格一格传给相邻台面 (ServerConveyorStation.ConveyTo:198-203)。
+        ///       方向: Rightwards => -transform.right, Leftwards => +transform.right
+        ///             (ServerConveyorStation.cs:237-247, 和 Travelator 是同一套约定)
+        ///       速度单位是**格/秒**, 不是世界单位/秒 ——
+        ///             m_arriveTime = now + 1f / GetConveySpeed() (ServerConveyorStation.cs:192)
+        ///       默认 m_conveySpeed = 1 ⇒ 1 秒传一格。
+        ///
+        /// 对脚本的含义: 把切好的料放在台面传送带上, 它会自己滑走 —— 必须放普通台面。
+        /// </summary>
         private static string ConveyorExtra(Component c, string typeName)
         {
             var sb = new StringBuilder();
-            sb.Append("\"on\":").Append(BoolJson(Enabled(c)));
-            if (typeName != "Travelator")
-                return sb.ToString();
+            bool on = Enabled(c);
+            sb.Append("\"on\":").Append(BoolJson(on));
+
+            string dir = "";
+            float speed = 0f;
+            bool cellsPerSecond = false;
             try
             {
                 var t = c.GetType();
-                var speedF = t.GetField("m_speed");
-                float speed = 1f;
-                if (speedF != null)
+                if (typeName == "Travelator")
                 {
-                    var v = speedF.GetValue(c);
-                    if (v is float)
-                        speed = (float)v;
+                    var sf = t.GetField("m_speed");
+                    if (sf != null)
+                    {
+                        var v = sf.GetValue(c);
+                        if (v is float)
+                            speed = (float)v;
+                    }
+                    var df = t.GetField("m_directionXZ", BindingFlags.NonPublic | BindingFlags.Instance);
+                    if (df != null)
+                    {
+                        var v = df.GetValue(c);
+                        if (v != null)
+                            dir = v.ToString();
+                    }
                 }
-                var dirF = t.GetField("m_directionXZ", BindingFlags.NonPublic | BindingFlags.Instance);
-                string dir = "";
-                if (dirF != null)
+                else
                 {
-                    var v = dirF.GetValue(c);
-                    if (v != null)
-                        dir = v.ToString();
+                    // ConveyorStation 的两个字段都是 public
+                    var sf = t.GetField("m_conveySpeed");
+                    if (sf != null)
+                    {
+                        var v = sf.GetValue(c);
+                        if (v is float)
+                            speed = (float)v;
+                    }
+                    cellsPerSecond = true;
+                    var df = t.GetField("m_conveyanceDirectionXZ");
+                    if (df != null)
+                    {
+                        var v = df.GetValue(c);
+                        if (v != null)
+                            dir = v.ToString();
+                    }
                 }
-                // GetTravelDirection: Leftwards → transform.right, Rightwards → -transform.right
-                Vector3 right = c.transform.right;
-                float sign = dir == "Leftwards" ? 1f : -1f;
-                float vx = sign * right.x * speed;
-                float vz = sign * right.z * speed;
-                bool on = Enabled(c);
-                sb.Append(",\"dir\":\"").Append(Safe(dir)).Append("\"");
-                sb.Append(",\"speed\":").Append(F(speed));
-                sb.Append(",\"vx\":").Append(F(on ? vx : 0f));
-                sb.Append(",\"vz\":").Append(F(on ? vz : 0f));
             }
             catch (Exception) { }
+
+            // 两套约定一致: Rightwards => -transform.right; Leftwards => +transform.right
+            Vector3 right = c.transform.right;
+            float sign = dir == "Leftwards" ? 1f : -1f;
+            float sx = sign * right.x;
+            float sz = sign * right.z;
+
+            // 归到轴向单位步长(网格轴对齐, 一格 = 1.2): 脚本要的正是"往哪一格传"
+            float stepX = 0f, stepZ = 0f;
+            if (Mathf.Abs(sx) >= Mathf.Abs(sz))
+                stepX = sx >= 0f ? 1f : -1f;
+            else
+                stepZ = sz >= 0f ? 1f : -1f;
+
+            sb.Append(",\"dir\":\"").Append(Safe(dir)).Append("\"");
+            sb.Append(",\"speed\":").Append(F(speed));
+            sb.Append(",\"unit\":\"").Append(cellsPerSecond ? "cells/s" : "units/s").Append("\"");
+            sb.Append(",\"stepx\":").Append(F(stepX));
+            sb.Append(",\"stepz\":").Append(F(stepZ));
+            if (on && speed > 0f)
+                sb.Append(",\"secPerCell\":").Append(F(cellsPerSecond ? 1f / speed : 1.2f / speed));
             return sb.ToString();
         }
 

@@ -27,6 +27,7 @@ LEGEND = """
        T  传送带      H  危险区(水面/岩浆/边界墙) —— 踩上去会死
        V  空洞(没地面, 会掉下去)
        v  地板太低(单向落差 / 正在下沉的平台, 例如会沉的荷叶)
+       C  台面传送带(走不上去, 而且放上去的东西会被传走)
        @  你指定的坐标所在格
 """
 
@@ -106,11 +107,49 @@ def main() -> int:
     for x in dyn.get("buttons") or []:
         print("  [按钮] %-14s (%6.2f,%6.2f)  此刻可按=%s" % (
             x.get("type"), float(x.get("x") or 0), float(x.get("z") or 0), x.get("pressable")))
-    for x in dyn.get("conveyors") or []:
-        print("  [传送带] %-14s (%6.2f,%6.2f) 开=%s 朝向=%s 速度=%.2f 推送=(%+.2f,%+.2f)" % (
+
+    # 传送带分两套, 别混: Travelator 推**厨师**, ConveyorStation 推**物品**。
+    convs = dyn.get("conveyors") or []
+    chefbelt = [x for x in convs if x.get("type") == "Travelator"]
+    itembelt = [x for x in convs if x.get("type") != "Travelator"]
+
+    def _fmt(x):
+        step = ""
+        sx, sz = float(x.get("stepx") or 0), float(x.get("stepz") or 0)
+        if sx or sz:
+            step = " 传送方向=(%+.0f,%+.0f)格" % (sx, sz)
+        spc = x.get("secPerCell")
+        spc_s = "  每格%.2fs" % float(spc) if spc is not None else ""
+        return "  [传送带/推人] %-11s (%6.2f,%6.2f) 开=%s 朝向=%s 速度=%.2f%s%s%s" % (
             x.get("type"), float(x.get("x") or 0), float(x.get("z") or 0), x.get("on"),
             x.get("dir"), float(x.get("speed") or 0),
-            float(x.get("vx") or 0), float(x.get("vz") or 0)))
+            " " + str(x.get("unit") or ""), step, spc_s)
+
+    for x in chefbelt:
+        print(_fmt(x))
+
+    if itembelt:
+        # 台面传送带可能有几十个, 只汇总 + 列前几个, 免得淹掉其它信息
+        dirs = {}
+        for x in itembelt:
+            k = (x.get("dir"), float(x.get("speed") or 0), x.get("on"))
+            dirs[k] = dirs.get(k, 0) + 1
+        print("  [传送带/推物品] ConveyorStation 共 %d 个  —— 台面上放的东西会被一格一格传走" % len(itembelt))
+        for (d, sp, on), n in sorted(dirs.items(), key=lambda kv: -kv[1]):
+            print("      朝向=%-11s 速度=%.2f 格/秒  开=%s  ×%d" % (d, sp, on, n))
+        step_by_dir = {}
+        for x in itembelt:
+            step_by_dir.setdefault(
+                (x.get("dir"), float(x.get("stepx") or 0), float(x.get("stepz") or 0)),
+                []).append((float(x.get("x") or 0), float(x.get("z") or 0)))
+        for (d, sx, sz), pts in step_by_dir.items():
+            print("      朝向=%s → 往 (%+.0f,%+.0f) 格传, 共 %d 个" % (d, sx, sz, len(pts)))
+        for x in sorted(itembelt, key=lambda a: (float(a.get("z") or 0), float(a.get("x") or 0)))[:8]:
+            print("      · (%6.2f,%6.2f) 朝向=%s" % (
+                float(x.get("x") or 0), float(x.get("z") or 0), x.get("dir")))
+        if len(itembelt) > 8:
+            print("      · … 另有 %d 个" % (len(itembelt) - 8))
+
     for x in dyn.get("platforms") or []:
         print("  [平台] %-14s (%6.2f,%6.2f) %s" % (
             x.get("type"), float(x.get("x") or 0), float(x.get("z") or 0), x.get("name")))

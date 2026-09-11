@@ -1,4 +1,4 @@
-﻿"""地图模型: 把桥采集的台子/厨师/烹饪状态组织成语义化地图。
+"""地图模型: 把桥采集的台子/厨师/烹饪状态组织成语义化地图。
 
 台子语义归类依据(反编译确认):
   · kind 是组件类型名, 且 C# 侧已按 instanceID 去重(一个物体只归一个类型), 所以 kind 可靠
@@ -22,7 +22,7 @@ _KIND_SEM = {
     "platereturnstation": "return_plates",
     "rubbishbin": "bin",
     "washingstation": "wash",
-    "conveyorstation": "conveyor",
+    "conveyorstation": "conveyor",   # 台面传送带: 放上去的东西会被传走, 别当普通台面用
     "mixingstation": "mix",
     "autoworkstation": "auto",
     "switchstation": "switch",
