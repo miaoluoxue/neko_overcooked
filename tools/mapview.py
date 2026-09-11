@@ -204,6 +204,26 @@ def main() -> int:
     print(tm.ascii(cx, cz))
     print(LEGEND)
 
+    # ---- 连通性: 从厨师出发真正到得了哪些格 ----
+    chefs = ((st.get("layout") or {}).get("chefs") or [])
+    if chefs:
+        try:
+            px = float(chefs[0].get("x") or 0)
+            pz = float(chefs[0].get("z") or 0)
+        except (TypeError, ValueError):
+            px = pz = None
+        if px is not None:
+            reach = tm.reachable_from(px, pz)
+            print("\n---- 从厨师(id=%s)出发**真正到得了**的区域 (空白 = 到不了) ----" % chefs[0].get("id"))
+            print(tm.ascii_reach(px, pz))
+            print("可走格 %d 个, 其中从厨师出发到得了的 %d 个" % (
+                sum(1 for j in range(tm.h) for i in range(tm.w) if tm.walkable(i, j)),
+                len(reach)))
+            print("说明: 空白处虽然地形上是'.'(有地面、没占用物), 但和厨师不连通 ——")
+            print("      寻路不会去, 也不该算作'边界被解析成可走'。")
+            if len(reach) < 10:
+                print("⚠ 到得了的格子非常少! 厨师可能被卡在角落里, 需要人工确认")
+
     # 顺手给出"哪里有危险"的格子坐标清单
     danger = [(i, j) for j in range(tm.h) for i in range(tm.w) if tm.is_danger(i, j)]
     if danger:

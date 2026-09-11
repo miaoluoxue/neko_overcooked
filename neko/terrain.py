@@ -137,26 +137,45 @@ class TerrainMap:
     # ---------------------------------------------------------------- 寻路
     def find_path(self, sx: float, sz: float, tx: float, tz: float,
                   allow_platform: bool = True, allow_travelator: bool = True,
-                  max_nodes: int = 8000) -> list:
+                  max_nodes: int = 8000, use_reach: bool = True) -> list:
         """在**安全格**上跑 A*, 返回途经点世界坐标列表(不含起点)。
 
         目标本身通常是台子(障碍格), 所以终点取它周围最近的可走格。
         起点即使不可走(例如人被平台推到了边上)也允许出发, 否则会原地锁死。
+
+        use_reach: 只在**从起点真正连通**的格子上搜。实测 s_sushi_4_5:
+          总可走格 182, 但从厨师出发只到得了 122 —— 另外 60 格是关卡里
+          装饰地面/边界外的地皮, 地形上是 '.' 却和厨房不连通。
+          不加这道约束, A* 会把这些格子当候选:
+            · 目标最近的可走格若落在不连通的一片里, 整条路就规划不出来
+            · 还会白搜一大片无关格子
         """
         if not self.ok:
             return []
         start = self.cell_of(sx, sz)
         goal_cell = self.cell_of(tx, tz)
 
+        reach = None
+        if use_reach:
+            reach = self.reachable_from(sx, sz, allow_platform, allow_travelator)
+
         def ok(c):
-            return self.walkable(c[0], c[1], allow_platform, allow_travelator)
+            if not self.walkable(c[0], c[1], allow_platform, allow_travelator):
+                return False
+            if reach is not None and c not in reach:
+                return False
+            return True
 
         goals = []
         if ok(goal_cell):
             goals.append(goal_cell)
-        nw = self.nearest_walkable(goal_cell[0], goal_cell[1])
-        if nw and nw not in goals:
-            goals.append(nw)
+        # 目标通常是台子(=障碍), 所以取它**紧邻**的可走格当终点。
+        # 邻域只放相邻 4 格, 不要放宽: 放宽会"退而求其次"选到隔着墙的格子,
+        # 于是"目标根本去不了"被伪装成"规划成功"。
+        for di, dj in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            cand = (goal_cell[0] + di, goal_cell[1] + dj)
+            if ok(cand) and cand not in goals:
+                goals.append(cand)
         if not goals:
             return []
         goalset = set(goals)
@@ -198,6 +217,62 @@ class TerrainMap:
             cur = came[cur]
         cells.reverse()
         return [self.world_of(i, j) for i, j in cells[1:]]
+
+    # ---------------------------------------------------------------- 连通性
+    def reachable_from(self, x: float, z: float,
+                       allow_platform: bool = True,
+                       allow_travelator: bool = True) -> set:
+        """从某个世界坐标出发, 能走到的所有格子(BFS)。
+
+        为什么这个比"可走格"重要:
+          网格图上大片 '.' 看着像"能走", 但**能站不等于到得了**。
+          关卡边界外的地皮/装饰地面在格子图上同样是 '.'(没有占用物、也有地面),
+          可它和厨房根本不相连 —— 寻路永远不会过去, 画出来却吓人。
+          反过来说: 如果某片区域**是**连通的, 那它就是真能走过去的, 不该当成 bug。
+
+        寻路只关心"起点所在连通块"; 这个函数把它算出来。
+        """
+        if not self.ok:
+            return set()
+        start = self.cell_of(x, z)
+        if not self.inside(*start):
+            return set()
+        seen = set()
+        stack = [start]
+        # 起点即使不可走也允许出发(人被平台推到边上是常见情况)
+        seen.add(start)
+        while stack:
+            i, j = stack.pop()
+            for di, dj in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                nb = (i + di, j + dj)
+                if nb in seen:
+                    continue
+                if not self.walkable(nb[0], nb[1], allow_platform, allow_travelator):
+                    continue
+                seen.add(nb)
+                stack.append(nb)
+        return seen
+
+    def ascii_reach(self, x: float, z: float) -> str:
+        """画出"从某点出发真正到得了的区域": '#' 表示到不了。
+
+        用它替代一眼看过去全是 '.' 的网格图 —— 到不了的格子直接打掉,
+        避免把装饰地面误当成"边界被解析成可走"。
+        """
+        reach = self.reachable_from(x, z)
+        mark = self.cell_of(x, z)
+        rows = []
+        for j in range(self.h - 1, -1, -1):
+            line = []
+            for i in range(self.w):
+                if mark == (i, j):
+                    line.append("@")
+                elif (i, j) in reach:
+                    line.append(self.at(i, j))
+                else:
+                    line.append(" ")     # 到不了 -> 留白
+            rows.append("".join(line))
+        return "\n".join(rows)
 
     # ---------------------------------------------------------------- 诊断
     def describe_dangers(self) -> str:

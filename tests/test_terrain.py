@@ -121,6 +121,21 @@ def main():
     bad = TerrainMap({"w": 3, "h": 3, "grid": ".."})
     check("网格长度不符时 ok=False", not bad.ok)
 
+    # ---- 连通性: "能站" 不等于 "到得了" ----
+    # 实测 s_sushi_4_5: 总可走 182, 但从厨师出发只到得了 122 —— 另外 60 格是
+    # 关卡里和厨房不连通的装饰地面/边界地皮。它们在地形图上是 '.', 却不是能去的地方。
+    # 左右两片被中间一条水隔开, 彼此不连通
+    split = make_map(["..HHH..", "..HHH..", "..HHH..", "..HHH..", "..HHH.."])
+    r = split.reachable_from(0.0, 0.0)
+    check("连通块只包含自己那一侧", (0, 0) in r and (6, 0) not in r,
+          "reach=%d" % len(r))
+    check("去不了的目标返回空路径(不再伪装成规划成功)",
+          split.find_path(0.0, 0.0, 7.2, 0.0) == [],
+          str(split.find_path(0.0, 0.0, 7.2, 0.0)))
+    check("到得了的目标正常规划", len(split.find_path(0.0, 0.0, 0.0, 4.8)) > 0)
+    check("ascii_reach 会把到不了的格子留白",
+          " " in split.ascii_reach(0.0, 0.0))
+
     print()
     if _failed:
         print(f"❌ 地形测试失败 {len(_failed)} 项: {_failed}")
