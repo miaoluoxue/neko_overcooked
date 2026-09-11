@@ -338,6 +338,18 @@ class Engine:
         time.sleep(0.08)
         return True
 
+    def interaction_targets(self, st: dict) -> tuple:
+        """游戏自己认为这个厨师**现在按交互键会作用到哪个物体** (pick, use)。
+
+        依据: 插件读 PlayerControls.CurrentInteractionObjects (PlayerControls.cs:394),
+        pick = m_TheOriginalHandlePickup(抓取键), use = m_interactable(工位交互键)。
+        这是**权威答案** —— 交互判定量的是"到碰撞体表面的距离 < 1.0 + 朝向前 180°"
+        (InteractWithItemHelper.cs:119,153-163), 台面有体积、厨师走不到正中间,
+        所以脚本自己拿格子中心算距离是没有意义的。
+        """
+        c = self.chef(st or {})
+        return (c.get("pick") or "", c.get("use") or "")
+
     def interact(self, kind: str = "pickup", verify_hold_change=True) -> bool:
         st = self.state()
         if not st or not st.get("inRound"):
@@ -370,8 +382,10 @@ class Engine:
             seen.append(cur)
             if cur != (held_before or ""):
                 return True
-        self.log("[交互] %s: 持有物始终未变(%s) —— 可能没站到位/没朝向目标"
-                 % (kind, "→".join(repr(s) for s in seen[:4])))
+        self.log("[交互] %s: 持有物始终未变(%s); 游戏说此刻可作用: 抓取=%r 工位=%r"
+                 % (kind, "→".join(repr(s) for s in seen[:3]),
+                    (self.chef(self.state() or {}).get("pick") or "(空, 新版dll才有)"),
+                    (self.chef(self.state() or {}).get("use") or "(空, 新版dll才有)")))
         return False
 
     # ---------------- 组装台面 ----------------

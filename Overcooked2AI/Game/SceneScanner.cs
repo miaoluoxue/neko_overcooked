@@ -135,11 +135,14 @@ namespace Overcooked2AI.Game
                         // **现在能不能指挥得动这个厨师** —— 见 ReadControl。
                         // 只判 respawning 不够: 过场压制、喷灭火器(scale=0) 也一样按不动。
                         string control = ReadControl(go);
+                        // **游戏自己认为"现在按交互键会作用到哪个物体"** —— 见 ReadInteraction。
+                        string inter = ReadInteraction(go);
                         if (chefCount > 0)
                             chefs.Append(",");
                         chefs.Append(string.Format(
-                            "{{\"id\":{0},\"seq\":{0},\"player\":\"{1}\",\"name\":\"{2}\",\"x\":{3:F2},\"y\":{4:F2},\"z\":{5:F2},\"held\":\"{6}\",{7}}}",
-                            chefCount, player, SafeName(go.name), pos.x, pos.y, pos.z, held, control));
+                            "{{\"id\":{0},\"seq\":{0},\"player\":\"{1}\",\"name\":\"{2}\",\"x\":{3:F2},\"y\":{4:F2},\"z\":{5:F2},\"held\":\"{6}\",{7}{8}}}",
+                            chefCount, player, SafeName(go.name), pos.x, pos.y, pos.z, held,
+                            control, inter));
                         chefCount++;
                     }
                 }
@@ -209,6 +212,70 @@ namespace Overcooked2AI.Game
             }
             catch (Exception) { }
             return "";
+        }
+
+        /// <summary>游戏自己认为这个厨师**现在按交互键会作用到哪个物体**。
+        ///
+        /// 依据(公开属性, 不是 private 字段):
+        ///   PlayerControls.CurrentInteractionObjects              (PlayerControls.cs:394)
+        ///     → InteractionObjects.m_TheOriginalHandlePickup      // 抓取键作用物
+        ///     → InteractionObjects.m_interactable                 // 工位交互键作用物
+        ///   (InteractionObjects 字段定义见 PlayerControls.cs:150-171)
+        ///
+        /// **为什么必须问游戏、不能自己算几何**(用户指出的问题):
+        ///   交互判定是 InteractWithItemHelper.IsColliderInArc (InteractWithItemHelper.cs:153-163):
+        ///       closest = GetClosestPointOnSurface(collider, chefPos)   // :119-151
+        ///       要求 |closest - chefPos| 的 XZ 距离 < 1.0
+        ///       且 Dot(chefForward, 该方向) >= cos(PI/2) = 0            // 只认前 180°
+        ///   量的是**到碰撞体表面的距离** —— 而台面是有体积的, 厨师永远走不到台面正中间。
+        ///   脚本拿"格子中心"去算距离毫无意义。直接读游戏算好的结果就不用猜站位了。
+        /// </summary>
+        private static string ReadInteraction(GameObject chefGo)
+        {
+            try
+            {
+                var pcType = FindType("PlayerControls");
+                if (pcType == null)
+                    return "";
+                var comp = chefGo.GetComponent(pcType);
+                if (comp == null)
+                    return "";
+                var prop = pcType.GetProperty("CurrentInteractionObjects");
+                if (prop == null)
+                    return "";
+                object io = prop.GetValue(comp, null);
+                if (io == null)
+                    return "";
+                var ioType = io.GetType();
+                string pick = GoFieldName(ioType, io, "m_TheOriginalHandlePickup");
+                string use = CompFieldName(ioType, io, "m_interactable");
+                return string.Format(",\"pick\":\"{0}\",\"use\":\"{1}\"",
+                                     SafeName(pick), SafeName(use));
+            }
+            catch (Exception) { }
+            return "";
+        }
+
+        private static string GoFieldName(Type t, object inst, string field)
+        {
+            try
+            {
+                var f = t.GetField(field);
+                var v = (f == null) ? null : f.GetValue(inst) as GameObject;
+                return v == null ? "" : v.name;
+            }
+            catch (Exception) { return ""; }
+        }
+
+        private static string CompFieldName(Type t, object inst, string field)
+        {
+            try
+            {
+                var f = t.GetField(field);
+                var v = (f == null) ? null : f.GetValue(inst) as Component;
+                return v == null ? "" : v.gameObject.name;
+            }
+            catch (Exception) { return ""; }
         }
 
         /// <summary>读厨师归属的玩家(PlayerIDProvider.GetID() → Player.One/Two/…)。
