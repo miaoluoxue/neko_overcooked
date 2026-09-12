@@ -669,6 +669,23 @@ class Engine:
         out.sort()
         return [(wx, wz) for _, wx, wz in out]
 
+    def _station_at(self, km: KitchenMap, x: float, z: float, tol: float = 0.25):
+        """找坐标落在 (x,z) 上的台面。
+
+        用途: 从**箱子**取料时, 计划给的 (tx,tz) 就是货源的坐标, 但食材并不在
+        任何台面上("on" 是空的), 所以 _find_item_station 返回 None。
+        这时必须**从坐标反查出那个箱子**, 才能拿到它的名字去核对
+        "游戏说抓取=谁"。否则 want 为空 -> _aim_ok 会放行任意可交互物 ->
+        站在错的箱子旁也判成功 -> 抓错食材 -> 放回去 -> 死循环
+        (用户实测: "订单是寿司, 你去交互虾的食材箱子")。
+        """
+        best, bd = None, None
+        for s in km.stations.values():
+            d = (s.x - x) ** 2 + (s.z - z) ** 2
+            if d <= tol * tol and (bd is None or d < bd):
+                bd, best = d, s
+        return best
+
     def _name_is(self, got: str, want: str) -> bool:
         """判断游戏报的物体名 got 是不是我们要的 want（**用于台面/箱子**）。
 
@@ -913,8 +930,14 @@ class Engine:
             return False
 
         # 先粗到再收紧: 相邻台子太近, 站远了会拿错。
-        # want=目标台面的名字 —— 让游戏自己确认"现在按抓取键能作用到它"。
-        want_name = live.name if live is not None else ""
+        # want=**货源台面自己的名字** —— 让游戏确认"现在按抓取键能作用到它"。
+        # 注意从箱子取料时 live 是 None(食材不在任何台面上), 必须从坐标反查那个箱子;
+        # 否则 want 为空 -> _aim_ok 放行任意可交互物 -> 站在错箱子旁也判成功。
+        src_station = live if live is not None else self._station_at(km, tx, tz)
+        want_name = src_station.name if src_station is not None else ""
+        if not want_name:
+            self.log("[步骤] ⚠ 查不到货源台面名(坐标 %.1f,%.1f) —— 只能抓到什么算什么"
+                     % (tx, tz))
         if not self._approach(km, tx, tz, attempt, want=want_name):
             return False
         if not self.interact("pickup", verify_hold_change=True):

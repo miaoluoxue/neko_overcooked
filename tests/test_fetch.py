@@ -146,6 +146,35 @@ def main():
     if err3 is None:
         check("找不到货源 -> 返回 False 而不是抛异常", r3 is False, repr(r3))
 
+    # ---- 台面/箱子名核对: 带编号时必须精确(踩过的坑) ----
+    # 教训: 原来用 _norm 比名字会剥掉结尾的 " (N)", 于是
+    #   "DispenserCrate 3 (7)" 与 "(8)" 都变成 "dispensercrate3" —— 唯一区分信息没了,
+    #   站到随便哪个箱子旁都判"就是它" -> 抓错食材 -> 放回去 -> 死循环。
+    e0 = make_engine(lay)
+    check("同一个箱子 -> 命中", e0._name_is("DispenserCrate 3 (8)", "DispenserCrate 3 (8)"))
+    check("编号不同的箱子 -> 不命中", not e0._name_is("DispenserCrate 3 (7)", "DispenserCrate 3 (8)"))
+    check("编号不同的箱子 -> 不命中(3)", not e0._name_is("DispenserCrate 3 (3)", "DispenserCrate 3 (8)"))
+    check("一边无编号仍可归一化(物品实例 vs 计划名)",
+          e0._name_is("SushiFish (2)", "SushiFish"))
+    check("不同物品不命中", not e0._name_is("SushiPrawn", "SushiFish"))
+
+    # ---- 从箱子取料: 必须能从坐标反查出箱子名 ----
+    # 否则 want 为空 -> _aim_ok 放行任意可交互物 -> 站在错箱子旁也判成功。
+    lay_crate = {"stations": [
+        {"id": "PickupItemSpawner_8", "kind": "PickupItemSpawner",
+         "name": "DispenserCrate 3 (8)", "x": -1.2, "z": 4.8, "spawn": "Seaweed"},
+        {"id": "PickupItemSpawner_3", "kind": "PickupItemSpawner",
+         "name": "DispenserCrate 3 (3)", "x": 0.0, "z": 6.0, "spawn": "SushiPrawn"},
+    ], "chefs": [], "cooking": []}
+    kmc = KitchenMap.from_layout(lay_crate)
+    e1 = make_engine(lay_crate)
+    st_at = e1._station_at(kmc, -1.2, 4.8)
+    check("能从货源坐标反查出箱子",
+          st_at is not None and st_at.name == "DispenserCrate 3 (8)", str(st_at))
+    check("反查出的箱子正确对应食材",
+          st_at is not None and st_at.spawn == "Seaweed",
+          str(getattr(st_at, "spawn", None)))
+
     print()
     if _failed:
         print(f"❌ 取料测试失败 {len(_failed)} 项: {_failed}")
