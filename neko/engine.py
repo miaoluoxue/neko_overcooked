@@ -669,6 +669,31 @@ class Engine:
         out.sort()
         return [(wx, wz) for _, wx, wz in out]
 
+    def _name_is(self, got: str, want: str) -> bool:
+        """判断游戏报的物体名 got 是不是我们要的 want（**用于台面/箱子**）。
+
+        ⚠ 这里不能用 _norm 直接比 —— 实测踩的大坑:
+          _norm 会剥掉结尾的 " (N)" 实例编号。这对**物品**是对的
+          (计划里写 "SushiFish", 场景实例叫 "SushiFish (2)"), 但对**箱子**是灾难:
+              "DispenserCrate 3 (7)" 和 "DispenserCrate 3 (8)"
+              归一化后都变成 "dispensercrate3" —— **唯一的区分信息被抹掉了**。
+          后果: 站到随便哪个箱子旁边都判"就是它" -> 抓 -> 拿错食材 -> 放回去 -> 死循环
+          (用户实测: "拿了就放下拿了就放下")。
+
+        规则: 先精确比; 只有**其中一方没有编号后缀**时才允许归一化比。
+              两边都带编号 -> 编号就是身份, 必须精确相等。
+        """
+        if not got or not want:
+            return False
+        if got == want:
+            return True
+        import re as _re
+        suf = _re.compile(r"\(\d+\)\s*$")
+        if suf.search(got) and suf.search(want):
+            return False
+        g, w = self._norm(got), self._norm(want)
+        return bool(g) and (g == w or w in g or g in w)
+
     def _aim_ok(self, st: dict, want: str) -> bool:
         """**用游戏自己的判定**确认"现在按交互键能作用到目标 want"。
 
@@ -679,17 +704,12 @@ class Engine:
           而交互真实判据是 InteractWithItemHelper.IsColliderInArc
           (InteractWithItemHelper.cs:153-163): 到**碰撞体表面**的距离 < 1.0
           且朝向前 180°。台面有体积, 拿"格子中心距离"比根本没有可比性。
-          所以直接比对游戏报的 pick/use 名字。
+          所以直接比对游戏报的 pick/use 名字 —— 用 _name_is(带编号时精确比)。
         """
         pick, use = self.interaction_targets(st)
-        w = self._norm(want)
-        if not w:
+        if not want:
             return bool(pick or use)
-        for got in (pick, use):
-            g = self._norm(got)
-            if g and (g == w or w in g or g in w):
-                return True
-        return False
+        return self._name_is(pick, want) or self._name_is(use, want)
 
     def _approach(self, km: KitchenMap, tx: float, tz: float, attempt: int = 0,
                   tight: float = 0.8, want: str = "") -> bool:
