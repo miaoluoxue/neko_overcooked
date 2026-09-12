@@ -191,6 +191,7 @@ class Engine:
         reach_t = None
         last_pos = None
         stuck = 0
+        prev_sign = None      # 上一次的主导轴方向, 用于识别"目标附近来回抖"
         try:
             while True:
                 if time.time() - t0 > limit:
@@ -228,6 +229,21 @@ class Engine:
                     last_pos = None
                     stuck = 0
                     continue
+
+                # ---- 防"抽搐": 目标附近来回反向就说明在抖, 直接收工 ----
+                # 现象(用户实测: "一开局的疯狂抽搐寻格子"): 闭环里死区太小,
+                # 走近了按住时长也变小, 于是左右反复修正 —— 画面上就是在抖。
+                # 判据: 距离已经不大(<1.6 格), 而且**主导轴的方向翻了** ——
+                # 那不是在接近, 是在来回蹭, 再走只会更抖。用当前距离收工。
+                if prev_sign is not None and dist < 1.6:
+                    if dir_sign != prev_sign and dir_sign != (0, 0):
+                        self.kb.release_all()
+                        self.log("[导航] 目标附近来回反向(抖动), 就地收工 距 %.2f 格" % dist)
+                        return True
+                if dir_sign != (0, 0):
+                    prev_sign = dir_sign
+                else:
+                    prev_sign = None
 
                 if dist <= arr:
                     if tight is None or dist <= tight:
@@ -271,6 +287,10 @@ class Engine:
                         d = "right" if dx > 0 else "left"
                     else:
                         d = "up" if dz > 0 else "down"
+
+                # 记下这一步的主导轴方向(防抖用, 见上面"防抽搐"那段)
+                dir_sign = (1 if d == "right" else -1 if d == "left" else 0,
+                            1 if d == "up" else -1 if d == "down" else 0)
 
                 key = self._key({"left": "A", "right": "D", "up": "W", "down": "S"}[d])
                 # 按住时长直接由运动学算, 不再靠猜。
