@@ -133,6 +133,12 @@ namespace Overcooked2AI.Game
             // 机关/陷阱: 按钮 / 传送带方向 / 触发机器 / 平台 / 火 / 关卡变形
             if (line.Contains("\"dyn\""))
                 return _collector.RequestJob("dyn", 8000);
+            // 虚拟手柄诊断/注入。**要排在 "pad" 前面** —— 免得被那条分支先截走。
+            // 走主线程 job 泵: 读它/注入它都会触发 PCPadInputProvider 静态构造。
+            if (line.Contains("\"padinit\""))
+                return _collector.RequestJob("padinit", 10000);
+            if (line.Contains("\"pads\""))
+                return _collector.RequestJob("pads", 10000);
             if (line.Contains("\"pad\""))
                 return HandlePad(line);
             if (line.Contains("\"action\""))

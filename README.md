@@ -109,6 +109,44 @@ python -u run_team.py
 
 ---
 
+## 作为 N.E.K.O 插件运行
+
+这个项目同时是 N.E.K.O 的一个插件（`plugin/plugins/neko_overcooked/`）。装好之后
+不用敲命令行 —— 让 AI 开一局就行：
+
+| 入口点 | 作用 |
+|---|---|
+| `overcooked_start` | 开始自动做菜。参数 `mode`(coop/clumsy/sabotage) / `cid`(0=P1,1=P2) / `dry` |
+| `overcooked_stop` | 停手并**松开所有按键**，把厨师交回给你 |
+| `overcooked_status` | 只读：空闲 / 正在连游戏 / 正在做菜 / 已停止 / 出错 |
+
+几条刻意的设计：
+
+- **绝不自动开跑**（`[plugin_runtime] auto_start = false`）。一进游戏就抢键盘是事故，不是功能。
+- **桥没起来会一直重试**，不报错 —— 你很可能先点插件再开游戏。
+- **停止不是瞬时的**：主循环只在每一步的间隙看停止标志，最坏要等一个单步超时（25 秒），
+  但按键会立刻松开。
+- `dry = true` 只规划不按键 —— 想先看它打算怎么做时用这个。
+
+> **关于导入方式**：`neko/` 下的模块互相用的是平铺导入（`from map_model import ...`），
+> 靠把 `neko/` 插进 `sys.path` 才能跑 —— 项目里 2 个 CLI 入口、5 个工具、6 个测试用的
+> 是同一套办法，插件外壳沿用了它，游戏逻辑一行没改。代价是 `engine`/`terrain`/`bridge`
+> 等名字会进插件进程的顶层命名空间；要彻底干净得把 `neko/` 改成正规包（相对导入），
+> 那会牵动 CLI / 工具 / 测试。细节见 `__init__.py` 顶部注释。
+
+离线自测（不需要游戏，也不需要桥）：
+
+```bat
+:: A 部分: Engine.stop() 能中断主循环 —— 普通 python 就行
+python -u tests\test_plugin_shell.py
+
+:: B 部分: 线程生命周期 / 停止 / 松键 —— 需要宿主虚拟环境里的 zmq,
+::          所以要用宿主那个解释器; 用普通 python 跑会明确跳过 B, 不会假装通过
+<N.E.K.O 根目录>\.venv\Scripts\python.exe -u tests\test_plugin_shell.py
+```
+
+---
+
 ## 逆向文档
 
 `docs/关卡逆向/` 是为写这套脚本而做的系统性逆向，**569 KB / 9 篇，全部结论带

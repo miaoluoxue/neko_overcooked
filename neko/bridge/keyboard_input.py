@@ -31,6 +31,11 @@ VK = {
 
 INPUT_KEYBOARD = 1
 KEYEVENTF_KEYUP = 0x0002
+INPUT_MOUSE = 0
+MOUSEEVENTF_LEFTDOWN = 0x0002
+MOUSEEVENTF_LEFTUP = 0x0004
+MOUSEEVENTF_RIGHTDOWN = 0x0008
+MOUSEEVENTF_RIGHTUP = 0x0010
 
 
 def _key_code(name: str) -> int:
@@ -54,6 +59,46 @@ def tap(name: str, duration: float = 0.08):
     _send_key(vk)
     time.sleep(duration)
     _send_key(vk, up=True)
+
+
+# ---- 鼠标 ------------------------------------------------------------------
+# 为什么需要它(以及它比键盘可靠在哪):
+#   菜单、选关、确认这类**看界面就能点**的操作, 用键盘盲按方向键很不可靠
+#   (实测同样一个 LEFT 时灵时不灵), 因为你不知道光标在哪、菜单几层、要不要展开。
+#   而鼠标点的是**绝对坐标** —— 截一张图就知道按哪个像素, 一步到位。
+#   另外: 鼠标点击会顺带把窗口带到前台并聚焦, 比 SetForegroundWindow 稳。
+
+def mouse_move(x: float, y: float) -> None:
+    """把鼠标挪到**屏幕坐标** (x, y)。"""
+    ctypes.windll.user32.SetCursorPos(int(x), int(y))
+
+
+def mouse_pos() -> tuple:
+    pt = wintypes.POINT()
+    ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+    return (pt.x, pt.y)
+
+
+def _send_mouse(flags: int) -> int:
+    inp = INPUT(type=INPUT_MOUSE)
+    inp.mi.dwFlags = flags
+    return ctypes.windll.user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
+
+
+def click(x: float, y: float, button: str = "left", settle: float = 0.12) -> None:
+    """在**屏幕坐标** (x, y) 点一下。
+
+    settle: 移动到位后先停一下再按 —— 有些 UI 要先收到 hover 才认这次点击。
+    """
+    mouse_move(x, y)
+    time.sleep(settle)
+    if button == "right":
+        down, up = MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP
+    else:
+        down, up = MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP
+    _send_mouse(down)
+    time.sleep(0.06)
+    _send_mouse(up)
 
 
 class MOUSEINPUT(ctypes.Structure):
@@ -119,14 +164,37 @@ PLAYER2 = {
 
 
 class KeyboardPlayer:
-    """一个玩家的键盘控制器。move_dir 传 (x, y), x/y ∈ {-1,0,1}。"""
+    """一个玩家的键盘控制器。move_dir 传 (x, y), x/y ∈ {-1,0,1}。
 
-    def __init__(self, bindings: dict):
+    allow: 可调用对象, 返回"现在允许发键吗"。席位不归脚本时(玩家在玩, 或席位被
+           交出去了)用它把整套动作闸掉 —— 否则脚本会和玩家抢同一个键盘。
+
+    **只闸"按下类"动作**(move/pickup/chop/dash)。`release_all` 永不闸:
+    松键在任何时候都是安全且必要的, 闸掉它反而会留下按住的键。
+    """
+
+    def __init__(self, bindings: dict, allow=None):
         self.b = bindings
         self._held = set()
+        self._allow = allow
+
+    def key_ok(self) -> bool:
+        """现在允许发键吗? 没装闸门时一律允许(旧行为)。"""
+        if self._allow is None:
+            return True
+        try:
+            return bool(self._allow())
+        except Exception:
+            # 闸门自己坏了。返回 True 是**故意**的: 这里没有 logger, 而静默不发键
+            # 的后果是整局没人动、日志上只看到"卡住", 比多打一会儿难查得多。
+            # 判断逻辑的异常由 Engine.key_ok() 负责记日志。
+            return True
 
     def move(self, x: float, y: float):
         """x/y ∈ -1..1。更新按住的方向键。"""
+        if not self.key_ok():
+            self.release_all()          # 席位不归脚本了 → 立刻松手, 别留着键按住
+            return
         want = set()
         if x < -0.3:
             want.add("left")
@@ -150,14 +218,20 @@ class KeyboardPlayer:
 
     def pickup(self):
         """捡起/放下。"""
+        if not self.key_ok():
+            return
         tap(self.b["pickup"])
 
     def chop(self):
         """切碎/投掷。"""
+        if not self.key_ok():
+            return
         tap(self.b["chop"])
 
     def dash(self):
         """加速。"""
+        if not self.key_ok():
+            return
         tap(self.b["dash"])
 
     def release_all(self):
@@ -322,8 +396,12 @@ def panic_pressed() -> bool:
         return False
 
 
-def ensure_focus(steal: bool = None, wait_s: float = 0.0, poll: float = 0.25) -> bool:
+def ensure_focus(steal: bool = None, wait_s: float = 0.0, poll: float = 0.25,
+                 bindings: dict | None = None) -> bool:
     """确保游戏在前台。**默认不抢**, 只等 —— 这是为了不把用户锁死。
+
+    bindings: 等待期间要松开哪套键。**调用方应当传自己那份**(`self.kb.b`) ——
+    不传会把两套都松掉, 连玩家正按着的那套一起打断。见 `_release_all_safe()`。
 
     旧实现每次都 SetForegroundWindow, 用户一按别的窗口就被抢回来, 等于电脑没法用。
     现在:
@@ -346,7 +424,7 @@ def ensure_focus(steal: bool = None, wait_s: float = 0.0, poll: float = 0.25) ->
     if wait_s <= 0:
         return False
     t0 = time.time()
-    _release_all_safe()
+    _release_all_safe(bindings)
     while time.time() - t0 < wait_s:
         time.sleep(poll)
         if game_focused():
@@ -354,10 +432,22 @@ def ensure_focus(steal: bool = None, wait_s: float = 0.0, poll: float = 0.25) ->
     return False
 
 
-def _release_all_safe():
-    """尽力把可能按住的键松开(不知道是哪个玩家, 所以两组都松)。"""
+def _release_all_safe(bindings: dict | None = None):
+    """尽力把可能按住的键松开。
+
+    bindings: **只松这一套键**(调用方传自己那份)。不传则两套都松(旧行为)。
+
+    为什么要能只松一套(实测踩到的跨席位干扰):
+    这个函数发的是**合成 key-up**, 而 key-up 是**全局**生效的 —— 它不认"这键是谁
+    按的"。于是双人时:
+      · 席位 1 的引擎在 navigate 里等焦点 → 走到这里 → 顺手把**席位 2 正按住的
+        方向键**也松了, 席位 2 的厨师会莫名停一下
+      · 更糟的是人机同桌时: 玩家手指正按着 W, 一个合成 key-up 会**把他的移动打断**
+        (要松手重按才恢复)
+    所以调用方能指明自己那套键时, 就只松自己那套 —— 松别人的键从来不是它的职责。
+    """
     try:
-        for grp in (PLAYER1, PLAYER2):
+        for grp in ((bindings,) if bindings else (PLAYER1, PLAYER2)):
             for k in ("up", "down", "left", "right"):
                 vk = grp.get(k)
                 if vk:

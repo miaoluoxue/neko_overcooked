@@ -82,6 +82,12 @@ namespace Overcooked2AI.Game
                     json = LevelInfo.Snapshot(arg);
                 else if (kind == "dyn")
                     json = InteractiveScan.Snapshot();
+                // 虚拟手柄诊断。**必须在这条主线程路径上跑** —— 读它/注入它都会触发
+                // PCPadInputProvider 的静态构造, 而从桥线程触发会卡死(见 Plugin.cs 的注释)。
+                else if (kind == "pads")
+                    json = VirtualGamepads.Report();
+                else if (kind == "padinit")
+                    json = VirtualGamepads.InitAndReport();
                 else
                     json = "{\"error\":\"unknown job\"}";
             }

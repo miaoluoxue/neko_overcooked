@@ -175,6 +175,177 @@ namespace Overcooked2AI.Game
             }
         }
 
+        // ============================ 运行时诊断 ============================
+        //
+        // 为什么要有这一段: "虚拟手柄挂上了却不驱动厨师"至少有三种**完全不同的**原因,
+        // 修法也完全不同 ——
+        //   ① 设备压根没进 m_allDevices（注入没做/被跳过）
+        //   ② 进了表, 但**排位不对**。分配规则是按顺序的:
+        //        Pad N → m_allDevices 里第 N 个"未被占用"的设备
+        //      而表开头可能是键盘(KeyboardType.Actual 时 CreateForKeyboard 先进表),
+        //      于是我们的虚拟手柄落到了 Pad 1/2, 而脚本在推 Pad 0 —— 当然没反应。
+        //   ③ 进了表、排位也对, 但 IsAttached 是 false。
+        // 靠猜会白烧好几轮「重编译 + 重启游戏」, 所以先把它读出来。
+        //
+        // ⚠ 读它**会触发 PCPadInputProvider 的静态构造**（反射碰静态字段就会触发,
+        //   绕不开）。而"触发静态构造会卡死"正是当初把这条路停掉的原因。
+        //   所以这一段**只能从主线程调** —— 走 StateCollector 的 job 泵, 别从桥线程调。
+
+        private static string _J(string s)
+        {
+            if (string.IsNullOrEmpty(s))
+                return "";
+            return s.Replace("\\", "/").Replace("\"", "'");
+        }
+
+        /// <summary>一个 StandardActionSet 对应的设备名。Device==null 就是键盘。</summary>
+        private static string ReadDeviceName(object actionSet)
+        {
+            if (actionSet == null)
+                return "(null)";
+            try
+            {
+                var t = actionSet.GetType();
+                object dev = null;
+                var p = t.GetProperty("Device",
+                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                if (p != null)
+                    dev = p.GetValue(actionSet, null);
+                else
+                {
+                    var f = t.GetField("Device",
+                        BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                    if (f != null)
+                        dev = f.GetValue(actionSet);
+                }
+                if (dev == null)
+                    return "(键盘)";      // CreateForKeyboard 造出来的 set, Device 是 null
+                var meta = dev.GetType().GetProperty("Meta", BindingFlags.Public | BindingFlags.Instance);
+                if (meta != null)
+                {
+                    var mv = meta.GetValue(dev, null) as string;
+                    if (!string.IsNullOrEmpty(mv))
+                        return mv;
+                }
+                return dev.GetType().Name;
+            }
+            catch (Exception ex)
+            {
+                return "?(" + _J(ex.Message) + ")";
+            }
+        }
+
+        public static string Report()
+        {
+            var sb = new System.Text.StringBuilder();
+            sb.Append("{\"attached\":").Append(Attached ? "true" : "false");
+            sb.Append(",\"injected\":").Append(Injected ? "true" : "false");
+            sb.Append(",\"virtualCount\":").Append(_devices.Count);
+
+            sb.Append(",\"virtual\":[");
+            for (int i = 0; i < _devices.Count; i++)
+            {
+                if (i > 0)
+                    sb.Append(",");
+                sb.Append("{\"i\":").Append(i)
+                  .Append(",\"meta\":\"").Append(_J(_devices[i].Meta)).Append("\"")
+                  .Append(",\"isAttached\":").Append(_devices[i].IsAttached ? "true" : "false")
+                  .Append("}");
+            }
+            sb.Append("]");
+
+            string kt = "?";
+            try
+            {
+                var dbg = GameUtils.GetDebugConfig();
+                if (dbg != null)
+                    kt = dbg.m_keyboardType.ToString();
+            }
+            catch (Exception) { }
+            sb.Append(",\"keyboardType\":\"").Append(_J(kt)).Append("\"");
+
+            try
+            {
+                var type = HarmonyLib.AccessTools.TypeByName("PCPadInputProvider");
+                if (type == null)
+                {
+                    sb.Append(",\"error\":\"PCPadInputProvider 未加载\"}");
+                    return sb.ToString();
+                }
+
+                object inst = null;
+                var getM = type.GetMethod("Get", BindingFlags.Public | BindingFlags.Static);
+                if (getM == null && type.BaseType != null)
+                    getM = type.BaseType.GetMethod("Get", BindingFlags.Public | BindingFlags.Static);
+                if (getM != null)
+                {
+                    try { inst = getM.Invoke(null, null); }
+                    catch (Exception) { }
+                }
+                sb.Append(",\"instance\":").Append(inst != null ? "true" : "false");
+
+                var mAll = type.GetField("m_allDevices",
+                    BindingFlags.NonPublic | BindingFlags.Static);
+                var list = (mAll != null) ? mAll.GetValue(null) as System.Collections.IList : null;
+                sb.Append(",\"allDevices\":[");
+                if (list != null)
+                {
+                    for (int j = 0; j < list.Count; j++)
+                    {
+                        if (j > 0)
+                            sb.Append(",");
+                        sb.Append("{\"i\":").Append(j)
+                          .Append(",\"device\":\"").Append(_J(ReadDeviceName(list[j]))).Append("\"}");
+                    }
+                }
+                sb.Append("],\"allCount\":").Append(list != null ? list.Count : -1);
+
+                // 最关键的一列: Pad 0..3 各自落在哪个设备上
+                var gas = type.GetMethod("GetActionSet",
+                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
+                sb.Append(",\"padMap\":[");
+                if (gas != null)
+                {
+                    string[] names = { "One", "Two", "Three", "Four" };
+                    var padEnum = HarmonyLib.AccessTools.TypeByName("ControlPadInput+PadNum");
+                    for (int p = 0; p < names.Length; p++)
+                    {
+                        if (p > 0)
+                            sb.Append(",");
+                        object set = null;
+                        try
+                        {
+                            set = gas.Invoke(null, new object[] { Enum.Parse(padEnum, names[p]) });
+                        }
+                        catch (Exception) { }
+                        sb.Append("{\"pad\":").Append(p)
+                          .Append(",\"device\":\"").Append(_J(ReadDeviceName(set))).Append("\"}");
+                    }
+                }
+                sb.Append("]");
+            }
+            catch (Exception ex)
+            {
+                sb.Append(",\"error\":\"").Append(_J(ex.Message)).Append("\"");
+            }
+            sb.Append("}");
+            return sb.ToString();
+        }
+
+        /// <summary>注入 + 立刻回报状态。只在主线程调（理由见上面那段注释）。</summary>
+        public static string InitAndReport()
+        {
+            try
+            {
+                InjectIntoPCPadProvider();
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log?.LogWarning("[Overcooked2AI] 注入异常: " + ex.Message);
+            }
+            return Report();
+        }
+
         public static void UpdateAll(ulong tick, float dt)
         {
             for (int i = 0; i < _devices.Count && i < Pads.Length; i++)

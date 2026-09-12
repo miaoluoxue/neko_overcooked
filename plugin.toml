@@ -1,0 +1,26 @@
+[plugin]
+id = "neko_overcooked"
+name = "胡闹厨房2陪玩"
+description = "在《胡闹厨房 2》里替你操作厨师：读订单、自己拿料切菜煮菜摆盘送餐，不撞墙不淹死。需要你自己拥有正版游戏，并按项目 README 装好 BepInEx 桥。"
+short_description = "Overcooked! 2 companion: auto-cooks orders by reading the game's own state through a BepInEx bridge and replaying inputs."
+keywords = ["胡闹厨房", "overcooked", "陪玩", "自动", "做菜", "厨房", "做饭", "autoplay", "companion", "cooking"]
+version = "0.1.0"
+entry = "plugin.plugins.neko_overcooked:OvercookedPlugin"
+
+[plugin.sdk]
+recommended = ">=0.1.0,<0.2.0"
+supported = ">=0.1.0,<0.3.0"
+
+# 绝不自动开跑：一进游戏就抢键盘、发按键, 那是事故不是功能。
+[plugin_runtime]
+enabled = true
+auto_start = false
+
+[overcooked]
+# 游戏内 BepInEx 薄桥的地址(见项目 README「构建与部署」)
+bridge_host = "127.0.0.1"
+bridge_port = 48778
+# 桥没起来时多久重试一次(秒)。用户很可能先点插件、再开游戏。
+connect_retry_seconds = 2.0
+default_mode = "coop"
+default_cid = 0

@@ -16,9 +16,11 @@
 from __future__ import annotations
 
 import os
+import threading
 import time
 
-from bridge.keyboard_input import KeyboardPlayer, PLAYER1, PLAYER2, ensure_focus, game_focused, panic_pressed
+from bridge.keyboard_input import (KeyboardPlayer, PLAYER1, PLAYER2, ensure_focus,
+                                   game_focused, panic_pressed, key_down, key_up)
 from map_model import KitchenMap, Station
 from pathing import dir_for_step
 from cookbook import Knowledge, derive, Op, DishFlow
@@ -29,10 +31,17 @@ COOK_SEMS = ("hob", "oven", "fryer", "firepit", "barbeque", "floorburner", "flam
 
 class Engine:
     def __init__(self, bridge, cid=0, bindings=None, log=print, board=None,
-                 mode_state=None):
+                 mode_state=None, owns_seat=None, observe_only=False,
+                 on_handover=None, events=None):
         self.bridge = bridge
         self.cid = cid
-        self.kb = KeyboardPlayer(bindings or PLAYER1)
+        #: 事件出口(neko/events.py)。None = 不发事件(纯 CLI 的旧行为)。
+        self.events = events
+        #: 席位闸门 —— 见 key_ok()。装在 KeyboardPlayer 里, 覆盖它那几条按下类动作。
+        self.owns_seat = owns_seat
+        self.observe_only = bool(observe_only)
+        self.on_handover = on_handover
+        self.kb = KeyboardPlayer(bindings or PLAYER1, allow=self._kb_allow)
         self.log = log
         self.board = board       # 双人时的订单黑板(单人传 None)
         self.mode_state = mode_state   # 三模式的个体状态(neko/modes/); None=纯合作不捣蛋
@@ -61,6 +70,24 @@ class Engine:
         self._terrain = None                         # 关卡地形(含危险区), 见 terrain()
         self._terrain_scene = ""
         self._last_fail_step = ""                    # 最后失败在哪一步(供主循环判断重复失败)
+        #: "同一步连续同样失败"的指纹(规则 5: 别烧整局)。是**实例属性**而不是
+        #: run() 的局部变量 —— 席位交回时要能把它清零, 见 run() 的席位闸门。
+        self._fail_sig = None
+        self._fail_n = 0
+        #: 协作式停止开关。CLI 靠 Ctrl+C, 但插件里主循环跑在后台线程, 杀不掉线程 ——
+        #: 只能由外部置位, 让 run() 自己在循环头退出。见 stop()。
+        self._stop = threading.Event()
+        #: 观察模式(席位归人时)的轮询间隔。人类席位的事件流靠它 —— 见 observe_once()。
+        self.observe_interval = 0.5
+        #: 观察模式的"上次看到的样子", 只在变化时记一笔, 免得刷屏
+        self._observed_round = False
+        self._observed_last = None
+        #: 事件用: 上一轮看到的订单集合 + 上一轮是否在对局中(都是**边沿检测**用)
+        self._seen_orders = None
+        self._was_in_round = False
+        self._cook_states = None
+        #: 订单剩余时间低于这个比例就发 hurry(0.25 = 剩四分之一)
+        self.hurry_at = 0.25
         #: 台面传送带的"每格往哪传"表 + 速度, 按场景缓存(来自插件 dyn)
         self._belt_dirs_cache = None
         self._belt_speeds_cache = {}
@@ -81,7 +108,9 @@ class Engine:
         lay = (st or {}).get("layout") or {}
         if not lay.get("chefs"):
             return None
-        return KitchenMap.from_layout(lay)
+        km = KitchenMap.from_layout(lay)
+        self._track_cooking(km)         # 顺带出 cook_state(生→熟→焦)
+        return km
 
     def pos(self, st: dict) -> tuple:
         lay = (st or {}).get("layout") or {}
@@ -144,6 +173,7 @@ class Engine:
             return []
         orders = [o for o in (payload.get("live") or []) if o.get("name")]
         orders.sort(key=lambda o: float(o.get("t", 1.0)))
+        self._track_orders(orders)      # 顺带出 order_new / order_gone
         return orders
 
     def find_detail(self, st: dict, name: str) -> dict | None:
@@ -170,7 +200,9 @@ class Engine:
         #   于是用户每看一眼终端, 就把当前路径上的点逐个判死, 整条路径报废。
         #   实测日志: 一连串 "[导航] 游戏不在前台 → 路径点 (2.4,7.2) 到不了 → 继续下一个"。
         _told = False
-        while not ensure_focus(wait_s=1.0):
+        # 只松**自己这套**键: 不传 bindings 会把两套都松掉, 连队友(或玩家正按着
+        # 的)那套一起打断 —— 见 _release_all_safe() 的说明。
+        while not ensure_focus(wait_s=1.0, bindings=self.kb.b):
             if not _told:
                 self.log("[导航] 游戏不在前台 —— 暂停等它回来(失焦不算导航失败)")
                 _told = True
@@ -193,6 +225,13 @@ class Engine:
         stuck = 0
         try:
             while True:
+                # 席位中途被交出去了(玩家接手 / 下行指令): 立刻停手。
+                # 不检查的话会一直"推空气"到单步超时(25 秒)才放弃 —— 玩家那边
+                # 看起来就是"脚本卡住了", 而其实是它早就不该动了。
+                if not self.key_ok():
+                    self.log("[导航] 席位已不在脚本手里, 中止")
+                    self.kb.release_all()
+                    return False
                 if time.time() - t0 > limit:
                     self.log(f"[导航] 超时 (还差 {dist:.1f} 格)")   # 只看"超时"分不清是没走到还是走错方向
                     return False
@@ -252,9 +291,7 @@ class Engine:
                         key = self._key("W" if dz > 0 else "S")
                     else:
                         key = self._key("D" if dx > 0 else "A")
-                    key_down(key)
-                    time.sleep(0.35)
-                    key_up(key)
+                    self._press(key, 0.35)
                     time.sleep(0.1)
                     stuck = 0
                     continue
@@ -282,9 +319,7 @@ class Engine:
                 step_dist = max(abs(dx), abs(dz))
                 hold = step_dist / self.speed
                 hold = max(0.05, min(self.max_hold, hold))
-                key_down(key)
-                time.sleep(hold)
-                key_up(key)
+                self._press(key, hold)
                 time.sleep(self.tap_gap)
         finally:
             self.kb.release_all()
@@ -332,9 +367,7 @@ class Engine:
         if not d:
             return True
         key = self._key({"left": "A", "right": "D", "up": "W", "down": "S"}[d])
-        key_down(key)
-        time.sleep(hold)
-        key_up(key)
+        self._press(key, hold)
         time.sleep(0.08)
         return True
 
@@ -434,7 +467,9 @@ class Engine:
         if want is None:
             self.log(f"[键位] 未知的玩家归属 {chef.player!r}")
             return False
-        self.kb = KeyboardPlayer(PLAYER1 if want == "P1" else PLAYER2)
+        # 换 kb 时要**重新装上席位闸门** —— 漏了这里, 键位绑定一刷新闸门就没了
+        self.kb = KeyboardPlayer(PLAYER1 if want == "P1" else PLAYER2,
+                                 allow=self._kb_allow)
         self.log(f"[键位] 厨师#{self.cid} 属于 {chef.player} → 用 {want} 键位")
         return True
 
@@ -446,21 +481,23 @@ class Engine:
         没有必然对应 —— 实测遇到过 `cid=0` 其实归「方向键」那一路、而 WASD 完全
         没绑定到任何玩家的情况。靠假设选错键位, 表现就是"发了一堆按键但人一动不动"。
         """
-        from bridge.keyboard_input import PLAYER1, PLAYER2, ensure_focus, key_down, key_up
+        from bridge.keyboard_input import PLAYER1, PLAYER2, ensure_focus
         cands = candidates or [("P1(WASD)", PLAYER1), ("P2(方向键)", PLAYER2)]
         st = self.state()
         p0 = self.pos(st) if st else (None, None, "")
         if p0[0] is None:
             self.log("[键位] 探测失败: 读不到厨师位置")
             return None
-        if not ensure_focus(wait_s=self.focus_wait):
+        if not ensure_focus(wait_s=self.focus_wait, bindings=self.kb.b):
             self.log("[键位] 探测失败: 游戏不在前台(脚本不抢焦点)")
+            return None
+        if not self.key_ok():
+            # 席位不归脚本 —— 探测要真按键, 绝不能碰玩家的键盘
+            self.log("[键位] 席位不归脚本, 跳过键位探测")
             return None
         for label, b in cands:
             for key in (b["up"], b["down"], b["left"], b["right"]):
-                key_down(key)
-                time.sleep(0.22)
-                key_up(key)
+                self._press(key, 0.22)
                 time.sleep(0.18)
                 p1 = self.pos(self.state())
                 if p1[0] is None:
@@ -469,7 +506,7 @@ class Engine:
                     self.log(f"[键位] 探测到可用键位: {label} (按 {key} 使 "
                              f"P{self.cid + 1} 从 ({p0[0]:.1f},{p0[1]:.1f}) 移到 "
                              f"({p1[0]:.1f},{p1[1]:.1f}))")
-                    self.kb = KeyboardPlayer(b)
+                    self.kb = KeyboardPlayer(b, allow=self._kb_allow)   # 同上: 别忘了闸门
                     return b
         self.log(f"[键位] ⚠ 两套键位都驱动不了 P{self.cid + 1} —— "
                  f"检查: 该玩家是否已加入? 窗口是否真前台?")
@@ -485,7 +522,46 @@ class Engine:
         if not orders:
             return 0.0
         left = min(float(o.get("t", 1.0)) for o in orders)
+        self._track_hurry(orders)
         return max(0.0, min(1.0, 1.0 - left))
+
+    def _track_hurry(self, orders: list) -> None:
+        """订单快超时 → hurry 事件。**一张单只报一次**（展开说会变成噪音刷屏）。
+
+        这是陪玩最值钱的事件之一：猫娘得能在菜快烂掉的时候喊一声，
+        而不是等订单消失了才知道。
+        """
+        if self.events is None:
+            return
+        for o in orders or []:
+            name = str(o.get("name") or "")
+            left = float(o.get("t", 1.0))
+            if name and left <= self.hurry_at:
+                self._emit("hurry", once_key=f"hurry:{name}", name=name, left=left)
+
+    def _track_cooking(self, km) -> None:
+        """灶上东西的**状态迁移**（生 → 熟 → 焦）→ cook_state 事件。
+
+        只在**变化**时发：Raw 每一帧都是 Raw，报它没意义；真正值得 AI 说的
+        是"刚熟，快取"和"糊了"。后者尤其重要 —— 焦了订单就不认了。
+        """
+        if self.events is None or km is None:
+            return
+        seen = {}
+        for ck in getattr(km, "cooking", None) or []:
+            key = getattr(ck, "station", "") or getattr(ck, "name", "")
+            if not key:
+                continue
+            seen[key] = (getattr(ck, "state", "") or "", getattr(ck, "ing", "") or "")
+        prev = self._cook_states
+        self._cook_states = seen
+        if prev is None:
+            return
+        for key, (state, ing) in seen.items():
+            old = prev.get(key)
+            if old is not None and old[0] != state:
+                self._emit("cook_state", station=key, ing=ing,
+                           frm=old[0], to=state, burning=(state == "Burnt"))
 
     def _apply_mischief(self, m, km, st) -> None:
         """演一次失误/捣蛋。**只做小动作，不改变流程控制**（做完照常继续）。
@@ -554,6 +630,13 @@ class Engine:
         if m is None:
             return
         self.log(f"[模式] P{self.cid + 1} {ms.mode.value} → 演 {m.value}")
+        # 点名的"小类"演不了时 roll() 会退回大类随机演(决定 6)。这一点必须**报出去**,
+        # 否则 AI 说"我要去倒掉你的菜", 实际却发了个呆, 看起来像脚本坏了。
+        pinned = getattr(ms, "pin", None)
+        self._emit("mischief", form=m.value, mode=ms.mode.value,
+                   conscience=round(float(getattr(ms, "conscience", 0.0)), 2),
+                   fell_back=bool(pinned) and m not in pinned,
+                   asked=([x.value for x in pinned] if pinned else None))
         try:
             self._apply_mischief(m, km, st)
         except Exception as e:
@@ -764,10 +847,7 @@ class Engine:
                         key = self._key("D" if abs(dx) >= abs(dz) and dx > 0 else
                                         "A" if abs(dx) >= abs(dz) else
                                         "W" if dz > 0 else "S")
-                        from bridge.keyboard_input import key_down, key_up
-                        key_down(key)
-                        time.sleep(hold)
-                        key_up(key)
+                        self._press(key, hold)
                         time.sleep(0.08)
                     st4 = self.state()
                     pick, use = self.interaction_targets(st4)
@@ -1472,12 +1552,21 @@ class Engine:
         self.assemble_spot = None
         total = len(flow.ops)
         for i, op in enumerate(flow.ops):
+            # 席位检查点 ①: 每一步开始前。席位被交出去了就立刻停手并交接。
+            # 这是"一步操作"的天然边界; 一步**中途**的让位由 navigate() 循环里的
+            # 检查兜住(否则会一直推空气到单步超时 25 秒)。
+            if not self.key_ok():
+                self.log("[引擎] 席位已不在脚本手里, 停止本单")
+                self.handover()
+                return False
             done = False
             _st0 = self.state()
             _c0 = self.pos(_st0) if _st0 else (None, None, "")
             _loc = f" @({op.at_x:.1f},{op.at_z:.1f})" if (op.at_x or op.at_z) else ""
             _chef = f"  厨师({_c0[0]:.1f},{_c0[1]:.1f}) 手持{_c0[2]!r}" if _c0[0] is not None else ""
             self.log(f"[引擎] ▶ {i+1}/{total} {op.action} {op.target}{_loc}{_chef}")
+            self._emit("op_start", i=i + 1, total=total, action=op.action,
+                       target=op.target, at_x=op.at_x, at_z=op.at_z)
             # 三模式：这一步开始前，先看要不要演一次失误/捣蛋（v1 §4/§5）
             if self.mode_state is not None:
                 _km0 = self.map(_st0) if _st0 else None
@@ -1506,8 +1595,10 @@ class Engine:
                 self.log(f"[引擎] ✗ 放弃: {op.action} {op.target}")
                 # 记下失败在哪一步, 供主循环判断"是不是同一个 bug 在反复失败"
                 self._last_fail_step = f"{i+1}.{op.action} {op.target}"
+                self._emit("op_fail", i=i + 1, action=op.action, target=op.target)
                 return False
             self.log(f"[引擎] ✓ {op.action} {op.target}")
+            self._emit("op_done", i=i + 1, action=op.action, target=op.target)
         return True
 
     # ---------------- 规划 ----------------
@@ -1533,6 +1624,189 @@ class Engine:
             return name, float(o.get("t", 1.0)), derive(detail, self.know)
         return None
 
+    # ---------------- 事件 ----------------
+    def _emit(self, kind: str, once_key: str = None, **data) -> None:
+        """发一条事件。没挂总线时什么都不做 —— 纯 CLI 的行为一字不变。
+
+        为什么包一层而不是各处直接 `self.events.emit(...)`: 发射点会越来越多,
+        每处都写一遍 `if self.events is not None` 迟早会漏一个。
+        """
+        if self.events is None:
+            return
+        try:
+            self.events.emit(kind, cid=self.cid, once_key=once_key, **data)
+        except Exception as e:
+            # emit() 本身承诺不抛; 这里是最后一道保险 —— 事件发不出去,
+            # 绝不能连累做菜。
+            self.log(f"[事件] 发送失败(忽略): {type(e).__name__}: {e}")
+
+    def _track_orders(self, orders: list) -> None:
+        """订单集合的**差分** → order_new / order_gone 事件。
+
+        放在 `live_orders()` 里顺带做, 不额外多问一次桥 —— 桥的请求槽是全局单槽,
+        多一个调用方就多一分串数据的机会(见 StateCollector)。
+
+        注意: 两个席位会各自看到同一张单, 所以这里用 once_key 让总线去重。
+        """
+        if self.events is None:
+            return
+        now = {str(o.get("name") or "") for o in (orders or [])}
+        now.discard("")
+        prev = self._seen_orders
+        self._seen_orders = now
+        if prev is None:
+            # 第一轮不报"新订单" —— 那是开局就挂在栏上的存量, 不是刚来的
+            return
+        for name in sorted(now - prev):
+            left = next((float(o.get("t", 1.0)) for o in orders
+                         if str(o.get("name")) == name), 1.0)
+            self._emit("order_new", once_key=f"order_new:{name}", name=name, left=left)
+        for name in sorted(prev - now):
+            self._emit("order_gone", once_key=f"order_gone:{name}", name=name, why="left")
+
+    def _track_round(self, st: dict) -> None:
+        """对局的开始/结束**沿** → round_start / round_end。"""
+        if self.events is None:
+            return
+        now = bool(st.get("inRound"))
+        if now == self._was_in_round:
+            return
+        self._was_in_round = now
+        scene = st.get("scene") or self.scene or ""
+        if now:
+            # 新一局: 订单差分重新起算, 否则开局挂在栏上的存量会被当成"刚来的单"
+            self._seen_orders = None
+            self._emit("round_start", scene=scene)
+        else:
+            self._emit("round_end", scene=scene)
+
+    # ---------------- 席位闸门 ----------------
+    def _kb_allow(self) -> bool:
+        """给 KeyboardPlayer 用的闸门回调(它没有 logger, 判断逻辑在 key_ok)。"""
+        return self.key_ok()
+
+    def key_ok(self) -> bool:
+        """**这个席位现在允许脚本发键吗？** 引擎里所有"按下"动作都要过这里。
+
+        两道闸:
+          ① `observe_only` —— 静态的。启动时声明这个席位归人(`--seat1=human`),
+             整场脚本只读不发键。
+          ② `owns_seat()` —— 动态的。运行时席位被交出去/收回来(下行指令、AI 接入)。
+
+        闸门自己出错时返回 True(**保持旧行为**): 宁可多打一会儿, 也不要因为一个
+        判断异常就让整局没人动 —— 那种失败看起来像"脚本坏了", 极难定位。
+
+        注意 `release_all()` **不**过闸: 松键任何时候都安全且必要。
+        """
+        if self.observe_only:
+            return False
+        if self.owns_seat is None:
+            return True
+        try:
+            return bool(self.owns_seat())
+        except Exception as e:
+            self.log(f"[席位] 归属判断异常, 暂按『归脚本』处理: {e}")
+            return True
+
+    def _press(self, key: str, hold: float) -> None:
+        """按住 key 一段时间再松开 —— 引擎里所有"一次推一把"的移动都走这里。
+
+        为什么要有这个收口(它是席位闸门唯一的把关点):
+        `KeyboardPlayer` 只管 tap 类动作(pickup/chop/dash)。引擎里另有 5 处
+        "按住 N 秒"的移动是**直接调模块级 key_down/key_up** 的 —— 侧移脱困、主移动、
+        转身、就地微调、键位探测。如果只在 KeyboardPlayer 里加闸门, 这 5 处会绕过它,
+        于是"席位交给玩家了、脚本还在推他的键盘" —— 正是席位模型要防的事。
+        """
+        if not self.key_ok():
+            return
+        key_down(key)
+        try:
+            time.sleep(hold)
+        finally:
+            key_up(key)
+
+    def handover(self) -> None:
+        """把这个席位交出去: 松键 + 释放所有认领 + 清掉跨步持有的状态。幂等。
+
+        为什么必须一次做全(每一项漏了都有具体后果):
+          · `kb.release_all()` —— 不松手, 玩家接手时"车还在往前开"
+          · `board.release_all(cid)` —— 不释放认领, 队友(或人)永远拿不到这张单/这个锅
+          · `_stove_used` / `assemble_spot` —— 残留的指针会让"回来以后"继续操作
+            一个早就不属于它的台子
+        """
+        try:
+            self.kb.release_all()
+        except Exception:
+            pass
+        if self.board is not None:
+            try:
+                self.board.release_all(self.cid)
+            except Exception:
+                pass
+        self._stove_used = ""
+        self.assemble_spot = None
+        if self.on_handover is not None:
+            try:
+                self.on_handover(self.cid)
+            except Exception:
+                pass
+
+    def stop(self):
+        """请求主循环退出(给插件外壳这类"杀不掉线程"的调用方用)。幂等。
+
+        注意退出**不是即时的**: run() 只在循环头看这个标志, 所以最坏要等当前
+        这一"步"走完(单步超时 self.step_timeout, 默认 25 秒)。调用方若要立刻
+        松开按键, 自己再补一次 self.kb.release_all() —— 那不会有害。
+        """
+        self._stop.set()
+
+    # ---------------- 观察模式(席位归人) ----------------
+    def observe_once(self) -> None:
+        """只读一轮: 看这个席位的厨师在干什么, 变了就记一笔。**一个键都不发。**
+
+        席位归人时脚本唯一该做的事 —— 也是人类席位事件流的来源: NEKO 得知道
+        "人在切洋葱、手上拿着盘子", 才能在旁边接得上话。
+
+        注意脚本**只能看结果**(位置/手持/是否在重生), 看不了**输入**:
+        `keyboard_input._send_key` 从不设 dwExtraInfo, `GetAsyncKeyState` 也不区分
+        来源, 所以"人按了哪个键"根本拿不到。"人在做什么"只能从**结果**反推。
+
+        (事件出口在 events.py 接上后由这里发; 现在先落到 log, 便于离线观察。)
+        """
+        st = self.state()
+        if not st:
+            return
+        if not st.get("inRound"):
+            if self._observed_round:
+                self._observed_round = False
+                self._observed_last = None
+                self.log("[观察] 对局结束")
+            return
+        self._observed_round = True
+        c = self.chef(st)
+        if not c:
+            return
+        held = c.get("held") or ""
+        x, z = c.get("x"), c.get("z")
+        resp = bool(c.get("respawning"))
+        # 位置按 0.1 格量化: 不然每帧的浮点抖动都会被算成"变了", 日志直接刷爆
+        cur = (held, resp,
+               None if x is None else round(float(x), 1),
+               None if z is None else round(float(z), 1))
+        if cur != self._observed_last:
+            self._observed_last = cur
+            where = "?" if x is None else "({:.1f},{:.1f})".format(float(x), float(z))
+            self.log("[观察] P{} 手持{!r} @{}{}".format(
+                self.cid + 1, held, where, " [重生中]" if resp else ""))
+            # 人类席位的事件流 —— NEKO 靠它知道"人在切洋葱", 才能接得上话。
+            # 注意这是**从结果反推**的(位置/手持), 不是"看到人按键": 脚本分不清
+            # 键是谁按的(见 keyboard_input._send_key)。所以措辞只能是"在做什么",
+            # 不能是"按了什么"。
+            self._emit("human_observed", held=held,
+                       x=None if x is None else round(float(x), 1),
+                       z=None if z is None else round(float(z), 1),
+                       respawning=resp)
+
     # ---------------- 主循环 ----------------
     def run(self, dry: bool = False):
         self.log("[引擎] 启动, 等对局...")
@@ -1540,8 +1814,19 @@ class Engine:
         self.log("[引擎]           按 " + (os.environ.get("NEKO_PANIC_KEY") or "F12") +
                  " 可以急停(只读按键状态, 不影响你在游戏里的操作)")
         _warned_unfocused = False
-        _fail_sig, _fail_n = None, 0
+        self._fail_sig, self._fail_n = None, 0
+        #: 这个席位现在归脚本吗。起始值直接问闸门 —— observe_only 的席位一上来
+        #: 就该是"不归脚本", 不能先假装归脚本再交出去(会打一句莫名其妙的交接日志)。
+        _owning = self.key_ok()
         while True:
+            # ---- 外部停止请求 ----
+            # 自己松手再退: SendInput 是系统级注入, 留着键不放会让玩家接手时
+            # "车还在往前开"。
+            if self._stop.is_set():
+                self.kb.release_all()
+                self.log("[引擎] 收到停止请求, 退出")
+                return
+
             # ---- 焦点/急停闸门 ----
             # SendInput 是系统级注入, 键会发给**当前前台窗口**。所以游戏不在前台时
             # 绝不能发键 —— 一是会打进别人家窗口, 二是用户根本没法用电脑。
@@ -1561,10 +1846,34 @@ class Engine:
                 self.log("[引擎] 游戏回到前台, 继续")
                 _warned_unfocused = False
 
+            # ---- 席位闸门 ----
+            # 席位不归脚本时: 先交接一次(松键 + 释放所有认领), 然后**只观察不驱动**。
+            # 观察不是浪费 —— 人类席位也要出事件流, NEKO 才知道"人在切洋葱",
+            # 否则猫娘在那个席位上是瞎子, 接不上话(而且脚本分不清键是谁按的,
+            # 只能看结果, 见 keyboard_input._send_key)。
+            if not self.key_ok():
+                if _owning:
+                    self.handover()
+                    _owning = False
+                    self.log("[席位] 席位已交给别人 —— 脚本只观察, 不再发键")
+                self.observe_once()
+                time.sleep(self.observe_interval)
+                continue
+            if not _owning:
+                # 席位被交回来了(人睡了、AI 接入、下行指令) —— 重新开始驱动。
+                # 从**干净状态**开始: 失败计数和键位探测都要复位。不复位的话,
+                # 人玩了三分钟再交回来, 引擎会带着之前残留的失败指纹一接管就
+                # 触发"3 连败停机"(规则 5), 看起来像"刚接管就坏了"。
+                _owning = True
+                self._fail_sig, self._fail_n = None, 0
+                self._probed = False
+                self.log("[席位] 席位回到脚本手里, 开始驱动")
+
             st = self.state()
             if not st:
                 time.sleep(1)
                 continue
+            self._track_round(st)
             if not st.get("inRound"):
                 if self.scene:
                     self.log("[引擎] 对局结束, 清空缓存")
@@ -1604,7 +1913,7 @@ class Engine:
 
             if self.execute(flow):
                 self.log(f"[引擎] ★ 完成 {name}")
-                _fail_sig, _fail_n = None, 0
+                self._fail_sig, self._fail_n = None, 0
             else:
                 self.log(f"[引擎] 订单 {name} 未完成")
                 # ---- 同一步反复同样失败 → 立刻停下报错, 别把整局烧光 ----
@@ -1612,14 +1921,14 @@ class Engine:
                 # "重试 3 次 → 放弃 → 重新规划同一单 → 再来一遍" 上, 白白烧完一局。
                 # 现在记住"订单+失败在哪一步"的指纹, 连续 3 次一样就停。
                 sig = (name, getattr(self, "_last_fail_step", ""))
-                if sig == _fail_sig:
-                    _fail_n += 1
+                if sig == self._fail_sig:
+                    self._fail_n += 1
                 else:
-                    _fail_sig, _fail_n = sig, 1
-                if _fail_n >= 3:
+                    self._fail_sig, self._fail_n = sig, 1
+                if self._fail_n >= 3:
                     self.log("")
                     self.log("=" * 62)
-                    self.log(f"[引擎] ⛔ 同一步连续失败 {_fail_n} 次: {name} / {sig[1]}")
+                    self.log(f"[引擎] ⛔ 同一步连续失败 {self._fail_n} 次: {name} / {sig[1]}")
                     self.log("[引擎]    这多半是代码 bug 而不是运气问题, 已停止以免烧完整局。")
                     self.log("[引擎]    把上面第一次失败的日志发给开发者。")
                     self.log("=" * 62)

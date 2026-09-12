@@ -24,3 +24,6 @@ overcooked_decomp/
 overcooked_decomp.7z
 overcooked_decomp*.7z
 overcooked_decomp*.zip
+
+# CodeGraph 本地索引(每个开发者自己生成)
+.codegraph/

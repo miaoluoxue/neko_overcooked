@@ -101,9 +101,55 @@ class BridgeClient:
         """整张关卡网格 + 危险区 + 空洞 + 平台。见 neko/terrain.py 的 TerrainMap。"""
         return self._send({"cmd": "map", "arg": "force" if force else ""})
 
+    def get_pads(self) -> dict:
+        """**只读**诊断虚拟手柄: 我们的设备有没有进 `PCPadInputProvider.m_allDevices`、
+        表里都有谁、以及 Pad 0..3 各落在哪个设备上。
+
+        走主线程 job 泵执行 —— 读它会触发 `PCPadInputProvider` 的静态构造,
+        从桥线程触发会卡死(见 `Plugin.cs` 的注释)。
+        """
+        return self._send({"cmd": "pads"})
+
+    def init_pads(self) -> dict:
+        """注入虚拟手柄到 `m_allDevices`, 然后回报状态（主线程执行）。
+
+        ⚠ 同样会触发静态构造 —— 这是当初把这条路停掉的那个隐患, 所以它是
+        **按需触发**而不是开机自动跑: 出问题能立刻看出来是谁干的。
+        """
+        return self._send({"cmd": "padinit"})
+
     def get_dyn(self) -> dict:
         """关卡里的机关/陷阱: 按钮 / 传送带方向 / 触发机器 / 平台 / 正在烧的东西 / 关卡变形。"""
         return self._send({"cmd": "dyn"})
+
+    def send_pad(self, pad: int, *, connected: bool = True,
+                 lx: float = 0.0, ly: float = 0.0, rx: float = 0.0, ry: float = 0.0,
+                 lt: float = 0.0, rt: float = 0.0,
+                 a=False, b=False, x=False, y=False, lb=False, rb=False,
+                 start=False, back=False,
+                 du=False, dd=False, dl=False, dr=False) -> dict:
+        """推一个**虚拟手柄**的状态（C# 侧见 `VirtualGamepad.cs`）。
+
+        这是"进程内驱动"那条路：InControl 的虚拟设备每帧被游戏自己的
+        `InputManager.UpdateDevices` 刷新，**不经过 SendInput、不经过前台窗口** ——
+        所以理论上游戏不在前台也能操作。这正是它和键盘注入的本质区别。
+
+        注意：C# 侧整套（设备注册 / Update override / pad 命令处理）早就写完了，
+        但从没有 Python 调用方 —— 这条路一直是"造好了没通电"。
+        """
+        return self._send({
+            "cmd": "pad", "pad": int(pad),
+            "connected": 1 if connected else 0,
+            "A": 1 if a else 0, "B": 1 if b else 0,
+            "X": 1 if x else 0, "Y": 1 if y else 0,
+            "lb": 1 if lb else 0, "rb": 1 if rb else 0,
+            "start": 1 if start else 0, "back": 1 if back else 0,
+            "du": 1 if du else 0, "dd": 1 if dd else 0,
+            "dl": 1 if dl else 0, "dr": 1 if dr else 0,
+            "lx": float(lx), "ly": float(ly),
+            "rx": float(rx), "ry": float(ry),
+            "lt": float(lt), "rt": float(rt),
+        })
 
     def send_action(self, chef: int, kind: str, target: str = "", duration: float = 0.0) -> dict:
         return self._send({"cmd": "action", "chef": chef, "kind": kind,
