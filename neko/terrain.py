@@ -41,6 +41,10 @@ CH_FIRE = "F"         # 火焰
 CH_HAZARD = "H"       # 水面 / 岩浆 / 边界
 CH_VOID = "V"         # 空洞
 CH_VOID_LOW = "v"     # 地板太低(单向落差 / 正在下沉的平台)
+#: 物理阻挡: 不占格子、但有碰撞体挡路(装饰物/栏杆/花坛/街景)。
+#: **这是"寻路说能走、厨师却撞墙"的根源** —— 原来只看"有没有格子占用物",
+#: 这些一律被当空气。现在插件用厨师自己的胶囊半径做 OverlapSphere 检测出来。
+CH_PHYS = "x"
 
 DANGER_CHARS = CH_FIRE + CH_HAZARD + CH_VOID + CH_VOID_LOW
 
@@ -64,6 +68,7 @@ class TerrainMap:
         self.grid = data.get("grid") or ""
         self.hazards = data.get("hazards") or []
         self.counts = data.get("counts") or {}
+        self.phys_names = data.get("physNames") or []
 
     @property
     def ok(self) -> bool:
@@ -288,13 +293,17 @@ class TerrainMap:
                 float(hz.get("x0") or 0), float(hz.get("x1") or 0),
                 float(hz.get("z0") or 0), float(hz.get("z1") or 0)))
         c = self.counts
-        summary = "可走%d 障碍%d 台面传送带%d 危险%d 空洞%d 低地板%d 平台%d 地面传送带%d 火%d" % (
+        summary = "可走%d 障碍%d 物理阻挡%d 台面传送带%d 危险%d 空洞%d 低地板%d 平台%d 地面传送带%d 火%d" % (
             int(c.get("free") or 0), int(c.get("blocked") or 0),
+            int(c.get("phys") or 0),
             int(c.get("conveyor") or 0),
             int(c.get("hazard") or 0), int(c.get("void") or 0),
             int(c.get("voidLow") or 0),
             int(c.get("platform") or 0), int(c.get("travelator") or 0),
             int(c.get("fire") or 0))
+        if int(c.get("phys") or 0) > 0:
+            names = self.phys_names[:3]
+            summary += " (物理阻挡例: %s)" % ",".join(names)
         if int(c.get("conveyor") or 0) > 0:
             summary += (" ⚠有台面传送带(ConveyorStation): 放上去的物品会被一格一格传走 —— "
                         "切好的料不能存在上面")

@@ -96,6 +96,99 @@ namespace Overcooked2AI.Game
             }
         }
 
+        // ================= 物理可站判定 =================
+        /// <summary>厨师身体的碰撞半径 —— "这一格挤不挤得过去"的判据。
+        ///
+        /// 为什么必须问物理(用户指出的问题: "到现在了还是分不清橱柜、地图物品"):
+        ///   原来的可走判定只有一条 `GetGridOccupant(格) == null` ——
+        ///   **不占格子的东西一律当空气**。而关卡里有大量装饰物(街景/花坛/栏杆)
+        ///   **有碰撞体但不占格子**, 厨师撞得上去, A* 却认为能走。
+        ///   表现就是日志里的 "卡住 / 超时(还差 N 格) / 路径点 (-1.2,3.6) 到不了"。
+        /// 厨师的胶囊体在 prefab 上(离线 dump: "Player 1" 带 CapsuleCollider),
+        /// 运行时读它的 radius 就是权威尺寸, 不用猜。
+        /// </summary>
+        private static float _bodyRadius;
+
+        private static float ResolveBodyRadius()
+        {
+            try
+            {
+                var pcType = SceneScanner.FindType("PlayerControls");
+                if (pcType == null)
+                    return 0.35f;
+                var objs = UnityEngine.Object.FindObjectsOfType(pcType);
+                if (objs == null || objs.Length == 0)
+                    return 0.35f;
+                var comp = objs[0] as Component;
+                if (comp == null)
+                    return 0.35f;
+                var cap = comp.GetComponent<CapsuleCollider>();
+                if (cap == null)
+                    return 0.35f;
+                float r = cap.radius;
+                var tr = cap.transform;
+                float s = Mathf.Max(Mathf.Abs(tr.lossyScale.x), Mathf.Abs(tr.lossyScale.z));
+                r *= (s > 0.01f ? s : 1f);
+                return (r > 0.05f && r < 1.0f) ? r : 0.35f;
+            }
+            catch (Exception) { return 0.35f; }
+        }
+
+        /// <summary>这些层的碰撞体**不**算挡住路。
+        /// 其余一律算挡路 —— 宁可多标几个不可走, 也别让 A* 规划出撞墙的路径。</summary>
+        private static int _ignoreMask;
+
+        private static int ResolveIgnoreMask()
+        {
+            int m = 0;
+            string[] ignore = { "Ground", "SlopedGround", "Players", "KillPlane",
+                                "PlayerTriggerZone", "Camera", "Water", "UI",
+                                "PlayersRespawn", "Attachments", "HeldAttachments",
+                                "AttachedBackpack", "Beings", "PausableUI",
+                                "Administration" };
+            foreach (var n in ignore)
+            {
+                try
+                {
+                    int L = LayerMask.NameToLayer(n);
+                    if (L >= 0 && L < 32)
+                        m |= (1 << L);
+                }
+                catch (Exception) { }
+            }
+            return m;
+        }
+
+        /// <summary>这一格厨师身体能不能站下。返回挡路物体的名字("" = 能站)。</summary>
+        private static string BlockedBy(float x, float z, float y)
+        {
+            if (_bodyRadius <= 0.05f)
+                return "";
+            try
+            {
+                var hits = Physics.OverlapSphere(new Vector3(x, y + _bodyRadius * 0.9f, z),
+                                                 _bodyRadius * 0.88f);
+                if (hits == null)
+                    return "";
+                for (int i = 0; i < hits.Length; i++)
+                {
+                    var c = hits[i];
+                    if (c == null)
+                        continue;
+                    int layer = c.gameObject.layer;
+                    if ((_ignoreMask & (1 << layer)) != 0)
+                        continue;
+                    if (c.isTrigger)
+                        continue;                 // 触发区不挡路
+                    if (_respawnType != null && c.gameObject.GetComponent(_respawnType) != null)
+                        continue;                 // 水面/死亡面另有标记
+                    return c.gameObject.name;
+                }
+            }
+            catch (Exception) { }
+            return "";
+        }
+
         /// <summary>桥 Job: kind="map", arg 可含 "force" 强制重建。</summary>
         public static string Snapshot(string arg)
         {
@@ -181,6 +274,9 @@ namespace Overcooked2AI.Game
             // ---- 第一遍: 只判占用物, 顺便数出"空格子"总数 ----
             _conveyorType = SceneScanner.FindType("ConveyorStation");
             _groundMask = ResolveGroundMask();
+            // 物理可站判定要用到这两个(见 BlockedBy 的说明)
+            _bodyRadius = ResolveBodyRadius();
+            _ignoreMask = ResolveIgnoreMask();
             var occ = new char[total];
             var xs = new float[total];
             var zs = new float[total];
@@ -249,6 +345,8 @@ namespace Overcooked2AI.Game
 
             // ---- 第二遍: 出字符 ----
             var sb = new StringBuilder(total);
+            int nBlkSample = 0, nPhys = 0;
+            var _blkNames = new List<string>();
             int nFree = 0, nBlocked = 0, nHaz = 0, nVoid = 0, nVoidLow = 0,
                 nPlat = 0, nTravel = 0, nFire = 0, nConveyor = 0;
             for (int n = 0; n < total; n++)
@@ -266,6 +364,19 @@ namespace Overcooked2AI.Game
                 {
                     char fc = FloorChar(xs[n], zs[n], floorY);
                     ch = (fc == '\0') ? '.' : fc;
+                    // **物理可站判定**: 有地面不代表站得下 —— 装饰物/栏杆/花坛
+                    // 有碰撞体但不占格子, 原来一律当空气, A* 就会规划出撞墙的路径。
+                    if (ch == '.')
+                    {
+                        string blk = BlockedBy(xs[n], zs[n], floorY);
+                        if (blk.Length > 0)
+                        {
+                            ch = 'x';                 // 物理阻挡(非格子占用)
+                            if (nBlkSample < 6)
+                                _blkNames.Add(blk);
+                            nBlkSample++;
+                        }
+                    }
                 }
 
                 sb.Append(ch);
@@ -279,6 +390,7 @@ namespace Overcooked2AI.Game
                     case 'P': nPlat++; break;
                     case 'T': nTravel++; break;
                     case 'C': nConveyor++; break;
+                    case 'x': nPhys++; break;
                     case 'F': nFire++; break;
                     default: nBlocked++; break;
                 }
@@ -342,7 +454,16 @@ namespace Overcooked2AI.Game
              .Append(",\"platform\":").Append(nPlat)
              .Append(",\"travelator\":").Append(nTravel)
              .Append(",\"conveyor\":").Append(nConveyor)
-             .Append(",\"fire\":").Append(nFire).Append("}");
+             .Append(",\"fire\":").Append(nFire).Append(",\"phys\":").Append(nPhys).Append("}");
+            // 被物理挡住的格子, 给出几个挡路物体的名字 —— 便于核对"到底是谁挡的"
+            o.Append(",\"physNames\":[");
+            for (int i = 0; i < _blkNames.Count; i++)
+            {
+                if (i > 0)
+                    o.Append(",");
+                o.Append("\"").Append(Safe(_blkNames[i])).Append("\"");
+            }
+            o.Append("]");
             o.Append("}");
             return o.ToString();
         }
