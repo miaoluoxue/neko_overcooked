@@ -138,6 +138,11 @@ namespace Overcooked2AI.Game
         /// 其余一律算挡路 —— 宁可多标几个不可走, 也别让 A* 规划出撞墙的路径。</summary>
         private static int _ignoreMask;
 
+        /// <summary>这些层的碰撞体属于"台面/橱柜/墙"这类**实体障碍**, 不是装饰物。
+        /// 物理阻挡扫描(BlockedBy)撞到它们时, 该格应当标 '#'(solid), 而不是 'x'。
+        /// 否则会出现"鱼箱/橱柜"被标成物理阻挡, 地图解析和 CellMap 交叉验证都会错。</summary>
+        private static int _solidMask;
+
         private static int ResolveIgnoreMask()
         {
             int m = 0;
@@ -159,17 +164,38 @@ namespace Overcooked2AI.Game
             return m;
         }
 
-        /// <summary>这一格厨师身体能不能站下。返回挡路物体的名字("" = 能站)。</summary>
-        private static string BlockedBy(float x, float z, float y)
+        private static int ResolveSolidMask()
         {
+            int m = 0;
+            string[] names = { "Worktops", "Walls", "TableBlock",
+                               "CookingStationBlock", "PlateStationBlock",
+                               "BinBlock", "PushedObjectBounds" };
+            foreach (var n in names)
+            {
+                try
+                {
+                    int L = LayerMask.NameToLayer(n);
+                    if (L >= 0 && L < 32)
+                        m |= (1 << L);
+                }
+                catch (Exception) { }
+            }
+            return m;
+        }
+
+        /// <summary>这一格厨师身体能不能站下。返回挡路物体的名字("" = 能站)。</summary>
+        /// <summary>返回该格被什么挡住: '\0'=能站, '#'=实体障碍, 'x'=装饰性物理阻挡。</summary>
+        private static char BlockedBy(float x, float z, float y, out string name)
+        {
+            name = "";
             if (_bodyRadius <= 0.05f)
-                return "";
+                return '\0';
             try
             {
                 var hits = Physics.OverlapSphere(new Vector3(x, y + _bodyRadius * 0.9f, z),
                                                  _bodyRadius * 0.88f);
                 if (hits == null)
-                    return "";
+                    return '\0';
                 for (int i = 0; i < hits.Length; i++)
                 {
                     var c = hits[i];
@@ -182,11 +208,14 @@ namespace Overcooked2AI.Game
                         continue;                 // 触发区不挡路
                     if (_respawnType != null && c.gameObject.GetComponent(_respawnType) != null)
                         continue;                 // 水面/死亡面另有标记
-                    return c.gameObject.name;
+                    name = c.gameObject.name;
+                    if ((_solidMask & (1 << layer)) != 0)
+                        return '#';
+                    return 'x';
                 }
             }
             catch (Exception) { }
-            return "";
+            return '\0';
         }
 
         /// <summary>桥 Job: kind="map", arg 可含 "force" 强制重建。</summary>
@@ -277,6 +306,7 @@ namespace Overcooked2AI.Game
             // 物理可站判定要用到这两个(见 BlockedBy 的说明)
             _bodyRadius = ResolveBodyRadius();
             _ignoreMask = ResolveIgnoreMask();
+            _solidMask = ResolveSolidMask();
             var occ = new char[total];
             var xs = new float[total];
             var zs = new float[total];
@@ -368,13 +398,16 @@ namespace Overcooked2AI.Game
                     // 有碰撞体但不占格子, 原来一律当空气, A* 就会规划出撞墙的路径。
                     if (ch == '.')
                     {
-                        string blk = BlockedBy(xs[n], zs[n], floorY);
-                        if (blk.Length > 0)
+                        char blk = BlockedBy(xs[n], zs[n], floorY, out string blkName);
+                        if (blk != '\0')
                         {
-                            ch = 'x';                 // 物理阻挡(非格子占用)
-                            if (nBlkSample < 6)
-                                _blkNames.Add(blk);
-                            nBlkSample++;
+                            ch = blk;
+                            if (blk == 'x')
+                            {
+                                if (nBlkSample < 6)
+                                    _blkNames.Add(blkName);
+                                nBlkSample++;
+                            }
                         }
                     }
                 }
