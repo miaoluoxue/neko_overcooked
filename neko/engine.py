@@ -1175,7 +1175,6 @@ class Engine:
             return None
         ci, cj = cell
         belt_speed = max(0.1, self._belt_speeds_cache.get(cell, self.BELT_SPEED))
-        cell_len = abs(tm.cellx) or 1.2
 
         for k in range(1, 10):
             ti, tj = ci + step[0] * k, cj + step[1] * k
@@ -1193,7 +1192,11 @@ class Engine:
                 continue
             dist = ((spot[0] - cx) ** 2 + (spot[1] - cz) ** 2) ** 0.5
             t_chef = dist / self.CHEF_SPEED_DASH        # 用冲刺速度估, 偏乐观一点
-            t_item = (k * cell_len) / belt_speed
+            # 台面传送带的 speed 单位是 **格/秒**(ConveyorStation.m_conveySpeed,
+            # ServerConveyorStation.cs:192 arriveTime = now + 1/speed)。
+            # 所以走 k 格的时间就是 k / speed, 不能再乘格长 —— 那是把它当"单位/秒"了,
+            # 会让 t_item 被放大 1.2 倍, 导致把过远的格子当成"赶得上"。
+            t_item = k / belt_speed
             if t_chef <= t_item + 1.2:                  # 留 1.2 秒余量
                 return (spot, (wx, wz), max(0.0, t_item - t_chef))
         return None
