@@ -840,13 +840,31 @@ class Engine:
             return bool(pick or use)
         return self._name_is(pick, want) or self._name_is(use, want)
 
+    def _place_ok(self, st: dict, want: str) -> bool:
+        """用游戏自己报的放置目标(m_iHandlePlacement 的宿主)确认"放得进去"。
+
+        拾取看 pick/use, 放置必须看 placeh —— 两者在游戏里是分开扫描的
+        (PlayerControls.cs:742-778)。手持物时 pick 往往为空或指向手里的东西,
+        拿 pick 判放置是错的; placeh 才是指向台面/锅的放置宿主。
+        """
+        if not want:
+            return True
+        c = self.chef(st or {})
+        return self._name_is(c.get("placeh") or "", want)
+
+    def _goal_ok(self, st: dict, want: str, place_want: str) -> bool:
+        if place_want:
+            return self._place_ok(st, place_want)
+        return self._aim_ok(st, want)
+
     def _approach(self, km: KitchenMap, tx: float, tz: float, attempt: int = 0,
-                  tight: float = 0.8, want: str = "") -> bool:
+                  tight: float = 0.8, want: str = "", place_want: str = "") -> bool:
         """接近一个台子并**转身面向它**。
 
         先站到"能站的相邻格", 再转身 —— 而不是朝台面本身推(那是障碍格)。
         attempt>0(上一次拿错了)时换个方位站: 相邻台子只隔 1.2 格, 游戏靠朝向决定
         交互哪一个, 换个方向最后一步的朝向就不同。
+        place_want 非空时, 用 placeh(放置目标)验收; 否则用 pick/use(拾取/交互)验收。
         """
         st = self.state(force=True)
         cx, cz, _ = self.pos(st) if st else (None, None, "")
@@ -887,7 +905,7 @@ class Engine:
                         continue
                     df = ((tx - px) ** 2 + (tz - pz) ** 2) ** 0.5
                     pick, use = self.interaction_targets(st2)
-                    if (not want) or self._aim_ok(st2, want):
+                    if self._goal_ok(st2, want, place_want):
                         self.log("[接近] (%.1f,%.1f) 距 %.2f 格, 游戏说可作用: 抓取=%r ✓"
                                  % (px, pz, df, pick))
                         return True
@@ -896,14 +914,14 @@ class Engine:
 
                 # ---- 就地微调: 不换站位, 只朝目标小步挪 + 转身, 每步问一次游戏 ----
                 # 这是"范围交互"的正解: 不必走到某个精确点, 只要进入范围且朝向对。
-                if want:
+                if want or place_want:
                     self.log("[接近] 就地微调, 朝目标靠近直到游戏说能作用")
                     for k in range(8):
                         st3 = self.state(force=True)
                         px, pz, _ = self.pos(st3) if st3 else (None, None, "")
                         if px is None:
                             break
-                        if self._aim_ok(st3, want):
+                        if self._goal_ok(st3, want, place_want):
                             self.log("[接近] 微调 %d 次后到位 (%.1f,%.1f) ✓" % (k, px, pz))
                             return True
                         dx, dz = tx - px, tz - pz
@@ -933,9 +951,9 @@ class Engine:
             # 兜底也要验收：走得到不等于抓得到。箱子坐标错/位置变的时候，走到
             # 旧坐标旁边其实是另一个箱子，这里不确认就返回 True，上层会盲目按下
             # 抓取键，把错的东西拿到手再放回去。
-            if ok and want:
+            if ok and (want or place_want):
                 st_now = self.state(force=True)
-                ok = self._aim_ok(st_now, want)
+                ok = self._goal_ok(st_now, want, place_want)
             return ok
         import math
         ang = attempt * 2.39996
@@ -944,9 +962,9 @@ class Engine:
         ok = self.navigate_smart(km, tx, tz, tight=max(0.45, tight - 0.3))
         if ok:
             self.face(tx, tz)
-        if ok and want:
+        if ok and (want or place_want):
             st_now = self.state(force=True)
-            ok = self._aim_ok(st_now, want)
+            ok = self._goal_ok(st_now, want, place_want)
         return ok
 
     def _find_item_station(self, km: KitchenMap, target: str,
@@ -1690,7 +1708,7 @@ class Engine:
             if not held:
                 self.log("[步骤] 手上没东西可煮")
                 return False
-            if not self.navigate_smart(km, stove.x, stove.z, tight=0.8):
+            if not self._approach(km, stove.x, stove.z, tight=0.8, place_want=stove.name):
                 return False
             if not self.interact("pickup", verify_hold_change=True):   # 手上的东西必须脱手
                 self.log("[步骤] ⚠ 东西没放上去(锅/灶台没接住)")
@@ -1763,13 +1781,12 @@ class Engine:
             km = self.map(st) if st else None
             if km is None:
                 return False
-            if not self.navigate_smart(km, stove.x, stove.z, tight=0.8):
-                return False
             # 朝向**锅**的实时位置, 而不是灶台中心 —— 锅架在灶台某个挂点上,
             # 朝灶台中心可能正好背对锅, m_iHandlePlacement 就判不到锅。
             fx = before.x if (before is not None and before.x) else stove.x
             fz = before.z if (before is not None and before.z) else stove.z
-            self.face(fx, fz)
+            if not self._approach(km, fx, fz, tight=0.8, place_want=stove.name):
+                continue
             st0 = self.state(force=True)
             placeh = (self.chef(st0) or {}).get("placeh") or ""
             self.log(f"[步骤] 手拿盘子对 {stove.id} 按交互取菜(第 {k+1} 次, "
@@ -1889,11 +1906,10 @@ class Engine:
             self.log(f"[步骤] ⚠ 摆盘位 {spot.id} 上没有盘子, 材料只能先干放在台面上")
         self.log(f"[步骤] 把 {held} 放到摆盘位 {spot.id}"
                  + ("(上面有盘子)" if self._has_plate(spot) else ""))
-        if not self.navigate_smart(km, spot.x, spot.z, tight=0.6):
+        # 橱柜/灶台有物理体积, 台面中心是障碍格; 必须站到"能站的相邻格"再转身,
+        # 并用游戏报的 placeh 确认放置目标就是这台, 而不是盲目朝中心走。
+        if not self._approach(km, spot.x, spot.z, tight=0.6, place_want=spot.name):
             return False
-        # 导航只保证站到了旁边, 朝向还是"最后一次移动的方向"。放置必须面向台面,
-        # 否则游戏会把 m_iHandlePlacement 判成旁边别的台面, 材料就放错地方。
-        self.face(spot.x, spot.z)
         # 手上端着盘子放到"已经有盘子"的台面 → 游戏做的其实是**两盘合并**:
         # ServerPlate.TransferToContainer → CombineWithContents, 然后把**自己清空**
         # (ServerPlate.cs:131-150), 盘子还在手上 —— 名字没变, 所以不能用
