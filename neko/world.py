@@ -37,6 +37,8 @@ class World:
         self._km_t = 0.0
         self._tm = None
         self._tm_scene = ""
+        self._dyn_t = 0.0
+        self._dyn_deforming = False
         self._resv: dict[tuple, tuple] = {}     # cell -> (cid, 过期时刻)
         self.state_fetches = 0
         self.state_cache_hits = 0
@@ -93,7 +95,12 @@ class World:
         with self._lock:
             if (not force and self._tm is not None
                     and self._tm_scene == scene and self._tm.ok):
-                return self._tm
+                # 关卡中途会变形(海鲜/矿坑/荷叶等): 一旦 dyn.transitions 报"正在变形",
+                # 静态网格就过时了, 必须强制重建。这里用 2 秒 TTL 的脏标记, 别每步都拉 dyn。
+                if self._layout_deforming():
+                    force = True
+                else:
+                    return self._tm
         try:
             data = self.br.get_map(force=force)
         except Exception as e:
@@ -120,6 +127,22 @@ class World:
             self._tm_scene = scene
             self.tm_rebuilds += 1
         return tm
+
+    def _layout_deforming(self) -> bool:
+        """这一关此刻是不是正在做布局变形(动态关卡)。2 秒内只问一次游戏。"""
+        now = time.time()
+        with self._lock:
+            if now - self._dyn_t < 2.0:
+                return self._dyn_deforming
+        try:
+            dyn = self.br.get_dyn()
+            deforming = bool((dyn or {}).get("transitions"))
+        except Exception:
+            deforming = self._dyn_deforming
+        with self._lock:
+            self._dyn_t = time.time()
+            self._dyn_deforming = deforming
+        return deforming
 
     # ---------------- 两个厨师的实时位置 ----------------
     # ⚠ 位置相关的一律 **force 读**, 不吃 TTL 缓存。
