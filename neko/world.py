@@ -39,6 +39,7 @@ class World:
         self._tm_scene = ""
         self._dyn_t = 0.0
         self._dyn_deforming = False
+        self._dyn_cache = {}
         self._resv: dict[tuple, tuple] = {}     # cell -> (cid, 过期时刻)
         self.state_fetches = 0
         self.state_cache_hits = 0
@@ -100,7 +101,7 @@ class World:
                 if self._layout_deforming():
                     force = True
                 else:
-                    return self._tm
+                    return self._with_dynamic(self._tm)
         try:
             data = self.br.get_map(force=force)
         except Exception as e:
@@ -126,23 +127,44 @@ class World:
             self._tm = tm
             self._tm_scene = scene
             self.tm_rebuilds += 1
-        return tm
+        return self._with_dynamic(tm)
 
-    def _layout_deforming(self) -> bool:
-        """这一关此刻是不是正在做布局变形(动态关卡)。2 秒内只问一次游戏。"""
+    def _dyn_snapshot(self) -> dict:
+        """取 dyn(动态层), 2 秒内复用缓存, 避免寻路每步都拉一次。"""
         now = time.time()
         with self._lock:
             if now - self._dyn_t < 2.0:
-                return self._dyn_deforming
+                return self._dyn_cache
         try:
-            dyn = self.br.get_dyn()
-            deforming = bool((dyn or {}).get("transitions"))
+            dyn = self.br.get_dyn() or {}
         except Exception:
-            deforming = self._dyn_deforming
+            dyn = self._dyn_cache
         with self._lock:
             self._dyn_t = time.time()
-            self._dyn_deforming = deforming
-        return deforming
+            self._dyn_cache = dyn
+            self._dyn_deforming = bool(dyn.get("transitions"))
+        return dyn
+
+    def _with_dynamic(self, tm):
+        """把 dyn 里的实时火/移动平台覆盖到静态图上, 返回补丁后的新图。"""
+        if tm is None or not tm.ok:
+            return tm
+        dyn = self._dyn_snapshot()
+        overrides = {}
+        try:
+            for f in dyn.get("fires") or []:
+                x, z = float(f.get("x") or 0), float(f.get("z") or 0)
+                overrides[tm.cell_of(x, z)] = "F"
+            for p in dyn.get("platforms") or []:
+                x, z = float(p.get("x") or 0), float(p.get("z") or 0)
+                overrides[tm.cell_of(x, z)] = "P"
+        except (TypeError, ValueError):
+            pass
+        return tm.patched(overrides)
+
+    def _layout_deforming(self) -> bool:
+        """这一关此刻是不是正在做布局变形(动态关卡)。2 秒内只问一次游戏。"""
+        return bool(self._dyn_snapshot().get("transitions"))
 
     # ---------------- 两个厨师的实时位置 ----------------
     # ⚠ 位置相关的一律 **force 读**, 不吃 TTL 缓存。

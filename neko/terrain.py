@@ -97,6 +97,24 @@ class TerrainMap:
     def at_world(self, x: float, z: float) -> str:
         return self.at(*self.cell_of(x, z))
 
+    def patched(self, overrides: dict) -> "TerrainMap":
+        """返回一张打了运行时补丁的新图(不改缓存里的原图)。
+
+        overrides: {(i,j): ch}。用于把 dyn 里的实时火(F)/移动平台(P)等动态状态
+        覆盖到静态网格上, 让寻路看到"此刻"的世界而不是建图那一刻的世界。
+        """
+        if not self.ok or not overrides:
+            return self
+        chars = list(self.grid)
+        for (i, j), ch in overrides.items():
+            if self.inside(i, j):
+                chars[j * self.w + i] = ch
+        import copy
+        clone = copy.copy(self)
+        clone.grid = "".join(chars)
+        # 覆盖后连通性/计数会变, 但这里只做寻路补丁; 保留原 counts 避免误导日志。
+        return clone
+
     # ---------------------------------------------------------------- 判定
     def walkable(self, i: int, j: int, allow_platform: bool = True,
                  allow_travelator: bool = True) -> bool:
