@@ -78,10 +78,11 @@ namespace Overcooked2AI.Game
                 if (impl == null)
                     return Err("这个厨师身上没有 ServerPlayerControlsImpl_Default");
 
-                // 游戏自己算好的交互目标。先强制刷新一次 —— 否则读到的可能是
-                // 上一帧的旧值(手持物刚变化后, m_iHandlePlacement 会短暂指向
-                // 刚拿起来的东西, 导致"手拿盘子去取菜却作用到自己身上")。
-                try { controls.UpdateNearbyObjects(); } catch (Exception) { }
+                // 直接读游戏每帧在 ClientPlayerControlsImpl_Default.Update_Impl 里已经
+                // 刷新好的 CurrentInteractionObjects, **不要自己再调 UpdateNearbyObjects()**。
+                // 反编译依据: 交互目标就是每帧 FindNearbyObjects 的结果(PlayerControls.cs:692-778);
+                // 直调再刷一次会脱离"按下这一帧"的朝向/站位, 把 m_iHandlePlacement 刷成
+                // 手里的东西或别的格子, 导致放置投错目标。
                 GameObject pick = ReadGo(controls, "m_TheOriginalHandlePickup");
                 GameObject use = ReadComp(controls, "m_interactable");
                 GameObject place = ReadPlacement(controls);   // m_iHandlePlacement 所在物体
@@ -98,20 +99,10 @@ namespace Overcooked2AI.Game
                         // 逐字对齐客户端 Update_Carry(ClientPlayerControlsImpl_Default.cs:238-263)
                         if (holding)
                         {
-                            // 手上有东西 = 放置/丢下。这里**不直调**。
-                            //
-                            // 原因(反编译):
-                            //   PlaceHeldItem_Client(PlayerControlsHelper.cs:149-160) 发的是
-                            //   `m_iHandlePlacement as MonoBehaviour`(台面/锅那侧), 服务端
-                            //   OnChefEvent 用 entity id 还原 target(ServerPlayerControlsImpl_Default.cs:333)。
-                            //   直调侧读到的 CurrentInteractionObjects.m_iHandlePlacement 在手持物刚变化时会
-                            //   短暂指向手上的盘子/台面上的盘子, 把 ReceivePlaceEvent 投错目标 ——
-                            //   服务端 PlaceHeldItem_Server 找不到正确放置句柄, 就什么都不做
-                            //   (PlayerControlsHelper.cs:126-147 的 else 分支直接 TakeItem)。
-                            //   与其猜目标, 不如把按键还给游戏自己的客户端链
-                            //   (Update_Carry → PlaceHeldItem_Client → 服务端路由), 那条链现在
-                            //   虚拟手柄已接管(clientOurs/serverOurs=true)。
-                            return Err("HOLDING: 放置/丢下改走原生 pickup 键兜底");
+                            // 手上有东西 → PlaceHeldItem_Client: 有放置句柄就 Place, 没有就 Take(丢脚下)
+                            // 目标必须是 m_iHandlePlacement 的宿主(台面/锅), 不是手里的东西。
+                            method = place != null ? "ReceivePlaceEvent" : "ReceiveTakeEvent";
+                            target = place;
                         }
                         else if (pick != null)
                         {
