@@ -88,6 +88,8 @@ namespace Overcooked2AI.Game
                 GameObject place = ReadPlacement(controls);   // m_iHandlePlacement 所在物体
                 bool useIsPlaceBtn = UsePlacementButton(controls);
                 bool holding = Held(controls) != null;
+                // 运行时判决: 目标台面此刻到底允不允许放下手里的东西(只读, 不改变世界)。
+                string placeCan = PlaceCanHandle(controls, place, holding);
                 GameObject target = pick;
                 string method = "ReceivePickUpEvent";
                 string extra = "";
@@ -180,7 +182,8 @@ namespace Overcooked2AI.Game
                     ",\"held\":\"{4}\",\"pick\":\"{5}\",\"place\":\"{6}\"{7}}}",
                     player, Safe(action), method, Safe(target != null ? target.name : "(null)"),
                     Safe(holding ? "yes" : "no"), Safe(pick != null ? pick.name : ""),
-                    Safe(place != null ? place.name : ""), extra);
+                    Safe(place != null ? place.name : ""), extra)
+                    .Replace("}}", ", " + placeCan + "}}");
             }
             catch (Exception ex)
             {
@@ -216,6 +219,61 @@ namespace Overcooked2AI.Game
                 return comp.gameObject;
             }
             catch (Exception) { return null; }
+        }
+
+        /// <summary>运行时判决(只读): 目标台面此刻是否允许放下手里的东西。
+        ///
+        /// 这是"允许的交互逻辑"的最后一道、也是唯一一道权威闸门 —— 直接调用
+        /// PlayerControlsHelper.GetControllingPlacementHandler_Server(target) 得到的
+        /// IHandlePlacement.CanHandlePlacement(carrier, forward, PlacementContext(Source.Player))。
+        /// 不碰世界状态, 只把 true/false 报回 Python, 用日志确认到底卡在哪。</summary>
+        private static string PlaceCanHandle(PlayerControls controls, GameObject place, bool holding)
+        {
+            if (!holding || place == null)
+                return "\"placeCanHandle\":null";
+            try
+            {
+                var phType = SceneScanner.FindType("PlayerControlsHelper");
+                if (phType == null)
+                    return "\"placeCanHandle\":null";
+                var getHandler = phType.GetMethod("GetControllingPlacementHandler_Server",
+                    BindingFlags.Public | BindingFlags.Static);
+                if (getHandler == null)
+                    return "\"placeCanHandle\":null";
+                object handler = getHandler.Invoke(null, new object[] { place });
+                if (handler == null)
+                    return "\"placeCanHandle\":null";
+
+                var carrier = controls.GetComponentInChildren(SceneScanner.FindType("ServerPlayerAttachmentCarrier"));
+                if (carrier == null)
+                    carrier = controls.GetComponentInChildren(SceneScanner.FindType("ClientPlayerAttachmentCarrier"));
+                if (carrier == null)
+                    return "\"placeCanHandle\":null";
+
+                var m = handler.GetType().GetMethod("CanHandlePlacement",
+                    BindingFlags.Public | BindingFlags.Instance);
+                if (m == null)
+                    return "\"placeCanHandle\":null";
+
+                Vector2 dir = new Vector2(controls.transform.forward.x, controls.transform.forward.z);
+                if (dir.sqrMagnitude > 0.0001f)
+                    dir.Normalize();
+
+                var pcType = SceneScanner.FindType("PlacementContext");
+                var srcType = SceneScanner.FindType("PlacementContext+Source");
+                object src = null;
+                try { src = Enum.Parse(srcType, "Player"); } catch (Exception) { }
+                object ctx;
+                try { ctx = Activator.CreateInstance(pcType, src); }
+                catch (Exception) { ctx = Activator.CreateInstance(pcType); }
+
+                object ok = m.Invoke(handler, new object[] { carrier, dir, ctx });
+                return "\"placeCanHandle\":" + (ok is bool && (bool)ok ? "true" : "false");
+            }
+            catch (Exception)
+            {
+                return "\"placeCanHandle\":null";
+            }
         }
 
         /// <summary>当前可交互物是不是把"拾取键"当触发键用(`ClientInteractable.UsePlacementButton`)。
