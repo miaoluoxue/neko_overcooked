@@ -81,6 +81,49 @@ def test_knowledge():
     check("海苔不需要煮", KB.cook_tool_for("Seaweed"), None)
 
 
+def test_name_matching():
+    print("\n[名字归一化: 差空格/编号/大小写也要匹配得上]")
+    # 配方树的名字来自 RecipeReader, 知识表的名字来自
+    # IngredientPropertiesComponent.GetOrderComposition —— 两边可能差一个空格、
+    # 一个 " (2)" 后缀、或大小写。**严格字符串相等**就会误判"找不到货源",
+    # 然后在日志里只留一句含糊的"箱子/生料/成品都没匹配上", 极难定位。
+    kb = Knowledge([item_from_json(d) for d in ITEMS])
+    check("带实例编号后缀", kb.crate_for("Seaweed (2)").name, "Crate_Seaweed")
+    check("大小写不同", kb.crate_for("seaweed").name, "Crate_Seaweed")
+    check("前后有空格", kb.crate_for("  Seaweed  ").name, "Crate_Seaweed")
+    check("生料匹配也归一化", kb.raw_for("cucumber").name, "CucumberWhole")
+    check("灶台匹配也归一化", kb.cook_tool_for("SUSHI RICE").station, "Hob")
+    check("确实没有的还是找不到(归一化不等于乱匹配)", kb.crate_for("Bun"), None)
+
+
+def test_blockers():
+    print("\n[执行前校验: 说不出货源就别认领这张单]")
+    # 之前的做法是"照做, 卡在第一步, 重试 3 次放弃, 重新规划同一张单" ——
+    # 150 秒整局就这么烧完(规则 5)。现在出计划时就把硬缺口标出来。
+    kb = Knowledge([item_from_json(d) for d in ITEMS])
+    flow = derive({"name": "Burger", "plate": "Plate",
+                   "tree": {"k": "comp", "i": [{"k": "ing", "n": "Bun"}]}}, kb)
+    check("Bun 没货源 → 不可做", flow.makeable, False)
+    check("缺口指出了是哪个材料", "Bun" in flow.blockers[0], True)
+    check("note 里带上了'表里现有'的诊断(下次一看就知道差在哪)",
+          "表里现有" in flow.ops[0].note, True)
+    check("inventory() 列出了箱子的名字", "Seaweed" in kb.inventory(), True)
+
+    print("\n[能做的单不该被误判]")
+    ok = derive({"name": "Sushi", "plate": "Plate",
+                 "tree": {"k": "comp", "i": [{"k": "ing", "n": "Seaweed"}]}}, kb)
+    check("海苔有货源 → 可做", ok.makeable, True)
+    check("没有缺口", ok.blockers, [])
+
+    print("\n[可选材料的缺口不算硬缺口(不会挡认领)]")
+    opt = derive({"name": "X", "plate": "Plate",
+                  "tree": {"k": "comp",
+                           "i": [{"k": "ing", "n": "Seaweed"}],
+                           "o": [{"k": "ing", "n": "NoSuchIngredient"}]}}, kb)
+    check("可选材料缺货源不影响可做性", opt.makeable, True)
+    check("但它仍然被记在步骤里", any("NoSuchIngredient" in o.target for o in opt.ops), True)
+
+
 def test_derive():
     print("\n[菜的做法推导]")
     # 虾: 只需要切 + 摆盘(对应用户说的第一张订单)
@@ -195,6 +238,8 @@ def test_plan():
 def main() -> int:
     test_classify()
     test_knowledge()
+    test_name_matching()
+    test_blockers()
     test_derive()
     test_plan()
     print()

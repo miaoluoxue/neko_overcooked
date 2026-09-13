@@ -53,8 +53,12 @@ def key_up(name: str):
     _send_key(_key_code(name), up=True)
 
 
-def tap(name: str, duration: float = 0.08):
-    """短按一个键(交互用)。"""
+def tap(name: str, duration: float = 0.05):
+    """短按一个键(交互用)。
+
+    0.05s ≈ 3 帧(60fps) —— 交互是 JustPressed 边沿触发, 跨过一帧边界就够了。
+    原来是 0.08, 而一局里要按几十次, 攒起来是实打实的时间。
+    """
     vk = _key_code(name)
     _send_key(vk)
     time.sleep(duration)
@@ -146,20 +150,57 @@ def _send_key(vk, up=False):
     return ctypes.windll.user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
 
 
-# ---- 双人键位(游戏实测配置) ----
-# 玩家1 (P1): WASD + 左Shift捡放 + 左Ctrl切碎 + 左Alt加速
+# ---- 键位表: 依据反编译, 不是推导 ----
+#
+# 游戏有**两张**键盘绑定表, 用哪张看玩法(PCPadInputProvider.cs:55-121 明文写死):
+#   · GetDefaultSplitKeyboardBindings()   一个键盘拆成两个虚拟手柄 → **双人**
+#   · GetDefaultCombinedKeyboardBindings() 一个键盘当一只手柄     → **单人**
+# 同一个动作在两张表里绑的**不是同一个键** —— 拿错表会有一半的键发错。
+# (doc 09 §1 专门警告过这个坑; 我自己也踩过一次: 单人局却去查了 split 表。)
+#
+# 运行时读过 m_UserKeyboardBindings, 与默认表**逐项一致** → 没有自定义键位,
+# 所以直接照反编译的默认表写就是对的。
+#
+# 单人(combined, PCPadInputProvider.cs:87-121):
+#   A=Space  B=LeftAlt  X=LeftControl  Y=E  LB=LeftShift  RB=RightShift  LeftAnalog=T
+#   移动: LStickX = D/→(正) A/←(负);  LStickY = W/↑(负) S/↓(正)
+#   ⇒ 单人下 **WASD 和方向键是同一个摇杆的两套键, 都管用**(一个键盘 = 一只手柄)
+#
+# 逻辑动作 → 环境按钮(doc 09 §3) → 落到具体键:
+#   捡起/放下 PickupAndDrop   ← One   → A/RB/LB  → 单人: Space / LeftShift / RightShift
+#   工位交互 WorkstationUse   ← Two   → X/扳机    → 单人: LeftControl
+#   冲刺     Dash             ← Three → B/十字键  → 单人: LeftAlt
+#   换人     PlayerSwitch     ← Five  → B/Y/DPadUp→ 单人: E
+#
+# ⚠ 换人键: 表里是 E, 但**实测按 E 没切过来** —— 所以"换人"这条路还没验通,
+#   可疑点见 engine.active_chef_ok(): 只有**活跃的那只**厨师
+#   `GetDirectlyUnderPlayerControl()` 为 true, 非活跃的连按键都进不去
+#   (PlayerControls.cs:452 CanButtonBePressed)。
+
+# 玩家1 (P1): 单人=总控(上面那张表) / 双人=左半键盘
 PLAYER1 = {
     "up": "W", "down": "S", "left": "A", "right": "D",
-    "pickup": "LSHIFT",   # 捡起/放下
-    "chop": "LCTRL",      # 切碎/投掷
-    "dash": "LALT",       # 加速
+    "pickup": "LSHIFT",   # 捡起/放下(split: LB / combined: LB)
+    "chop": "LCTRL",      # 切碎/投掷(split: LTrigger / combined: X)
+    "dash": "LALT",       # 加速(split: DPadRight / combined: B)
+    "switch": "E",        # 换人(split: DPadUp / combined: Y) —— 实测未通, 见上
 }
-# 玩家2 (P2): 方向键 + 右Shift捡放 + 右Ctrl切碎 + 右Alt加速
+#: **单人专用**: 单人用的是 combined 表, 而 `捡起/放下` 在两张表里**不是同一个键** ——
+#:   逻辑动作 PickupAndDrop → AmbiPadButton.One → {A, RB, LB}
+#:     · 单人(combined): A=**Space**  ← 排第一, 单人没有左右侧可分, 落到它
+#:     · 分屏双人(P1):   LB=LeftShift
+#: 其余三个动作(X/Y/B 那几项)两张表恰好一致, 所以只有这一个键要分模式。
+#: **踩过的坑**: 单人局一直按 LeftShift, 表现是"站在箱子旁边、游戏也说可抓,
+#: 但按下去毫无反应"—— 移动照常(那是值, 不受影响), 只有交互全废。
+PLAYER1_COMBINED = dict(PLAYER1, pickup="SPACE")
+
+# 玩家2 (P2): 右半键盘(仅双人时存在; 单人时没有这个玩家)
 PLAYER2 = {
     "up": "UP", "down": "DOWN", "left": "LEFT", "right": "RIGHT",
     "pickup": "RSHIFT",   # 捡起/放下
     "chop": "RCTRL",      # 切碎/投掷
     "dash": "RALT",       # 加速
+    "switch": "I",        # 换人
 }
 
 
@@ -233,6 +274,18 @@ class KeyboardPlayer:
         if not self.key_ok():
             return
         tap(self.b["dash"])
+
+    def switch(self) -> bool:
+        """换人 —— 只在**单人双角色**时才有意义(那时一个输入流驱动两只, 靠它切)。
+
+        双人时游戏里根本没有换人这回事, 键位表里也不该被用到; 但按一下无害
+        (游戏忽略)。键位表里没有 `switch` 就什么都不做。
+        """
+        key = (self.b or {}).get("switch")
+        if not key or not self.key_ok():
+            return False
+        tap(key)
+        return True
 
     def release_all(self):
         for d in list(self._held):

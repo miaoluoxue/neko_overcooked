@@ -180,6 +180,8 @@ def describe(ev: dict) -> str:
         back = "(点名的演不了, 退回大类随机演)" if d.get("fell_back") else ""
         return (f"{seat} 演了一出【{d.get('form')}】"
                 f"（{d.get('mode')} 良心={d.get('conscience')}）{back}")
+    if kind == "level_class":
+        return f"{seat} 关卡分级 {d.get('cls')} —— {d.get('reason')}"
     if kind == "seat_driver":
         return f"{seat} 席位归属: {d.get('frm')} → {d.get('to')}（{d.get('reason', '')}）"
     if kind == "human_observed":

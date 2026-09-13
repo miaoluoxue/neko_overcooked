@@ -151,15 +151,24 @@ namespace Overcooked2AI.Game
             o.Append(",\"layers\":").Append(LayerReport());
 
             // ---- 关卡正在变形? ----
+            // 区分两件事, 别混:
+            //   · transitionsAll —— 这一关**有没有**变形组件(能力)
+            //   · transitions    —— **此刻**是不是正在变形(状态)
+            // 为什么必须分开(实测教训的预判): 潮水是**过一会儿才涨的**, 开局那一瞬间
+            // 标志位全是 false。只看"此刻在不在动", 就会把潮水关/木筏关误判成
+            // "静态厨房", 然后按"没有会动的东西"去规划 —— 而它一局中途会把台面搬走、
+            // 物品回收重生、网格占用失效(02 号文档 §3)。
             var tr = new StringBuilder();
-            int ntr = 0;
+            int ntr = 0;      // 此刻正在变形
+            int ntrAll = 0;   // 有变形组件(不管此刻动没动)
             foreach (var typeName in TransitionTypes)
             {
                 foreach (var c in Comps(typeName))
                 {
                     string flags = ReadAnimatorFlags(c);
+                    ntrAll++;
                     if (string.IsNullOrEmpty(flags))
-                        continue;     // 没有任何变形标志为真 = 这一关此刻没在变形, 不必上报
+                        continue;     // 此刻没在动 —— 不进"正在变形"清单
                     if (ntr > 0) tr.Append(",");
                     tr.Append(PointJson(c, typeName, "\"flags\":\"" + flags + "\""));
                     ntr++;
@@ -172,7 +181,8 @@ namespace Overcooked2AI.Game
              .Append(",\"triggers\":").Append(nt)
              .Append(",\"platforms\":").Append(np)
              .Append(",\"fires\":").Append(nf)
-             .Append(",\"transitions\":").Append(ntr).Append("}");
+             .Append(",\"transitions\":").Append(ntr)
+             .Append(",\"transitionsAll\":").Append(ntrAll).Append("}");
             o.Append("}");
             return o.ToString();
         }

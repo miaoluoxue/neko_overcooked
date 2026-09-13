@@ -136,6 +136,81 @@ def main():
     check("ascii_reach 会把到不了的格子留白",
           " " in split.ascii_reach(0.0, 0.0))
 
+    # ---- 滑面(冰/泥) ----
+    # 坑: 冰上每帧只有 ~1.7% 的输入生效, 其余是动量。所以"走过去"本身就不准 ——
+    # 图上必须认得出来, A* 也该能绕就绕(但不是当障碍)。
+    ice = make_map([
+        "#######",
+        "#.....#",     # j=3 实心绕行路(长)
+        "#.SSS.#",     # j=2 冰面直通(短)
+        "#.....#",
+        "#######",
+    ])
+    check("滑面格能站(不是障碍)", ice.walkable(2, 2))
+    check("is_slippery 认得 S", ice.is_slippery(2, 2))
+    check("普通地面不滑", not ice.is_slippery(1, 2))
+    check("滑面不是危险格(踩上去不会死)", not ice.is_danger(2, 2))
+
+    # 从 (1,2) 到 (5,2): 冰面直通 4 步(代价 4×4=16), 上面实心绕行 6 步(代价 6)
+    # ⇒ 应该选绕行。这条是"冰上代价 > 绕路代价时能绕就绕"的机器证明。
+    path = ice.find_path(1.2, 2.4, 6.0, 2.4)
+    check("冰面能规划出路径", len(path) > 0, f"len={len(path)}")
+    ice_cells = [p for p in path
+                 if ice.is_slippery(*ice.cell_of(p[0], p[1]))]
+    check("有实心绕行路时, 规划结果一步都不踩冰", ice_cells == [],
+          f"踩了 {len(ice_cells)} 格冰: {ice_cells[:3]}")
+
+    # 反过来: 冰是唯一通道时, 照样得走(不能当障碍)
+    only_ice = make_map([
+        "#######",
+        "#.#.#.#",
+        "#.SSS.#",
+        "#.#.#.#",
+        "#######",
+    ])
+    p2 = only_ice.find_path(1.2, 2.4, 6.0, 2.4)
+    check("冰是唯一通道时仍能规划(不是当障碍)", len(p2) > 0, f"len={len(p2)}")
+
+    # ---- 关卡分级 ----
+    # 目标类别 = "静态厨房"(没有会动的东西)。分级决定"能不能期望稳定通关",
+    # 所以它的判据必须是**保守**的: 宁可把一关归到 dynamic, 也别把有传送带的
+    # 关卡说成 static —— 后者会让"没通关"变成说不清的问题。
+    from neko.terrain import LEVEL_STATIC, LEVEL_DYNAMIC, LEVEL_REFUSE
+
+    def cls(counts):
+        return make_map(["..."], counts=counts).level_class()
+
+    check("什么都不动 → static(这就是目标类别)",
+          cls({"free": 10, "blocked": 2}), LEVEL_STATIC)
+    check("普通危险区(水面)不算 dynamic —— 绕得开",
+          cls({"free": 10, "hazard": 3, "void": 2}), LEVEL_STATIC)
+    check("有地面传送带 → dynamic", cls({"travelator": 5}), LEVEL_DYNAMIC)
+    check("有台面传送带 → dynamic", cls({"conveyor": 3}), LEVEL_DYNAMIC)
+    check("有滑面 → dynamic", cls({"slip": 4}), LEVEL_DYNAMIC)
+    check("有移动平台 → dynamic", cls({"platform": 2}), LEVEL_DYNAMIC)
+    check("有低地板(荷叶类) → refuse", cls({"voidLow": 1}), LEVEL_REFUSE)
+    check("refuse 优先于 dynamic(两个都有时更严重)",
+          cls({"voidLow": 1, "travelator": 9}), LEVEL_REFUSE)
+    check("counts 整个缺失也不炸(当成 static 之外的未知 → 按 static 处理)",
+          cls({}), LEVEL_STATIC)
+    check("counts 里是坏值也不炸", cls({"slip": "abc"}), LEVEL_STATIC)
+
+    # dyn 那条: **光看地图格子会漏掉"关卡有没有变形能力"**。
+    # 潮水/木筏是过一会儿才动的, 开局那一瞬间 counts 里干干净净 ——
+    # 但它中途会把台面搬走、物品回收、网格占用失效。所以必须同时看 dyn。
+    def cls_dyn(dyncounts, counts=None):
+        return make_map(["..."], counts=counts or {}).level_class({"counts": dyncounts})
+
+    check("地图干净、但关卡有变形组件(潮水类) → dynamic",
+          cls_dyn({"transitionsAll": 2}), LEVEL_DYNAMIC)
+    check("地图干净、但有移动平台组件 → dynamic",
+          cls_dyn({"platforms": 1}), LEVEL_DYNAMIC)
+    check("地图干净、但有台面传送带组件 → dynamic",
+          cls_dyn({"conveyors": 3}), LEVEL_DYNAMIC)
+    check("dyn 为 None 时不炸(退回只看地图)", make_map(["..."], counts={}).level_class(None),
+          LEVEL_STATIC)
+    check("dyn 结构残缺也不炸", cls_dyn({}), LEVEL_STATIC)
+
     print()
     if _failed:
         print(f"❌ 地形测试失败 {len(_failed)} 项: {_failed}")

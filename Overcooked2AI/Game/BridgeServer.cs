@@ -139,6 +139,14 @@ namespace Overcooked2AI.Game
                 return _collector.RequestJob("padinit", 10000);
             if (line.Contains("\"pads\""))
                 return _collector.RequestJob("pads", 10000);
+            // ⚠ "binds"(导运行时按键绑定)**故意不接** —— 实测它会卡死。
+            //   它要碰 PCPadInputProvider(读 m_UserKeyboardBindings + 调
+            //   GetDefaultCombinedKeyboardBindings), 而 Plugin.cs:94 早就写着
+            //   "触发 PCPadInputProvider 静态构造会导致卡死"; 更糟的是**加载期间**
+            //   反复调它 —— 那会直接把游戏卡在加载界面(已实测)。
+            //   按键绑定不需要运行时问: 反编译 PCPadInputProvider.cs:55-121 里
+            //   两张表(split/combined)是**明文写死的**, 直接读源码即可, 零风险。
+            //   (VirtualGamepads.Bindings() 保留但不再暴露给桥, 只作离线参考。)
             if (line.Contains("\"pad\""))
                 return HandlePad(line);
             if (line.Contains("\"action\""))

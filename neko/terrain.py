@@ -35,14 +35,34 @@ import heapq
 CH_FREE = "."
 CH_PLATFORM = "P"
 CH_TRAVELATOR = "T"
+CH_SLIP = "S"         # 滑面(冰/泥): **能站**, 但在滑 —— 见下面 SLIP_COST
 # 绝对不能踏进去的格子
 CH_BLOCKED = "#"      # 占用物
+CH_CONVEYOR = "C"     # 台面传送带(ConveyorStation): 走不上去, 放上去的东西会被传走
 CH_FIRE = "F"         # 火焰
 CH_HAZARD = "H"       # 水面 / 岩浆 / 边界
 CH_VOID = "V"         # 空洞
 CH_VOID_LOW = "v"     # 地板太低(单向落差 / 正在下沉的平台)
 
 DANGER_CHARS = CH_FIRE + CH_HAZARD + CH_VOID + CH_VOID_LOW
+
+#: 滑面在 A* 里的代价倍数。**不是禁行, 只是不划算** ——
+#: 冰上每帧只有 ~1.7% 的输入生效, 其余是动量, 所以"走过去"这件事本身就不准;
+#: 能绕就绕, 绕不开才走(所以是加代价, 不是标成障碍)。
+SLIP_COST = 4
+
+
+# ---- 关卡分级 ----
+# "能不能期望稳定通关"取决于这一关有没有**会动的东西**。
+# 依据 v1 §"已知限制" + 实际踩坑:
+#   · 传送带/滑面/移动平台 —— 位置和位移随时间变, 算不出来(见 03/08 号文档),
+#     只能闭环硬扛, 于是"稳定"无从谈起
+#   · 荷叶那类会下沉/单向落差的地面 —— **同一格的站立性会反复翻转**,
+#     连"这格能不能站"都没有稳定答案(v1 直接列为 A 级不该自动玩)
+# 所以先把"什么都没有"的那一类挑出来当目标, 其余的按风险标出来。
+LEVEL_STATIC = "static"      # 静态厨房: 目标类别, 应当稳定通关
+LEVEL_DYNAMIC = "dynamic"    # 有会动的机制: 可玩, 但不保证
+LEVEL_REFUSE = "refuse"      # 站立性会翻转的地面: 原理上不该自动玩
 
 
 class TerrainMap:
@@ -98,15 +118,86 @@ class TerrainMap:
         ch = self.at(i, j)
         if ch == CH_FREE:
             return True
+        if ch == CH_SLIP:
+            return True          # 冰能站, 只是走不准 —— 见 SLIP_COST
         if ch == CH_PLATFORM:
             return allow_platform
         if ch == CH_TRAVELATOR:
             return allow_travelator
         return False
 
+    def is_slippery(self, i: int, j: int) -> bool:
+        """这一格滑不滑(冰/泥)。
+
+        滑面上"位移 = 4 × 按住秒数"完全失效(每帧只有 ~1.7% 的输入生效,
+        其余是上一帧的动量), 所以导航必须知道自己在冰上。
+        依据: 03 号文档 :858-863 的 ProgressVelocityWrtFriction。
+        """
+        return self.at(i, j) == CH_SLIP
+
     def is_danger(self, i: int, j: int) -> bool:
         """这一格会不会弄死厨师(水面/岩浆/火/空洞)。"""
         return self.at(i, j) in DANGER_CHARS
+
+    # ---------------------------------------------------------------- 分级
+    def level_class(self, dyn: dict = None) -> str:
+        """这一关属于哪一类 —— 决定"能不能期望稳定通关"。
+
+        返回 LEVEL_STATIC / LEVEL_DYNAMIC / LEVEL_REFUSE(见文件上方说明)。
+
+        两个来源, 缺一不可:
+          · `self.counts`(地图格子计数)—— 看得见"网格里此刻有什么"
+          · `dyn`(bridge.get_dyn())—— 看得见**组件层面**的东西。
+            尤其是 `counts.transitionsAll`: 关卡**有没有变形能力**。
+            只看地图会漏掉它 —— 潮水/木筏是**过一会儿才动**的, 开局那一瞬间
+            counts 里干干净净, 却会在中途把台面搬走、物品回收、网格占用失效。
+        """
+        c = self.counts or {}
+        d = ((dyn or {}).get("counts") or {})
+
+        def n(k, src=None):
+            try:
+                return int((src if src is not None else c).get(k) or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        # 会下沉/单向落差的地面: 同一格能不能站会**反复翻转**, 连地图都给不出稳定答案
+        if n("voidLow") > 0:
+            return LEVEL_REFUSE
+        # 会动/会变的机制
+        if (n("travelator") or n("conveyor") or n("slip") or n("platform")
+                or n("platforms", d) or n("conveyors", d) or n("transitionsAll", d)):
+            return LEVEL_DYNAMIC
+        return LEVEL_STATIC
+
+    def level_reason(self, dyn: dict = None) -> str:
+        """给日志用: 这一关为什么被归到那一类。"""
+        c = self.counts or {}
+        d = ((dyn or {}).get("counts") or {})
+
+        def n(k, src=None):
+            try:
+                return int((src if src is not None else c).get(k) or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        kind = self.level_class(dyn)
+        if kind == LEVEL_REFUSE:
+            return f"低地板格 x{n('voidLow')}(会下沉/单向落差, 站立性会翻转)"
+        if kind == LEVEL_DYNAMIC:
+            bits = []
+            if n("travelator"):
+                bits.append(f"地面传送带 x{n('travelator')}")
+            if n("conveyor") or n("conveyors", d):
+                bits.append(f"台面传送带 x{max(n('conveyor'), n('conveyors', d))}")
+            if n("slip"):
+                bits.append(f"滑面 x{n('slip')}")
+            if n("platform") or n("platforms", d):
+                bits.append(f"移动平台 x{max(n('platform'), n('platforms', d))}")
+            if n("transitionsAll", d):
+                bits.append(f"关卡会变形 x{n('transitionsAll', d)}(潮水/木筏类, 中途台面和物品会变)")
+            return "有会动的机制: " + "、".join(bits)
+        return "静态厨房(没有会动的机制)"
 
     def is_danger_world(self, x: float, z: float) -> bool:
         return self.is_danger(*self.cell_of(x, z))
@@ -201,7 +292,8 @@ class TerrainMap:
                 nb = (cur[0] + dx, cur[1] + dz)
                 if not ok(nb):
                     continue
-                ng = gc + 1
+                # 滑面加代价(不是禁行): 能绕就绕, 绕不开才走
+                ng = gc + (SLIP_COST if self.at(*nb) == CH_SLIP else 1)
                 if nb in best and best[nb] <= ng:
                     continue
                 best[nb] = ng
@@ -288,13 +380,17 @@ class TerrainMap:
                 float(hz.get("x0") or 0), float(hz.get("x1") or 0),
                 float(hz.get("z0") or 0), float(hz.get("z1") or 0)))
         c = self.counts
-        summary = "可走%d 障碍%d 台面传送带%d 危险%d 空洞%d 低地板%d 平台%d 地面传送带%d 火%d" % (
+        summary = "可走%d 障碍%d 台面传送带%d 危险%d 空洞%d 低地板%d 平台%d 地面传送带%d 滑面%d 火%d" % (
             int(c.get("free") or 0), int(c.get("blocked") or 0),
             int(c.get("conveyor") or 0),
             int(c.get("hazard") or 0), int(c.get("void") or 0),
             int(c.get("voidLow") or 0),
             int(c.get("platform") or 0), int(c.get("travelator") or 0),
+            int(c.get("slip") or 0),
             int(c.get("fire") or 0))
+        if int(c.get("slip") or 0) > 0:
+            summary += (" ⚠有滑面(冰/泥)x%d: 那上面每帧只有 ~1.7%% 的输入生效, "
+                        "其余是动量 —— '按 N 秒走 N 格'在冰上完全不准" % int(c.get("slip") or 0))
         if int(c.get("conveyor") or 0) > 0:
             summary += (" ⚠有台面传送带(ConveyorStation): 放上去的物品会被一格一格传走 —— "
                         "切好的料不能存在上面")

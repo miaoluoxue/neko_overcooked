@@ -53,12 +53,13 @@ class Engine:
         self.interact_range = 1.0  # 交互半径(表面距离), 只作参考/日志
         self.step_timeout = 25.0   # 单步超时(秒)
         self.tap_hold = 0.12       # 单次方向键按住时长(保留给固定步长用)
-        self.tap_gap = 0.05        # 方向键间隔
+        self.tap_gap = 0.02        # 方向键间隔(原 0.05 —— 每拍都睡, 攒起来很可观)
         # 精确运动学(反编译标定): PlayerControls.Movement.RunSpeed = 4f (PlayerControls.cs:28),
         # 平地水平速度每帧直接赋值 ⇒ 无加速度/惯性/刹车 ⇒ 位移 = 4 × 按住秒数。
         # 乘 0.9 留余量, 宁可多按几次也别冲过头(冲过头就会在目标两侧来回震)。
         self.speed = 4.0 * 0.9     # 有效推进速度 (u/s)
-        self.max_hold = 0.6        # 单次按键最长按住时长(秒) —— 闭环分多次走, 单次别冲太远
+        self.max_hold = 0.9        # 单次按键最长按住时长(秒)。原 0.6 太保守: 一局才
+                                   # 150 秒, 每拍都睡一下就把时间磨没了(实测被吐槽"太慢")
         # 焦点策略: 游戏不在前台时**等多久**(秒)。等不到就松手放弃这一步。
         # 默认不抢焦点(见 keyboard_input.FOCUS_POLICY), 这样跑脚本时电脑照样能用。
         self.focus_wait = 0.5
@@ -88,6 +89,14 @@ class Engine:
         self._cook_states = None
         #: 订单剩余时间低于这个比例就发 hurry(0.25 = 剩四分之一)
         self.hurry_at = 0.25
+        #: 已经报过的"这张单做不出来(订单, 原因)"指纹 —— 免得每 0.5 秒刷一遍同样的日志
+        self._blocked_logged = set()
+        #: 本局是否已经报过关卡分级(每局只报一次; 换关/换局时复位)
+        self._level_checked = False
+        #: 脚下 Slippiness 超过这个值就算"在滑" —— 位移不再是 4×按住秒数, 见 navigate()
+        self.slip_threshold = 0.3
+        #: 滑面上单次推的时长上限(秒)。冰上长按没用(输入只占 ~1.7%), 反而滑过头
+        self.slip_max_hold = 0.12
         #: 台面传送带的"每格往哪传"表 + 速度, 按场景缓存(来自插件 dyn)
         self._belt_dirs_cache = None
         self._belt_speeds_cache = {}
@@ -183,6 +192,28 @@ class Engine:
         return None
 
     # ---------------- 导航 ----------------
+    def active_chef_ok(self, st: dict) -> bool:
+        """我盯着的这只厨师, 是不是"我这个输入流**当前驱动**的那只"?
+
+        · **双人**(avail == 1): 恒为 True —— 一人一只, 不存在换人。
+        · **单人双角色**(avail > 1): 一个输入流按 ActiveAvatar 驱动其中一只,
+          **重生死一次就会把活跃对象切走**(ClientPlayerRespawnBehaviour.cs:177-190
+          → PlayerSwitchingManager.cs:118-125)。那时脚本推的键驱动的是**另一只**,
+          而它还在盯着这只的坐标 —— 表现就是"导航永远超时、厨师一步不动"。
+          实测 s_moonfestival_1_2 就是这么烧掉一整局的。
+
+        所以这一条必须**每步重读**, 不能在开局绑死。读不到就当 True(不做多余动作)。
+        """
+        c = self.chef(st)
+        if not c:
+            return True
+        try:
+            if int(c.get("avail", 1) or 1) <= 1:
+                return True
+            return bool(c.get("active", True))
+        except Exception:
+            return True
+
     def navigate(self, tx: float, tz: float, arrive: float = None,
                  tight: float = None, tight_timeout: float = 3.0,
                  step_timeout: float = None) -> bool:
@@ -223,6 +254,9 @@ class Engine:
         reach_t = None
         last_pos = None
         stuck = 0
+        _slip_told = False
+        _switch_t0 = 0.0     # 第一次发现"驱动对象被切走"的时刻(换人按时限, 不按次数)
+        _switch_told = False
         try:
             while True:
                 # 席位中途被交出去了(玩家接手 / 下行指令): 立刻停手。
@@ -239,11 +273,42 @@ class Engine:
                 if not st or not st.get("inRound"):
                     self.log("[导航] 对局结束, 中止")
                     return False
+                # 单人双角色: 重生会把手柄的活跃厨师切走 —— 那时我推的键驱动的是
+                # 另一只, 而我还盯着这只的坐标, 于是"永远走不到"。发现就切回来。
+                if not self.active_chef_ok(st):
+                    # 按时限, **不按次数**: 两只时奇数次按键恰好回到原来那只 ——
+                    # 数次数会数错(实测: 3 次上限刚好总是切回错误的那只, 然后无限刷屏)。
+                    now = time.time()
+                    if _switch_t0 == 0.0:
+                        _switch_t0 = now
+                        self.log("[导航] ⚠ 我驱动的那只被切走了(重生?), 按换人键切回来")
+                    if now - _switch_t0 > 3.0:
+                        if not _switch_told:
+                            _switch_told = True
+                            self.log("[导航] ⚠ 切了 3 秒还没切回来(换人键可能不对), "
+                                     "先按原目标继续走")
+                    else:
+                        self.kb.release_all()
+                        self.kb.switch()
+                        time.sleep(0.45)
+                    continue
+
                 x, z, _ = self.pos(st)
                 if x is None:
                     return False
                 dx, dz = tx - x, tz - z
                 dist = (dx * dx + dz * dz) ** 0.5
+
+                # ---- 滑面(冰/泥) ----
+                # 冰上每帧只有 ~1.7% 的输入生效, 其余是上一帧的动量(见 terrain.SLIP_COST)。
+                # ⇒ "位移 = 4 × 按住秒数"失效, 表现是: 按住了几乎不动、松开后还在滑、
+                #    冲过目标来回震 —— 而日志上看起来像"按键没送到"。改成短步 + 刹车。
+                slip = float(self.chef(st).get("slip") or 0.0)
+                sliding = slip >= self.slip_threshold
+                if sliding and not _slip_told:
+                    _slip_told = True
+                    self.log(f"[导航] ⚠ 在滑面上(slip={slip:.2f}): 位移不再是 4×按住秒数, "
+                             f"改用短步+刹车")
 
                 # 死亡重生中: 游戏接管角色, 按键无效。必须松手等, 不能当"卡住"处理 ——
                 # 这是之前"按键探针明明能用、导航却一直卡住"的真凶之一。
@@ -267,6 +332,21 @@ class Engine:
                     last_pos = None
                     stuck = 0
                     continue
+
+                # 进了粗半径但**还在滑** → 先别判到达: 把动量打掉。
+                # 不刹车的话会冲过目标, 下几拍再往回推 —— 就是"在目标两侧来回震"。
+                if sliding and dist <= arr and last_pos is not None:
+                    vx, vz = x - last_pos[0], z - last_pos[1]
+                    if (vx * vx + vz * vz) > 0.0025:          # 还在动(>0.05 格)
+                        if abs(vx) >= abs(vz):
+                            _b = "right" if vx > 0 else "left"
+                        else:
+                            _b = "down" if vz > 0 else "up"
+                        self._press(self._key({"left": "A", "right": "D",
+                                               "up": "W", "down": "S"}[_b]), 0.12)
+                        time.sleep(0.05)
+                        last_pos = (x, z)
+                        continue
 
                 if dist <= arr:
                     if tight is None or dist <= tight:
@@ -309,17 +389,34 @@ class Engine:
                     else:
                         d = "up" if dz > 0 else "down"
 
-                key = self._key({"left": "A", "right": "D", "up": "W", "down": "S"}[d])
-                # 按住时长直接由运动学算, 不再靠猜。
+                # **一次推两轴**(对角线), 而不是"只推主轴、下一拍再推另一轴"。
+                # 后者走的是阶梯 —— 实测就是"走路会左右摆"。KeyboardPlayer.move 本来
+                # 就吃方向向量(能同时按住两个键), 一直没用上。
+                kx = 0.0 if abs(dx) < dead else (1.0 if dx > 0 else -1.0)
+                kz = 0.0 if abs(dz) < dead else (1.0 if dz > 0 else -1.0)
+                if kx == 0.0 and kz == 0.0:
+                    # 两轴都在死区: 只推较大的那个轴(细调)
+                    if abs(dx) >= abs(dz):
+                        kx = 1.0 if dx > 0 else -1.0
+                    else:
+                        kz = 1.0 if dz > 0 else -1.0
+                # 按住时长由运动学算, 不再靠猜。
                 # 依据: PlayerControls.Movement.RunSpeed = 4f (PlayerControls.cs:28), 且平地
                 # 水平速度是**每帧直接赋值**的(ClientPlayerControlsImpl_Default.cs:414,433-435)
                 # —— 没有加速度、没有惯性、没有刹车, 所以 位移 = 4 × 按住秒数, 1 格(1.2u)=0.30s。
-                # 旧代码固定 tap_hold=0.12 猜: 远了走不到、近了冲过头, 于是来回震。
-                # 一次只推**主导轴**, 所以按主导轴上的距离算。
+                # 两轴同时推时**每个轴各走 4 u/s**, 所以按主导轴距离算时长即可(对角更快)。
                 step_dist = max(abs(dx), abs(dz))
                 hold = step_dist / self.speed
-                hold = max(0.05, min(self.max_hold, hold))
-                self._press(key, hold)
+                hold = max(0.04, min(self.max_hold, hold))
+                if sliding:
+                    # 冰上长按没用: 输入只占 ~1.7%, 按久了只是滑得更远。宁可多走几拍。
+                    hold = min(hold, self.slip_max_hold)
+                if not self.key_ok():
+                    self.kb.release_all()
+                    return False
+                self.kb.move(kx, kz)          # 过席位闸门; 同时按住两轴
+                time.sleep(hold)
+                self.kb.release_all()
                 time.sleep(self.tap_gap)
         finally:
             self.kb.release_all()
@@ -405,8 +502,10 @@ class Engine:
         # 这里最多轮询 1.6 秒, 只要中途看到变了就算成功。
         seen = [(held_before or "")]
         t0 = time.time()
-        while time.time() - t0 < 1.6:
-            time.sleep(0.18)
+        # 轮询窗口原 1.6s / 每拍 0.18s —— 一次交互最多白停 1.6 秒, 实时游戏里就是死刑。
+        # 拿/放是边沿触发, 游戏下一帧就反应了, 0.9s 足够; 每拍 0.08 也够密。
+        while time.time() - t0 < 0.9:
+            time.sleep(0.08)
             st2 = self.state()
             if not st2 or not st2.get("inRound"):
                 return False
@@ -467,9 +566,23 @@ class Engine:
         if want is None:
             self.log(f"[键位] 未知的玩家归属 {chef.player!r}")
             return False
-        # 换 kb 时要**重新装上席位闸门** —— 漏了这里, 键位绑定一刷新闸门就没了
-        self.kb = KeyboardPlayer(PLAYER1 if want == "P1" else PLAYER2,
-                                 allow=self._kb_allow)
+        # **单人 vs 双人, 捡起/放下不是同一个键** —— 见 keyboard_input 里的推导:
+        #   单人(combined) 用 A=Space;  分屏双人 P1 用 LB=LeftShift。
+        #   判据用游戏自己给的 avail: >1 = 这个玩家手里有两只 = 单人双角色。
+        chef_now = km.chef(self.cid)
+        single = False
+        try:
+            single = int(getattr(chef_now, "avail", 1) or 1) > 1
+        except Exception:
+            single = False
+        from bridge.keyboard_input import PLAYER1_COMBINED
+        if want == "P1" and single:
+            self.kb = KeyboardPlayer(PLAYER1_COMBINED, allow=self._kb_allow)
+            self.log("[键位] 单人双角色 → 用 combined 表(捡起/放下 = Space)")
+        else:
+            # 换 kb 时要**重新装上席位闸门** —— 漏了这里, 键位绑定一刷新闸门就没了
+            self.kb = KeyboardPlayer(PLAYER1 if want == "P1" else PLAYER2,
+                                     allow=self._kb_allow)
         self.log(f"[键位] 厨师#{self.cid} 属于 {chef.player} → 用 {want} 键位")
         return True
 
@@ -819,8 +932,13 @@ class Engine:
                     df = ((tx - px) ** 2 + (tz - pz) ** 2) ** 0.5
                     pick, use = self.interaction_targets(st2)
                     if (not want) or self._aim_ok(st2, want):
-                        self.log("[接近] (%.1f,%.1f) 距 %.2f 格, 游戏说可作用: 抓取=%r ✓"
-                                 % (px, pz, df, pick))
+                        if not want:
+                            # 没给"应该看到什么"就等于没校验 —— 说出来, 别让它悄悄通过。
+                            # (这条曾经让"站在错的箱子旁边"被判成功, 见调用处的注释)
+                            self.log("[接近] ⚠ 没给目标名字, 无法校验站位; 游戏说抓取=%r" % pick)
+                        else:
+                            self.log("[接近] (%.1f,%.1f) 距 %.2f 格, 游戏说可作用: 抓取=%r ✓"
+                                     % (px, pz, df, pick))
                         return True
                     self.log("[接近] (%.1f,%.1f) 距 %.2f 格, 游戏说: 抓取=%r ✗ 不是它"
                              % (px, pz, df, pick))
@@ -932,6 +1050,14 @@ class Engine:
         # 1) 实时找"正放着目标"的台子(传送带上的食材会移动, 取离自己最近的)
         cx, cz, _ = self.pos(self.state() or {})
         live = self._find_item_station(km, op.target, cx or x, cz or z)
+        # **传送带上的东西不是好货源**: 它在跑, 追它不收敛(实测 s_sushi_4_5 追 14 秒
+        # ×3 次都没到手)。而计划里的箱子/静置台面是**确定的** —— 有它就别去追。
+        # (实测: 计划写的是"来自 DispenserCrate 3 (1)", 引擎却因为实时在带上扫到鱼
+        #  就改去拦截传送带了 —— 明明有现成的箱子可以直接拿。)
+        if live is not None and live.id.startswith("conveyor") and (op.at_x or op.at_z):
+            self.log(f"[步骤] {op.target} 在传送带上({live.id}) —— 但计划里有确定的货源, "
+                     f"不追它, 直接去 ({op.at_name or '已知货源'})")
+            live = None
         if live is not None:
             tx, tz = live.x, live.z
             self.log(f"[步骤] 取 {op.target} @{live.id}({tx:.1f},{tz:.1f}) 实时")
@@ -973,8 +1099,22 @@ class Engine:
             return False
 
         # 先粗到再收紧: 相邻台子太近, 站远了会拿错。
-        # want=目标台面的名字 —— 让游戏自己确认"现在按抓取键能作用到它"。
-        want_name = live.name if live is not None else ""
+        # want = "到了那儿之后, **游戏应该报出什么**" —— 让游戏自己确认站位对不对。
+        #
+        # ⚠ 这里曾经是 `live.name if live is not None else ""`, 而 `_approach` 里是
+        #   `if (not want) or self._aim_ok(...)` —— **空 want 等于任何站位都算到位**。
+        #   于是"站在番茄箱旁边"会被判成功(日志还打个绿 ✓), 然后按 pickup 抓回一个
+        #   番茄、或者什么都没抓到。实测 s_mine_4_3 第一单就栽在这:
+        #     要找 Lettuce 箱 → 走到 know 表给的坐标 → 游戏说"可作用: DispenserCrate Tomato" ✓
+        #   现在改成用**食材名**兜底: 出手的箱子叫 "DispenserCrate Lettuce",
+        #   它包含 "lettuce", 名字对得上; 站错箱子就对不上, 会被否掉换下个站位。
+        # 兜底顺序: 实时台子的名字 → 知识表给的货源名(op.at_name) → 食材名。
+        #
+        # ⚠ 别只给食材名: 实测 s_sushi_1_1 要 `SushiFish`, 而源头的箱子叫
+        #   `DispenserCrate 3 (4)` —— 名字里根本不含 `sushifish`, 于是**明明站在对的
+        #   箱子旁边**也被判成"作用不到目标", 白白失败重试。而知识表给的 at_name
+        #   就是 `DispenserCrate 3 (4)`, 和游戏报的能对上(`_norm` 还会剥掉 " (4)")。
+        want_name = live.name if live is not None else (op.at_name or op.target)
         if not self._approach(km, tx, tz, attempt, want=want_name):
             return False
         if not self.interact("pickup", verify_hold_change=True):
@@ -1611,6 +1751,7 @@ class Engine:
         if self.know is None and not self.ensure_knowledge(st):
             return None
         orders = self.live_orders()
+        blocked = []
         for o in orders:
             name = o["name"]
             # 双人: 一张订单只由一个厨师认领, 否则两人做同一道菜会互相打架
@@ -1621,7 +1762,27 @@ class Engine:
                 if self.board is not None:
                     self.board.release_order(name, self.cid)
                 continue
-            return name, float(o.get("t", 1.0)), derive(detail, self.know)
+            flow = derive(detail, self.know)
+            if not flow.makeable:
+                # **执行前校验**: 这张单缺货源/缺灶台信息, 硬做只会卡在第一步,
+                # 重试三次后放弃、再重新规划同一张 —— 150 秒整局就这么烧完(规则 5)。
+                # 所以直接跳过它, 去做能做的那张。
+                blocked.append((name, flow))
+                if self.board is not None:
+                    self.board.release_order(name, self.cid)
+                continue
+            return name, float(o.get("t", 1.0)), flow
+
+        # 一张都做不出来 —— 把原因**说清楚**(每个订单+原因只说一次, 别刷屏),
+        # 否则日志上只看到"没在干活", 完全不知道是知识表缺条目还是名字对不上。
+        for name, flow in blocked:
+            sig = (name, tuple(flow.blockers))
+            if sig in self._blocked_logged:
+                continue
+            self._blocked_logged.add(sig)
+            self.log(f"[规划] ⚠ 跳过订单 {name}: {'; '.join(flow.blockers)}")
+            if self.know is not None:
+                self.log("[规划]   " + self.know.inventory())
         return None
 
     # ---------------- 事件 ----------------
@@ -1880,6 +2041,7 @@ class Engine:
                 self.know, self.scene, self.assemble_spot = None, "", None
                 self._belt_dirs_cache, self._belt_speeds_cache = None, {}
                 self._terrain, self._terrain_scene = None, ""
+                self._level_checked = False
                 time.sleep(1)
                 continue
 
@@ -1890,6 +2052,31 @@ class Engine:
             if not self.ensure_knowledge(st):
                 time.sleep(2)
                 continue
+
+            # ---- 关卡分级: 这一关值不值得跑 ----
+            # 目标类别是"静态厨房"(没有会动的东西)。不属于就先说清楚,
+            # 让失败有个名字 —— 否则"卡住"会和"这关本来就不该自动玩"混在一起,
+            # 白烧一局还查不出是哪种。
+            if not self._level_checked:
+                self._level_checked = True
+                tm0 = self.terrain()
+                if tm0 is not None and tm0.ok:
+                    from terrain import LEVEL_REFUSE
+                    # dyn 也要看: 光看地图格子会漏掉"关卡有没有变形能力" ——
+                    # 潮水/木筏是过一会儿才动的, 开局那一瞬间 counts 里干干净净。
+                    try:
+                        dyn0 = self.bridge.get_dyn()
+                    except Exception:
+                        dyn0 = None
+                    lc = tm0.level_class(dyn0)
+                    reason = tm0.level_reason(dyn0)
+                    self.log(f"[关卡] 分级 = {lc} —— {reason}")
+                    self._emit("level_class", cls=lc, reason=reason, scene=st.get("scene"))
+                    if lc == LEVEL_REFUSE:
+                        self.log("[关卡] ⛔ 这一关的站立性会反复翻转(荷叶类), "
+                                 "原理上不该自动玩 —— 脚本不接手, 等换关")
+                        time.sleep(2)
+                        continue
 
             planned = self.plan(st)
             if planned is None:

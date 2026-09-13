@@ -118,6 +118,27 @@ class BridgeClient:
         """
         return self._send({"cmd": "padinit"})
 
+    def get_binds(self) -> dict:
+        """⚠ **桥端已停用, 调它只会拿到 unknown cmd。**
+
+        实测它会把游戏**卡在加载界面** —— 它要碰 `PCPadInputProvider` 的静态构造
+        (读 `m_UserKeyboardBindings` + 调 `GetDefaultCombinedKeyboardBindings`),
+        而 `Plugin.cs:94` 早就写着"触发它会导致卡死"; 加载期间反复调更糟。
+
+        按键绑定**不需要运行时问**: 反编译 `PCPadInputProvider.cs:55-121` 里两张表
+        是明文写死的(见 `keyboard_input.py` 顶部那段依据)。这里保留方法只作历史记录。
+        """
+        return self._send({"cmd": "binds"})
+        """游戏**实际在用**的键盘绑定（`PCPadInputProvider.m_UserKeyboardBindings`）。
+
+        返回 `{"user": {"LB": ["LeftShift"], ...}, "default": {...}}` —— 两份并排，
+        一眼看出实际键位和默认表差在哪。主线程执行（会碰 PCPadInputProvider）。
+
+        为什么必须有它：doc 09 §4 写着游戏用的是**用户自定义键位**，默认表可能不对。
+        实测"换人键照默认表推成 E"就是错的 —— 这种错只能靠问游戏来避免，试是试不完的。
+        """
+        return self._send({"cmd": "binds"})
+
     def get_dyn(self) -> dict:
         """关卡里的机关/陷阱: 按钮 / 传送带方向 / 触发机器 / 平台 / 正在烧的东西 / 关卡变形。"""
         return self._send({"cmd": "dyn"})

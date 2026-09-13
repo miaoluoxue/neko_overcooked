@@ -88,6 +88,10 @@ namespace Overcooked2AI.Game
                     json = VirtualGamepads.Report();
                 else if (kind == "padinit")
                     json = VirtualGamepads.InitAndReport();
+                // 游戏**实际在用**的按键绑定(别再照默认表推) —— 也走主线程, 同样会碰
+                // PCPadInputProvider。
+                else if (kind == "binds")
+                    json = VirtualGamepads.Bindings();
                 else
                     json = "{\"error\":\"unknown job\"}";
             }

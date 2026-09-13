@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Reflection;
+using System.Text;
 using HarmonyLib;
 using InControl;
 
@@ -344,6 +345,160 @@ namespace Overcooked2AI.Game
                 Plugin.Log?.LogWarning("[Overcooked2AI] 注入异常: " + ex.Message);
             }
             return Report();
+        }
+
+        // ============================ 按键绑定导出 ============================
+        //
+        // **别再照默认表推按键了**(doc 09 §4 自己写着): 游戏实际用的是
+        //   `PCPadInputProvider.m_UserKeyboardBindings`,
+        // 不是 `GetDefaultSplitKeyboardBindings()` 那张默认表。玩家改过键位(或云存档
+        // 带过来的)两者就不一样 —— 实测"换人键照默认表推成 E"是错的。
+        //
+        // 结构: KeyboardBindings { m_SplitKeyboard: KeyboardBindingSet
+        //                          { m_ButtonBindings: Dictionary<ControlPadInput.Button, List<Key>> } }
+        // 两份并排导: user(实际) + default(默认表), 一眼看出差在哪。
+
+        /// <summary>从一个 KeyboardBindings 里取指定那张子表。
+        ///
+        /// **两张表, 别取错**(doc 09 §1, 我在这儿栽过一次):
+        ///   · `m_CombinedKeyboard` —— 一个键盘当**一只手柄**(**单人**用)
+        ///   · `m_SplitKeyboard`    —— 一个键盘拆成**两个虚拟手柄**(双人用)
+        /// 两张表里同一个逻辑动作绑的是**不同的物理键** —— 拿分屏表的结论去驱动
+        /// 单人模式, 键会发错一半, 而且表现只是"按了没反应", 极难定位。
+        /// </summary>
+        private static object ReadSetOf(object kb, string fieldName)
+        {
+            if (kb == null)
+                return null;
+            try
+            {
+                var f = kb.GetType().GetField(fieldName,
+                    BindingFlags.Public | BindingFlags.Instance);
+                return f != null ? f.GetValue(kb) : null;
+            }
+            catch (Exception) { return null; }
+        }
+
+        private static object ReadUserBindings()
+        {
+            try
+            {
+                var t = HarmonyLib.AccessTools.TypeByName("PCPadInputProvider");
+                if (t == null)
+                    return null;
+                var f = t.GetField("m_UserKeyboardBindings",
+                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
+                return f != null ? f.GetValue(null) : null;
+            }
+            catch (Exception) { return null; }
+        }
+
+        private static object ReadDefaultBindings()
+        {
+            try
+            {
+                var t = HarmonyLib.AccessTools.TypeByName("PCPadInputProvider");
+                if (t == null)
+                    return null;
+                var m = t.GetMethod("GetDefaultCombinedKeyboardBindings",
+                    BindingFlags.Public | BindingFlags.Static);
+                // 用 Combined 那份当"默认"就够了(它内部会建出两张表)
+                var kb = m != null ? m.Invoke(null, null) : null;
+                if (kb == null)
+                {
+                    var m2 = t.GetMethod("GetDefaultSplitKeyboardBindings",
+                        BindingFlags.Public | BindingFlags.Static);
+                    kb = m2 != null ? m2.Invoke(null, null) : null;
+                }
+                return kb;
+            }
+            catch (Exception) { return null; }
+        }
+
+        private static string DumpBindingSet(object set)
+        {
+            if (set == null)
+                return "null";
+            try
+            {
+                var f = set.GetType().GetField("m_ButtonBindings",
+                    BindingFlags.Public | BindingFlags.Instance);
+                var dict = (f != null) ? f.GetValue(set) as System.Collections.IDictionary : null;
+                if (dict == null)
+                    return "null";
+                var sb = new StringBuilder("{");
+                bool first = true;
+                foreach (System.Collections.DictionaryEntry e in dict)
+                {
+                    if (e.Key == null)
+                        continue;
+                    if (!first)
+                        sb.Append(",");
+                    first = false;
+                    sb.Append("\"").Append(_J(e.Key.ToString())).Append("\":[");
+                    bool f2 = true;
+                    var lst = e.Value as System.Collections.IEnumerable;
+                    if (lst != null)
+                    {
+                        foreach (var k in lst)
+                        {
+                            if (!f2)
+                                sb.Append(",");
+                            f2 = false;
+                            sb.Append("\"").Append(_J(k != null ? k.ToString() : "")).Append("\"");
+                        }
+                    }
+                    sb.Append("]");
+                }
+                sb.Append("}");
+                return sb.ToString();
+            }
+            catch (Exception ex)
+            {
+                return "\"err:" + _J(ex.Message) + "\"";
+            }
+        }
+
+        /// <summary>把一个对象身上的**公开实例字段名**列出来。
+        ///
+        /// 为什么需要: 导出返回 null 时有两种完全不同的原因 ——
+        ///   · 对象本身是 null(还没初始化)
+        ///   · 对象有, 但**字段名不对**(我这里写的是反编译看到的 `m_CombinedKeyboard`)
+        /// 光看 null 分不出来, 而这两种的修法相反。把真实字段名打出来一眼就分清。
+        /// </summary>
+        private static string FieldNames(object o)
+        {
+            if (o == null)
+                return "(对象是 null)";
+            try
+            {
+                var sb = new StringBuilder();
+                foreach (var f in o.GetType().GetFields(
+                             BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance))
+                {
+                    if (sb.Length > 0)
+                        sb.Append(",");
+                    sb.Append(f.Name);
+                }
+                return sb.Length > 0 ? sb.ToString() : "(没有实例字段)";
+            }
+            catch (Exception ex) { return "(err:" + _J(ex.Message) + ")"; }
+        }
+
+        public static string Bindings()
+        {
+            var ub = ReadUserBindings();
+            var db = ReadDefaultBindings();
+            return "{\"ubNull\":" + (ub == null ? "true" : "false")
+                 + ",\"ubFields\":\"" + _J(FieldNames(ub)) + "\""
+                 + ",\"dbNull\":" + (db == null ? "true" : "false")
+                 + ",\"user\":{\"combined\":"
+                 + DumpBindingSet(ReadSetOf(ub, "m_CombinedKeyboard"))
+                 + ",\"split\":" + DumpBindingSet(ReadSetOf(ub, "m_SplitKeyboard"))
+                 + "},\"default\":{\"combined\":"
+                 + DumpBindingSet(ReadSetOf(db, "m_CombinedKeyboard"))
+                 + ",\"split\":" + DumpBindingSet(ReadSetOf(db, "m_SplitKeyboard"))
+                 + "}}";
         }
 
         public static void UpdateAll(ulong tick, float dt)

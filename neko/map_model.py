@@ -81,6 +81,15 @@ class Chef:
     z: float
     held: str = ""             # 手上拿着什么
     player: str = ""           # 归属玩家(Player.One/Two) —— 决定该发哪套键盘
+    #: 脚下表面的 Slippiness(0=不滑, 1=全冰)。>0 时"位移 = 4 × 按住秒数"就开始不准;
+    #: 接近 1 时每帧只有 ~1.7% 的输入生效, 其余是动量。见 terrain.SLIP_COST
+    slip: float = 0.0
+    #: 这个玩家手上有几只厨师。**1 = 双人**(固定驱动这一只, 没有换人);
+    #: **>1 = 单人双角色**(一个输入流按 active 驱动其中一只, 换人键可用)
+    avail: int = 1
+    #: 这只厨师是不是"该玩家当前活跃的那只"。**必须每步重读** ——
+    #: 单人双角色下重生死一次就会把活跃对象切走, 脚本却还在对着旧坐标推按键。
+    active: bool = True
 
 
 @dataclass
@@ -162,7 +171,10 @@ class KitchenMap:
             km.chefs.append(Chef(
                 id=int(c.get("id", i)), name=c.get("name", f"P{i}"),
                 x=float(c.get("x", 0)), z=float(c.get("z", 0)),
-                held=c.get("held", ""), player=c.get("player", "")))
+                held=c.get("held", ""), player=c.get("player", ""),
+                slip=float(c.get("slip", 0) or 0),
+                avail=int(c.get("avail", 1) or 1),
+                active=bool(c.get("active", True))))
         for c in layout.get("cooking") or []:
             km.cooking.append(Cooking(
                 name=c.get("name", ""), ing=c.get("ing", ""),

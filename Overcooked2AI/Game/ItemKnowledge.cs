@@ -114,6 +114,13 @@ namespace Overcooked2AI.Game
             sb.Append(string.Format(",\"x\":{0:F2},\"z\":{1:F2}", pos.x, pos.z));
             sb.Append(isPrefab ? ",\"prefab\":true" : ",\"prefab\":false");
             string ing = IngredientName(go);
+            // 兜底: prefab 上 `IngredientPropertiesComponent.GetOrderComposition` 可能读不到
+            // (食材还在箱子里时场景里没有实例, 只能扫 prefab 资源), 于是 ing 是空的 ——
+            // 而 Python 侧四个查表全是"按 ing/next 名字匹配", 空名字等于**这一行白扫**:
+            // 它有灶台要求、有切片数, 却永远匹配不上任何订单, 表现为"可煮[(无)]"。
+            // 拿 GameObject 名字兜底不完美(prefab 名可能带后缀), 但比空着强得多。
+            if (string.IsNullOrEmpty(ing))
+                ing = Safe(go.name);
             sb.Append(",\"ing\":\"").Append(Safe(ing)).Append("\"");
 
             // 可切? 切完是什么?
@@ -124,7 +131,7 @@ namespace Overcooked2AI.Game
                 var wt = SceneScanner.FindType("WorkableItem");
                 if (wt != null)
                 {
-                    var wi = go.GetComponent(wt);
+                    var wi = go.GetComponentInChildren(wt, true);
                     if (wi != null)
                     {
                         var gm = wt.GetMethod("GetNextPrefab");
@@ -155,7 +162,8 @@ namespace Overcooked2AI.Game
                 var ct = SceneScanner.FindType("CookingHandler");
                 if (ct != null)
                 {
-                    var ch = go.GetComponent(ct);
+                    // 同样查子物体(理由同上)
+                    var ch = go.GetComponentInChildren(ct, true);
                     if (ch != null)
                     {
                         var stf = ct.GetField("m_stationType");
@@ -179,6 +187,8 @@ namespace Overcooked2AI.Game
             string spawn = "";
             string spawnIng = "";    // 箱子直接出的东西的食材名(直接可用)
             string spawnNext = "";   // 若出的是需切生料: 切完变成的食材名
+            string spawnStation = "";    // 出货的食材要什么灶(从出货 prefab 的 CookingHandler 读)
+            float spawnCookTime = 0f;    // 出货的食材煮多久熟
             int spawnStages = 0;     // 生料的切片数(WorkableItem.m_stages)
             try
             {
@@ -197,7 +207,7 @@ namespace Overcooked2AI.Game
                                 spawn = prefab.name;
                                 spawnIng = IngredientName(prefab);
                                 var wt2 = SceneScanner.FindType("WorkableItem");
-                                var wi2 = wt2 != null ? prefab.GetComponent(wt2) : null;
+                                var wi2 = wt2 != null ? prefab.GetComponentInChildren(wt2, true) : null;
                                 if (wi2 != null)
                                 {
                                     var sf = wt2.GetField("m_stages");
@@ -211,6 +221,40 @@ namespace Overcooked2AI.Game
                                             spawnNext = IngredientName(np2);
                                     }
                                 }
+                                // 名字兜底: prefab 上 GetOrderComposition 常读不到 → spawnIng 空,
+                                // 于是"箱子出什么"只剩 prefab 名。Python 侧四个查表全按名字匹配,
+                                // 空名字 = 那行白扫(实测 s_summer_1_1: 配方要 DLC11_HotDogBun,
+                                // 箱子的 spawnIng 是空的, 报"没有货源", 看着像名字对不上)。
+                                if (string.IsNullOrEmpty(spawnIng))
+                                    spawnIng = Safe(prefab.name);
+
+                                // **煮的参数直接从出货 prefab 上读** —— 这条比"扫 prefab 资源"
+                                // 可靠得多: ScanPrefabs 用 Resources.FindObjectsOfTypeAll, 只找
+                                // **已加载**的对象, 而关卡内容是从 AssetBundle 来的, 常常扫不到,
+                                // 结果整关 `可煮[(无)]`, 所有要煮的单全被跳过(实测最近 4/5 关都栽在这)。
+                                // 而箱子就在眼前, 它出的 prefab 也就在眼前。
+                                // 依据: CookableIngredient.cs 有 [RequireComponent(typeof(CookingHandler))],
+                                //   所以出货的食材 prefab 身上必有 CookingHandler;
+                                //   CookingHandler.m_stationType / m_cookingtime 都是 public。
+                                var ct2 = SceneScanner.FindType("CookingHandler");
+                                // **必须查子物体**: GetComponent 只看这一层, 而
+                                // CookableIngredient/CookingHandler 常常不在同一层
+                                // (和之前 ConveyorStation 那个坑同一类)。
+                                var ch2 = ct2 != null
+                                    ? prefab.GetComponentInChildren(ct2, true) : null;
+                                if (ch2 != null)
+                                {
+                                    var stf2 = ct2.GetField("m_stationType");
+                                    if (stf2 != null)
+                                    {
+                                        var v2 = stf2.GetValue(ch2);
+                                        if (v2 != null)
+                                            spawnStation = v2.ToString();
+                                    }
+                                    var tf2 = ct2.GetField("m_cookingtime");
+                                    if (tf2 != null)
+                                        spawnCookTime = Convert.ToSingle(tf2.GetValue(ch2));
+                                }
                             }
                         }
                     }
@@ -221,6 +265,8 @@ namespace Overcooked2AI.Game
             sb.Append(",\"spawnIng\":\"").Append(Safe(spawnIng)).Append("\"");
             sb.Append(",\"spawnNext\":\"").Append(Safe(spawnNext)).Append("\"");
             sb.Append(",\"spawnStages\":").Append(spawnStages);
+            sb.Append(",\"spawnStation\":\"").Append(Safe(spawnStation)).Append("\"");
+            sb.Append(string.Format(",\"spawnCookTime\":{0:F1}", spawnCookTime));
 
             sb.Append("}");
             return sb.ToString();

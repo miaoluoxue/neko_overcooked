@@ -34,6 +34,9 @@ namespace Overcooked2AI.Game
     ///   'V'  空洞(空着, 但脚下没地面)
     ///   'v'  地板太低(单向落差 / 正在下沉的平台, 例如会沉的荷叶)
     ///   'C'  台面传送带(ConveyorStation): 走不上去, 而且放上去的东西会被传走
+    ///   'S'  滑面(冰/泥, PlayerPhysicsSurface): **能走**, 但输入权重只剩 ~1.7% —— 在滑。
+    ///        脚本那套"位移 = 4 × 按住秒数"在这里完全失效, 失败方式还极具迷惑性
+    ///        (看起来像"按键没送到"), 所以必须能从图上认出来。
     /// </summary>
     public static class LevelInfo
     {
@@ -57,6 +60,59 @@ namespace Overcooked2AI.Game
 
         /// <summary>RespawnCollider 的类型, 缓存给 FloorChar 用。</summary>
         private static Type _respawnType;
+
+        // ---- 滑面(冰/泥) ----
+        //: Slippiness 到这个值以上就画 'S'。0.25 是"能明显感觉出来"的门槛 ——
+        //: k=Remap(slip,0,1,1,dt) 在 slip=0.25 时约等于 dt+0.25*(1-dt) ≈ 0.26,
+        //: 也就是说还有 74% 的动量在推着走, 闭环导航已经开始不准了。
+        private const float SLIP_CHAR_AT = 0.25f;
+        private static Type _slipSurfaceType;
+        private static System.Reflection.FieldInfo _slipPropsField;
+        private static System.Reflection.FieldInfo _slipValueField;
+        private static bool _slipTried;
+
+        /// <summary>脚下这个碰撞体滑不滑(0 = 不滑)。
+        ///
+        /// PlayerPhysicsSurface.Properties.Slippiness —— 全是 public 字段, 不用反射拿值,
+        /// 只反射拿类型(与 _respawnType 同一套写法)。
+        /// 物理含义见 03 号文档 :858-863: slip=1 时每帧只有 dt(≈1.7%) 是输入, 其余是动量。
+        /// </summary>
+        private static float SlipOf(Collider col)
+        {
+            try
+            {
+                if (col == null)
+                    return 0f;
+                if (!_slipTried)
+                {
+                    _slipTried = true;
+                    _slipSurfaceType = SceneScanner.FindType("PlayerPhysicsSurface");
+                    if (_slipSurfaceType == null)
+                        return 0f;
+                    _slipPropsField = _slipSurfaceType.GetField("Properties",
+                        System.Reflection.BindingFlags.Public |
+                        System.Reflection.BindingFlags.Instance);
+                    if (_slipPropsField == null)
+                        return 0f;
+                    _slipValueField = _slipPropsField.FieldType.GetField("Slippiness",
+                        System.Reflection.BindingFlags.Public |
+                        System.Reflection.BindingFlags.Instance);
+                }
+                if (_slipValueField == null)
+                    return 0f;
+                var ps = col.gameObject.GetComponent(_slipSurfaceType);
+                if (ps == null)
+                    return 0f;
+                var props = _slipPropsField.GetValue(ps);
+                if (props == null)
+                    return 0f;
+                return Convert.ToSingle(_slipValueField.GetValue(props));
+            }
+            catch (Exception)
+            {
+                return 0f;
+            }
+        }
 
         /// <summary>ConveyorStation 的类型, 缓存给 OccupantChar 用。</summary>
         private static Type _conveyorType;
@@ -250,7 +306,7 @@ namespace Overcooked2AI.Game
             // ---- 第二遍: 出字符 ----
             var sb = new StringBuilder(total);
             int nFree = 0, nBlocked = 0, nHaz = 0, nVoid = 0, nVoidLow = 0,
-                nPlat = 0, nTravel = 0, nFire = 0, nConveyor = 0;
+                nPlat = 0, nTravel = 0, nFire = 0, nConveyor = 0, nSlip = 0;
             for (int n = 0; n < total; n++)
             {
                 char ch;
@@ -279,6 +335,7 @@ namespace Overcooked2AI.Game
                     case 'P': nPlat++; break;
                     case 'T': nTravel++; break;
                     case 'C': nConveyor++; break;
+                    case 'S': nSlip++; break;
                     case 'F': nFire++; break;
                     default: nBlocked++; break;
                 }
@@ -342,6 +399,7 @@ namespace Overcooked2AI.Game
              .Append(",\"platform\":").Append(nPlat)
              .Append(",\"travelator\":").Append(nTravel)
              .Append(",\"conveyor\":").Append(nConveyor)
+             .Append(",\"slip\":").Append(nSlip)
              .Append(",\"fire\":").Append(nFire).Append("}");
             o.Append("}");
             return o.ToString();
@@ -488,6 +546,10 @@ namespace Overcooked2AI.Game
                     return 'V';
                 if (hit.point.y < floorY - 0.6f)
                     return 'v';
+                // 滑面(冰/泥): 射线正好落在脚下的碰撞体上, 顺手读它的 Slippiness ——
+                // 逐格精确, 不用去算 PlayerPhysicsSurface 的包围盒。
+                if (SlipOf(hit.collider) >= SLIP_CHAR_AT)
+                    return 'S';
                 return '\0';
             }
             catch (Exception)

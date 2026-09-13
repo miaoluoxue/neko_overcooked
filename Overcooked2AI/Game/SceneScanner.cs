@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Reflection;
 using System.Text;
 using UnityEngine;
 
@@ -141,10 +142,19 @@ namespace Overcooked2AI.Game
                         string inter = ReadInteraction(go);
                         if (chefCount > 0)
                             chefs.Append(",");
+                        // 脚下的表面滑不滑 —— 冰上输入权重只剩 ~1.7%, 运动学全错(见 ReadSlip)
+                        float slip = ReadSlip(go);
+                        // 这只厨师是不是"我这个玩家当前活跃的那只" + 该玩家一共几只
+                        // (单人双角色 >1 时才有换人; 双人恒为 1)。见 ReadSwitchState。
+                        bool swActive;
+                        int swCount;
+                        string swDbg;
+                        ReadSwitchState(go, player, out swActive, out swCount, out swDbg);
                         chefs.Append(string.Format(
-                            "{{\"id\":{0},\"seq\":{0},\"player\":\"{1}\",\"name\":\"{2}\",\"x\":{3:F2},\"y\":{4:F2},\"z\":{5:F2},\"held\":\"{6}\",\"heldc\":\"{7}\",{8}{9}}}",
+                            "{{\"id\":{0},\"seq\":{0},\"player\":\"{1}\",\"name\":\"{2}\",\"x\":{3:F2},\"y\":{4:F2},\"z\":{5:F2},\"held\":\"{6}\",\"heldc\":\"{7}\",\"slip\":{10:F2},\"avail\":{11},\"active\":{12},\"sw\":\"{13}\",{8}{9}}}",
                             chefCount, player, SafeName(go.name), pos.x, pos.y, pos.z,
-                            held, heldC, control, inter));
+                            held, heldC, control, inter, slip, swCount,
+                            swActive ? "true" : "false", SafeName(swDbg)));
                         chefCount++;
                     }
                 }
@@ -278,6 +288,178 @@ namespace Overcooked2AI.Game
                 return v == null ? "" : v.gameObject.name;
             }
             catch (Exception) { return ""; }
+        }
+
+        private static Type _psmType;
+        private static System.Reflection.FieldInfo _avatarSetsField;
+        private static bool _psmTried;
+
+        /// <summary>这个厨师是不是"该玩家当前活跃的那一只", 以及该玩家总共有几只。
+        ///
+        /// 依据 PlayerSwitchingManager.cs:
+        ///   `Dictionary&lt;PlayerInputLookup.Player, AvatarSet&gt; m_avatarSets` (:99)
+        ///   AvatarSet { GameObject[] Avatars; public int ActiveAvatar =&gt; m_activeAvatar (:49); }
+        /// 全是 public/可反射, 而且 Manager : MonoBehaviour → FindObjectOfType 拿实例。
+        ///
+        /// **为什么要读它**(两种玩法都靠这一条区分, 不用分模式硬编码):
+        ///   · `Avatars.Length == 1` → **双人**: 这个输入流固定驱动这一只, 没有换人这回事
+        ///   · `Avatars.Length &gt;  1` → **单人双角色**: 一个输入流按 ActiveAvatar 驱动其中一只,
+        ///     换人键可用; 而**重生死一次就会把活跃对象切走** —— 那时候脚本还在对着
+        ///     旧坐标推按键, 表现为"导航永远超时、厨师一步不动"(实测 s_moonfestival_1_2)。
+        /// 所以 active 必须每步重读, 不能在开局绑死。
+        ///
+        /// 读不到时保守返回 (active=true, count=1) = "就当它没这回事", 不做任何换人。
+        /// </summary>
+        private static void ReadSwitchState(GameObject chefGo, string playerId,
+                                            out bool isActive, out int count,
+                                            out string dbg)
+        {
+            isActive = true;
+            count = 1;
+            dbg = "";
+            try
+            {
+                if (!_psmTried)
+                {
+                    _psmTried = true;
+                    _psmType = FindType("PlayerSwitchingManager");
+                    if (_psmType != null)
+                        _avatarSetsField = _psmType.GetField("m_avatarSets",
+                            BindingFlags.NonPublic | BindingFlags.Instance);
+                }
+                if (_avatarSetsField == null)
+                    return;
+                var mgr = UnityEngine.Object.FindObjectOfType(_psmType);
+                if (mgr == null)
+                    return;
+                var dict = _avatarSetsField.GetValue(mgr) as System.Collections.IDictionary;
+                if (dict == null)
+                    return;
+                var myPcType = FindType("PlayerControls");
+                var myPc = (myPcType != null) ? chefGo.GetComponent(myPcType) : null;
+
+                foreach (System.Collections.DictionaryEntry e in dict)
+                {
+                    if (e.Key == null || e.Value == null)
+                        continue;
+                    if (!string.Equals(e.Key.ToString(), playerId,
+                                       StringComparison.OrdinalIgnoreCase))
+                        continue;
+                    var set = e.Value;
+                    var t = set.GetType();
+                    var af = t.GetField("Avatars", BindingFlags.Public | BindingFlags.Instance);
+                    var avatars = af != null ? af.GetValue(set) as Array : null;
+                    if (avatars != null)
+                        count = avatars.Length;
+                    isActive = false;
+
+                    // **首选 `SelectedAvatar`** —— 它直接返回 `Avatars[ActiveAvatar]` 上的
+                    // PlayerControls (PlayerSwitchingManager.cs:62-69), 拿它和自己的
+                    // PlayerControls 比引用, 比"比 GameObject 实例 ID"可靠得多:
+                    // `Avatars[i]` 未必就是厨师那个 GameObject(可能是容器/根节点),
+                    // 拿它比 ID 会**对两只都报 false** —— 于是引擎以为"被切走了"→按换人键
+                    // →其实切成功了但重读还是 false →永远在两头跳(实测就是这么刷屏的)。
+                    var selProp = t.GetProperty("SelectedAvatar",
+                        BindingFlags.Public | BindingFlags.Instance);
+                    var sel = selProp != null ? selProp.GetValue(set, null) : null;
+                    if (sel != null && myPc != null)
+                    {
+                        isActive = ReferenceEquals(sel, myPc);
+                        // 诊断: 把"游戏说是谁"和"我是谁"并排报出来。
+                        // 有了它, active 判错时一眼能看出是"比错了对象"还是"真的被切走了"。
+                        try
+                        {
+                            var selGo = ((Component)sel).gameObject;
+                            dbg = SafeName(selGo != null ? selGo.name : "?")
+                                + "|我:" + SafeName(chefGo.name);
+                        }
+                        catch (Exception) { }
+                        return;
+                    }
+
+                    // 退路: 拿不到 SelectedAvatar 时才退回比 GameObject 实例 ID
+                    var ap = t.GetProperty("ActiveAvatar",
+                        BindingFlags.Public | BindingFlags.Instance);
+                    int act = ap != null ? Convert.ToInt32(ap.GetValue(set, null)) : -1;
+                    if (avatars != null && act >= 0 && act < avatars.Length)
+                    {
+                        var av = avatars.GetValue(act) as GameObject;
+                        if (av != null)
+                        {
+                            var avPc = (myPcType != null) ? av.GetComponent(myPcType) : null;
+                            if (avPc != null && myPc != null)
+                                isActive = ReferenceEquals(avPc, myPc);
+                            else
+                                isActive = (av.GetInstanceID() == chefGo.GetInstanceID());
+                        }
+                    }
+                    return;
+                }
+            }
+            catch (Exception) { }
+        }
+
+        private static Type _slipSurfaceType;
+        private static System.Reflection.FieldInfo _slipPropsField;
+        private static System.Reflection.FieldInfo _slipField;
+        private static bool _slipTried;
+
+        /// <summary>脚下的表面滑不滑(冰/泥)。0 = 不滑。
+        ///
+        /// 依据(全 public, 不用反射拿值, 只反射拿类型):
+        ///   PlayerControls.PhysicsSurface => m_currentPhysicsSurface   (PlayerControls.cs:410)
+        ///   → PlayerPhysicsSurface.Properties                          (public 字段)
+        ///   → PlayerPhysicsSurfaceProperties.Slippiness                (public float)
+        /// 它在 OnGroundChanged 里随脚下碰撞体更新 (PlayerControls.cs:801-804), 所以是实时的。
+        ///
+        /// **为什么必须读它**(实测踩的坑): 冰面/泥地上
+        ///   `k = Remap(slip, 0, 1, 1, deltaTime)` → `v = 输入*k + 上一帧速度*(1-k)`
+        /// (03 号文档 :858-863)。slip=1 时 k = dt ≈ 1/60 ≈ **1.7%** ——
+        /// 每帧只有 1.7% 是你的输入, 其余 98.3% 是动量(在滑)。
+        /// 于是"位移 = 4 × 按住秒数"**完全失效**, 而且失败方式极具迷惑性:
+        /// 看起来像"按键没送到"或"设备不对", 实际是地在滑。
+        /// </summary>
+        private static float ReadSlip(GameObject chefGo)
+        {
+            try
+            {
+                if (!_slipTried)
+                {
+                    _slipTried = true;
+                    var pcType = FindType("PlayerControls");
+                    if (pcType == null)
+                        return 0f;
+                    var prop = pcType.GetProperty("PhysicsSurface",
+                        BindingFlags.Public | BindingFlags.Instance);
+                    if (prop == null)
+                        return 0f;
+                    _slipSurfaceType = prop.PropertyType;
+                    _slipPropsField = _slipSurfaceType.GetField("Properties",
+                        BindingFlags.Public | BindingFlags.Instance);
+                    if (_slipPropsField == null)
+                        return 0f;
+                    _slipField = _slipPropsField.FieldType.GetField("Slippiness",
+                        BindingFlags.Public | BindingFlags.Instance);
+                    if (_slipField == null)
+                        return 0f;
+                }
+                if (_slipField == null)
+                    return 0f;
+                var pc = chefGo.GetComponent(FindType("PlayerControls"));
+                if (pc == null)
+                    return 0f;
+                var pcProp = pc.GetType().GetProperty("PhysicsSurface",
+                    BindingFlags.Public | BindingFlags.Instance);
+                var surf = pcProp != null ? pcProp.GetValue(pc, null) : null;
+                if (surf == null)
+                    return 0f;
+                var props = _slipPropsField.GetValue(surf);
+                if (props == null)
+                    return 0f;
+                return Convert.ToSingle(_slipField.GetValue(props));
+            }
+            catch (Exception) { }
+            return 0f;
         }
 
         /// <summary>读厨师归属的玩家(PlayerIDProvider.GetID() → Player.One/Two/…)。

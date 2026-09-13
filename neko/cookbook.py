@@ -20,7 +20,24 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
+
+
+def _norm(s: str) -> str:
+    """比名字用的归一化: 去空白、剥掉实例编号后缀、只留字母数字、小写。
+
+    **为什么需要它**(实测踩的坑): 配方树里的名字来自 `RecipeReader`, 知识表里的
+    名字来自 `IngredientPropertiesComponent.GetOrderComposition` —— 两边可能差一个
+    空格、一个 " (2)" 后缀、或大小写。而原来的匹配是**严格字符串相等**, 差一点就判
+    "找不到货源", 然后在日志里只留一句含糊的"箱子/生料/成品都没匹配上", 极难定位。
+
+    与 `engine.Engine._norm` 同一套规则(那边比的是手持物), 别各写一份不一样的。
+    """
+    t = (s or "").strip()
+    t = re.sub(r"\s*\(\d+\)\s*$", "", t)      # 去掉结尾的 " (2)"
+    t = re.sub(r"\s+\d+\s*$", "", t)          # 去掉结尾的 " 5"
+    return "".join(ch for ch in t.lower() if ch.isalnum())
 
 
 # ---------------------------------------------------------------- 食材知识
@@ -41,6 +58,12 @@ class Item:
     spawnNext: str = ""    # 箱子出的生料切完后是什么
     spawnStages: int = 0   # 生料的切片数
     prefab: bool = False   # true = 来自 prefab 资源(没位置, 只用于查加工参数)
+    #: **箱子出的东西**要什么灶 / 煮多久 —— 这两个是从"出货 prefab"上现读的。
+    #: 比 `station` 可靠: `station` 依赖 `ScanPrefabs` 扫到 prefab 资源, 而它用的是
+    #: `Resources.FindObjectsOfTypeAll`(只找**已加载**对象), 关卡内容从 AssetBundle 来,
+    #: 常常扫不到 → 整关 `可煮[(无)]` → 所有要煮的单全被 blockers 跳过。
+    spawnStation: str = ""
+    spawnCookTime: float = 0.0
 
     @property
     def cookable(self) -> bool:
@@ -57,6 +80,8 @@ def item_from_json(d: dict) -> Item:
         x=float(d.get("x", 0)), z=float(d.get("z", 0)),
         next=d.get("next", ""), stages=int(d.get("stages", 0)),
         station=d.get("station", ""), cookTime=float(d.get("cookTime", 0)),
+        spawnStation=d.get("spawnStation", ""),
+        spawnCookTime=float(d.get("spawnCookTime", 0) or 0),
         spawn=d.get("spawn", ""), spawnIng=d.get("spawnIng", ""),
         spawnNext=d.get("spawnNext", ""), spawnStages=int(d.get("spawnStages", 0) or 0),
         prefab=bool(d.get("prefab", False)),
@@ -98,35 +123,82 @@ class Knowledge:
         Ingredient、生鱼却是 Pre-Ingredient, 靠 tag 会漏。看 next 字段才可靠。
         也只看场景实例(prefab 没有位置, 导航不过去)。
         """
+        w = _norm(ing)
         for i in self.items:
-            if not i.prefab and i.next == ing:
+            if not i.prefab and i.next and _norm(i.next) == w:
                 return i
         return None
 
     def ready_for(self, ing: str) -> Item | None:
         """场上有没有现成可拿的 ing(不需要再加工的成品)。"""
+        w = _norm(ing)
         for i in self.items:
-            if not i.prefab and i.ing == ing and not i.next:
+            if not i.prefab and not i.next and _norm(i.ing) == w:
                 return i
         return None
 
     def crate_for(self, ing: str) -> Item | None:
-        """哪个箱子能提供 ing(直接出成品, 或出需要切的生料)。"""
+        """哪个箱子能提供 ing(直接出成品, 或出需要切的生料)。
+
+        三个字段都查, **顺序有讲究**:
+          1. `spawnIng`  —— 箱子直接出的**食材名**(最权威, 直接可用)
+          2. `spawnNext` —— 出的是需切生料时, **切完**变成的食材名
+          3. `spawn`     —— 出的 prefab 名。**兜底**, 因为 C# 侧 `spawnIng` 有时读不到
+             (实测 s_summer_1_1: 配方要 `DLC11_HotDogBun`, 箱子的 spawnIng 是空的,
+              名字只落在 spawn 上的 `DLC11_HotdogBun` —— 只查前两个字段就永远找不到,
+              日志上表现为"没有 DLC11_HotDogBun 的货源", 看着像名字对不上, 其实是字段没填)。
+        """
+        w = _norm(ing)
         for c in self.crates:
-            if c.spawnIng == ing:
+            if _norm(c.spawnIng) == w:
                 return c
         for c in self.crates:
-            if c.spawnNext == ing:
+            if _norm(c.spawnNext) == w:
+                return c
+        for c in self.crates:
+            if _norm(c.spawn) == w:
                 return c
         return None
 
     def cook_tool_for(self, ing: str) -> Item | None:
         """煮 ing 要用什么。可能是食材自带灶台要求(直接放灶台上),
         也可能是"得装进能煮的容器"(例如米饭要放进锅 utensil_pot_01)。"""
+        w = _norm(ing)
         for i in self.items:
-            if i.ing == ing and i.cookable:
+            if i.cookable and _norm(i.ing) == w:
                 return i
+        # 兜底: **问那个出货的箱子**。箱子上的参数是插件从"出货 prefab"现读的,
+        # 不依赖 ScanPrefabs 能不能扫到资源 —— 实测整关 `可煮[(无)]` 时这条路还常在。
+        for c in self.crates:
+            if c.spawnStation and (_norm(c.spawnIng) == w or _norm(c.spawnNext) == w):
+                return c
         return None
+
+    def inventory(self) -> str:
+        """一行诊断: 表里**到底有什么**。
+
+        "找不到货源"这句话本身没法定位问题 —— 是表里没有? 还是名字对不上?
+        把清单打出来, 一眼就能分辨。名字对不上时, 这里会直接看到差在哪。
+        """
+        def _names(vals):
+            seen = []
+            for v in vals:
+                v = (v or "").strip()
+                if v and v not in seen:
+                    seen.append(v)
+            return "/".join(seen[:8]) or "(无)"
+        crates = _names(c.spawnIng or c.spawnNext or c.spawn for c in self.crates)
+        raws = _names(i.ing or i.name for i in self.items if i.next)
+        ready = _names(i.ing for i in self.items if i.ing and not i.next and not i.prefab)
+        # 用 `i.ing or i.name` 兜底: prefab 的 ing 可能读不到(名字来自
+        # IngredientPropertiesComponent.GetOrderComposition), 只按 ing 显示会
+        # 把"有行但 ing 空"误报成"一个都没有", 那就白查了。
+        cook = _names((i.ing or i.name) for i in self.items if i.cookable)
+        # 箱子上带的煮参数也算(那条路常常还在, 见 cook_tool_for)
+        cookz = _names(c.spawnIng or c.spawnNext for c in self.crates if c.spawnStation)
+        if cookz != "(无)":
+            cook = (cook + "/" + cookz) if cook != "(无)" else cookz
+        return f"表里现有: 箱子[{crates}] 生料[{raws}] 成品[{ready}] 可煮[{cook}]"
 
     def cook_container(self) -> Item | None:
         """能煮的容器(锅/平底锅)。米饭这类食材自己没有 CookingHandler, 只能靠容器。"""
@@ -237,6 +309,14 @@ class DishFlow:
     name: str
     plate: str = ""        # 订单要求的容器(OrderDefinitionNode.m_platingStep)
     ops: list = field(default_factory=list)
+    #: 硬缺口: 非可选步骤里"做不了"的原因(没货源 / 不知道要什么灶)。
+    #: **有缺口就别认领这张单** —— 硬做只会卡在第一步, 把 150 秒整局耗光(规则 5)。
+    #: (这个"执行前先校验"的思路借自尖塔插件: 先校验合法性, 再进行下一步。)
+    blockers: list = field(default_factory=list)
+
+    @property
+    def makeable(self) -> bool:
+        return not self.blockers
 
     def __str__(self) -> str:
         head = f"【{self.name}】" + (f" 容器={self.plate}" if self.plate else " 容器=无")
@@ -296,17 +376,27 @@ def derive(detail: dict, kb: Knowledge) -> DishFlow:
                           optional=optional,
                           at_name=crate.name, at_x=crate.x, at_z=crate.z))
         else:
-            ops.append(Op("fetch", name, "⚠ 找不到货源(箱子/生料/成品都没匹配上)",
+            ops.append(Op("fetch", name,
+                          "⚠ 找不到货源(箱子/生料/成品都没匹配上) —— " + kb.inventory(),
                           optional=optional))
+            if not optional:
+                flow.blockers.append(f"没有 {name} 的货源")
 
         if cooked:
             tool = kb.cook_tool_for(name)
             if tool is not None:
-                note = f"用 {tool.station}, {tool.cookTime:.0f}s 熟 / 超 {2 * tool.cookTime:.0f}s 就焦"
-                wait = tool.cookTime
+                # cook_tool_for 可能返回**箱子**(那条兜底路由), 它的灶台参数在
+                # spawnStation/spawnCookTime 上 —— 不接这里会写成"用 , 0s 熟"。
+                sem = tool.station or tool.spawnStation
+                ct = tool.cookTime or tool.spawnCookTime
+                note = f"用 {sem}, {ct:.0f}s 熟 / 超 {2 * ct:.0f}s 就焦"
+                wait = ct
             else:
-                note = "⚠ 找不到它的灶台要求"
+                note = ("⚠ 找不到它的灶台要求 —— 知识表里可煮的有: "
+                        + "/".join(i.ing for i in kb.items if i.cookable)[:120])
                 wait = 0.0
+                if not optional:
+                    flow.blockers.append(f"不知道 {name} 要用什么灶")
             ops.append(Op("cook", name, note, wait=wait, optional=optional))
         if mixed:
             ops.append(Op("mix", name, "需要搅拌", optional=optional))
