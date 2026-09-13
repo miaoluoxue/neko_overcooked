@@ -1,5 +1,8 @@
 # 构建产物与缓存
-build/
+# build/ **不忽略**(先生要求入库): 里面就一份编译好的 Overcooked2AI.dll,
+# 直接拿来扔进 BepInEx\plugins 就能用, 省掉一次编译环境搭建。
+# 代价: 每次重新编译都会让工作区变脏、仓库每次多存一份约 105KB 的二进制
+# (Git 存整份新 blob, delta 对这种事帮不上忙) —— 这是有意的取舍。
 __pycache__/
 *.pyc
 .pytest_cache/
