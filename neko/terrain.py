@@ -142,7 +142,8 @@ class TerrainMap:
     # ---------------------------------------------------------------- 寻路
     def find_path(self, sx: float, sz: float, tx: float, tz: float,
                   allow_platform: bool = True, allow_travelator: bool = True,
-                  max_nodes: int = 8000, use_reach: bool = True) -> list:
+                  max_nodes: int = 8000, use_reach: bool = True,
+                  diagonal: bool = True, smooth: bool = True) -> list:
         """在**安全格**上跑 A*, 返回途经点世界坐标列表(不含起点)。
 
         目标本身通常是台子(障碍格), 所以终点取它周围最近的可走格。
@@ -189,11 +190,14 @@ class TerrainMap:
             return [self.world_of(*start)]
 
         def h(c):
-            return min(abs(c[0] - g[0]) + abs(c[1] - g[1]) for g in goals)
+            # 8 邻接用 octile 启发: max + (sqrt2-1)*min, 比 Manhattan 更准。
+            return min(max(abs(c[0] - g[0]), abs(c[1] - g[1]))
+                       + 0.41421356 * min(abs(c[0] - g[0]), abs(c[1] - g[1]))
+                       for g in goals)
 
         openq = [(h(start), 0, start)]
         came = {start: None}
-        best = {start: 0}
+        best = {start: 0.0}
         found = None
         while openq:
             _, gc, cur = heapq.heappop(openq)
@@ -202,11 +206,19 @@ class TerrainMap:
                 break
             if len(best) > max_nodes:
                 break
-            for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            dirs = ((1, 0), (-1, 0), (0, 1), (0, -1))
+            if diagonal:
+                dirs += ((1, 1), (1, -1), (-1, 1), (-1, -1))
+            for dx, dz in dirs:
                 nb = (cur[0] + dx, cur[1] + dz)
                 if not ok(nb):
                     continue
-                ng = gc + 1
+                # 对角走法不允许"切角": 两个正交邻格必须都能走, 否则会从两个障碍的夹缝里
+                # 斜着穿过去(视觉上就是蹭墙/卡边)。
+                if diagonal and dx != 0 and dz != 0:
+                    if not ok((cur[0] + dx, cur[1])) or not ok((cur[0], cur[1] + dz)):
+                        continue
+                ng = gc + (1.41421356 if (dx != 0 and dz != 0) else 1.0)
                 if nb in best and best[nb] <= ng:
                     continue
                 best[nb] = ng
@@ -221,7 +233,53 @@ class TerrainMap:
             cells.append(cur)
             cur = came[cur]
         cells.reverse()
+        if smooth:
+            cells = self._smooth(cells, ok)
         return [self.world_of(i, j) for i, j in cells[1:]]
+
+    def _smooth(self, cells: list, ok) -> list:
+        """拉直路径(字符串拉直/视线裁剪): 能直线看到的下一个点就删掉中间点。
+
+        这是"360° 自由寻路"的关键: A* 只是给一串网格格心, 而模拟量驱动能走任意角度,
+        所以只要两个格心之间整段都安全, 就直接走直线, 不再一格一格折。
+        """
+        if len(cells) <= 2:
+            return cells
+        out = [cells[0]]
+        anchor = 0
+        while anchor < len(cells) - 1:
+            last = anchor
+            for j in range(len(cells) - 1, anchor, -1):
+                if self._line_clear(cells[anchor], cells[j], ok):
+                    last = j
+                    break
+            out.append(cells[last])
+            anchor = last
+        return out
+
+    @staticmethod
+    def _line_clear(a, b, ok) -> bool:
+        """从格 a 到格 b 的直线经过的每一格都 ok(Bresenham 采样, 防穿墙/穿危险区)。"""
+        x0, z0 = a
+        x1, z1 = b
+        dx = abs(x1 - x0)
+        dz = abs(z1 - z0)
+        sx = 1 if x0 < x1 else (-1 if x0 > x1 else 0)
+        sz = 1 if z0 < z1 else (-1 if z0 > z1 else 0)
+        err = dx - dz
+        x, z = x0, z0
+        while True:
+            if (x, z) != a and not ok((x, z)):
+                return False
+            if x == x1 and z == z1:
+                return True
+            e2 = 2 * err
+            if e2 > -dz:
+                err -= dz
+                x += sx
+            if e2 < dx:
+                err += dx
+                z += sz
 
     # ---------------------------------------------------------------- 连通性
     def reachable_from(self, x: float, z: float,
