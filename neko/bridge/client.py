@@ -1,4 +1,4 @@
-"""桥 client: 连游戏内 C# TCP server, 拉状态/发动作。行协议: 每行一个 JSON。"""
+﻿"""桥 client: 连游戏内 C# TCP server, 拉状态/发动作。行协议: 每行一个 JSON。"""
 
 from __future__ import annotations
 
@@ -104,6 +104,33 @@ class BridgeClient:
     def get_dyn(self) -> dict:
         """关卡里的机关/陷阱: 按钮 / 传送带方向 / 触发机器 / 平台 / 正在烧的东西 / 关卡变形。"""
         return self._send({"cmd": "dyn"})
+
+    def get_grid(self) -> dict:
+        """**游戏自己的网格**: 格子↔世界坐标换算参数(m_origin/m_size/transform) + 占位表。
+        依据 GridManager.cs / QuadGridManager.cs —— 权威, 不是我们采样推断的。"""
+        return self._send({"cmd": "grid"})
+
+    def direct(self, action: str, player: int = 0) -> dict:
+        """**直接调游戏自己的交互入口**(绕开输入层/消息链)。
+        action: pickup/place/take/interact/trigger/throw"""
+        return self._send({"cmd": "direct", "player": player, "action": action})
+
+    def get_cells(self) -> dict:
+        """对齐游戏格心的完整格子图(kind/conv/occ 三张 RLE 位图 + 交叉验证)。"""
+        return self._send({"cmd": "cells"})
+
+    def pad(self, action: str, **kw) -> dict:
+        """虚拟手柄。
+
+        action:
+          install / uninstall —— 换掉/还原某个厨师的输入(插件侧走主线程)
+          drive              —— 喂值: player/x/y/pickup/use/dash/curse(**不走主线程, 延迟最低**)
+          release            —— 松手(轴归零+全键弹起)
+          status             —— 当前虚拟手柄状态 + 应用遥测(focused/runInBackground/timeScale/menu)
+        """
+        payload = {"cmd": "pad", "action": action}
+        payload.update(kw)
+        return self._send(payload)
 
     def send_action(self, chef: int, kind: str, target: str = "", duration: float = 0.0) -> dict:
         return self._send({"cmd": "action", "chef": chef, "kind": kind,

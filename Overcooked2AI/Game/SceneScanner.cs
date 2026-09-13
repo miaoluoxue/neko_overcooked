@@ -134,6 +134,13 @@ namespace Overcooked2AI.Game
                         // Player.Two → 键盘右半(SplitPadGuest) → 方向键
                         // 注意: 这里的 chefCount 只是"枚举序号", 与 Player 编号**没有必然关系**。
                         string player = ReadPlayerId(go);
+                        // **游戏认不认这个厨师是"本地控制"** —— 决定性诊断。
+                        // ClientPlayerControlsImpl_Default.cs:204 起:
+                        //     bool flag = m_playerIDProvider.IsLocallyControlled();
+                        //     if (flag) { UpdateNearbyObjects(); Update_Carry(); ... }   // ← 拾取只在这里
+                        //     Update_Movement(...)                                        // ← 移动不看 flag
+                        // 所以"能走不能按"必须先看这个值: 若为 false, 拾取更新整段根本不执行。
+                        string local = ReadLocallyControlled(go);
                         // **现在能不能指挥得动这个厨师** —— 见 ReadControl。
                         // 只判 respawning 不够: 过场压制、喷灭火器(scale=0) 也一样按不动。
                         string control = ReadControl(go);
@@ -142,9 +149,9 @@ namespace Overcooked2AI.Game
                         if (chefCount > 0)
                             chefs.Append(",");
                         chefs.Append(string.Format(
-                            "{{\"id\":{0},\"seq\":{0},\"player\":\"{1}\",\"name\":\"{2}\",\"x\":{3:F2},\"y\":{4:F2},\"z\":{5:F2},\"held\":\"{6}\",\"heldc\":\"{7}\",{8}{9}}}",
+                            "{{\"id\":{0},\"seq\":{0},\"player\":\"{1}\",\"name\":\"{2}\",\"x\":{3:F2},\"y\":{4:F2},\"z\":{5:F2},\"held\":\"{6}\",\"heldc\":\"{7}\",{8}{9}{10}}}",
                             chefCount, player, SafeName(go.name), pos.x, pos.y, pos.z,
-                            held, heldC, control, inter));
+                            held, heldC, control, inter, local));
                         chefCount++;
                     }
                 }
@@ -204,13 +211,30 @@ namespace Overcooked2AI.Game
                 bool enabled = beh == null || beh.enabled;
                 bool can = enabled && !respawning && !suppressed && scale > 0.01f;
 
+                // 游戏自己说"现在按键有没有用"。PlayerControls.CanButtonBePressed()
+                // (PlayerControls.cs:453-468) 同时检查: 窗口在前台 + 角色直接受控 +
+                // 没有打开的对话框/根菜单。**"停了暂停菜单"时按键全部无效但位置也不变,
+                // 表现和"卡住"一模一样** —— 有这个字段就能一眼区分, 不用再猜。
+                bool canpress = false;
+                try
+                {
+                    var m = pcType.GetMethod("CanButtonBePressed");
+                    if (m != null)
+                    {
+                        var v = m.Invoke(comp, null);
+                        canpress = v is bool && (bool)v;
+                    }
+                }
+                catch (Exception) { }
+
                 return string.Format(
                     System.Globalization.CultureInfo.InvariantCulture,
-                    "\"respawning\":{0},\"suppressed\":{1},\"scale\":{2:F2},\"canmove\":{3}",
+                    "\"respawning\":{0},\"suppressed\":{1},\"scale\":{2:F2},\"canmove\":{3},\"canpress\":{4}",
                     respawning ? "true" : "false",
                     suppressed ? "true" : "false",
                     scale,
-                    can ? "true" : "false");
+                    can ? "true" : "false",
+                    canpress ? "true" : "false");
             }
             catch (Exception) { }
             return "";
@@ -251,8 +275,14 @@ namespace Overcooked2AI.Game
                 var ioType = io.GetType();
                 string pick = GoFieldName(ioType, io, "m_TheOriginalHandlePickup");
                 string use = CompFieldName(ioType, io, "m_interactable");
-                return string.Format(",\"pick\":\"{0}\",\"use\":\"{1}\"",
-                                     SafeName(pick), SafeName(use));
+                // ⚠ 关键: Update_Carry 用的是 **m_iHandlePickup**(接口实例), 不是 m_TheOriginalHandlePickup(物体)。
+                //   两者是分开赋值的: 前者 = GetControllingPickupHandler_Client(后者)。
+                //   如果后者有名字而前者是 null, 那么"游戏说能抓取"是真的, 但**客户端根本不会发取件消息**
+                //   —— 正好是"能走不能按"的形状。这个字段是这条链上唯一还没量过的一环。
+                string pickh = CompFieldName(ioType, io, "m_iHandlePickup");
+                string useh = CompFieldName(ioType, io, "m_iHandlePlacement");
+                return string.Format(",\"pick\":\"{0}\",\"use\":\"{1}\",\"pickh\":\"{2}\",\"placeh\":\"{3}\"",
+                                     SafeName(pick), SafeName(use), SafeName(pickh), SafeName(useh));
             }
             catch (Exception) { }
             return "";
@@ -282,6 +312,28 @@ namespace Overcooked2AI.Game
 
         /// <summary>读厨师归属的玩家(PlayerIDProvider.GetID() → Player.One/Two/…)。
         /// 这才是"该给它发哪套键"的依据; 枚举序号 id 不可靠。</summary>
+        /// <summary>游戏认不认这个厨师"本地控制"(PlayerIDProvider.IsLocallyControlled)。
+        /// 拾取/工位交互那段更新只在它为真时执行, 而移动不看它 —— 见上面 ReadPlayerId 的注释。</summary>
+        private static string ReadLocallyControlled(GameObject chefGo)
+        {
+            try
+            {
+                var pt = FindType("PlayerIDProvider");
+                if (pt == null)
+                    return "";
+                var prov = chefGo.GetComponent(pt);
+                if (prov == null)
+                    return "";
+                var m = pt.GetMethod("IsLocallyControlled", Type.EmptyTypes);
+                if (m == null)
+                    return "";
+                var v = m.Invoke(prov, null);
+                return ",\"local\":" + (v is bool && (bool)v ? "true" : "false");
+            }
+            catch (Exception) { }
+            return "";
+        }
+
         private static string ReadPlayerId(GameObject chefGo)
         {
             try
@@ -371,11 +423,21 @@ namespace Overcooked2AI.Game
                     catch (Exception) { }
 
                     var pos = go.transform.position;
+                    string tag = "";
+                    try { tag = go.tag; }
+                    catch (Exception) { }
+                    // 锅里装的是什么。**关键**: 锅身上的 CookingHandler 只知道"熟没熟",
+                    // 不知道"煮的是什么"(ItemKnowledge.IngredientName(锅) 永远是空串),
+                    // 所以必须另外读容器的 m_contents, 否则无法判断"这口锅是不是我的/是空的"。
+                    string inside = "";
+                    try { inside = ItemKnowledge.ContentsNames(go); }
+                    catch (Exception) { }
                     if (n > 0)
                         sb.Append(",");
                     sb.Append(string.Format(
-                        "{{\"name\":\"{0}\",\"ing\":\"{1}\",\"prog\":{2:F1},\"need\":{3:F1},\"state\":\"{4}\",\"burning\":{5},\"station\":\"{6}\",\"x\":{7:F2},\"z\":{8:F2}}}",
+                        "{{\"name\":\"{0}\",\"ing\":\"{1}\",\"in\":\"{2}\",\"tag\":\"{3}\",\"prog\":{4:F1},\"need\":{5:F1},\"state\":\"{6}\",\"burning\":{7},\"station\":\"{8}\",\"x\":{9:F2},\"z\":{10:F2}}}",
                         SafeName(go.name), SafeName(ItemKnowledge.IngredientName(go)),
+                        SafeName(inside), SafeName(tag),
                         prog, need, SafeName(state), burning ? "true" : "false",
                         SafeName(station), pos.x, pos.z));
                     n++;
@@ -451,6 +513,8 @@ namespace Overcooked2AI.Game
         private static string ReadContent(GameObject go)
         {
             var items = new StringBuilder();
+            var tags = new StringBuilder();
+            var hases = new StringBuilder();
             int cnt = 0;
 
             var at = FindType("AttachStation");
@@ -463,7 +527,7 @@ namespace Overcooked2AI.Game
                     {
                         var f = at.GetField("m_attachPoint");
                         var tr = f != null ? f.GetValue(comp) as Transform : null;
-                        cnt += CollectChildren(items, tr, cnt);
+                        cnt += CollectChildren(items, tags, hases, tr, cnt);
                     }
                 }
                 catch (Exception) { }
@@ -491,13 +555,18 @@ namespace Overcooked2AI.Game
                             if (f != null)
                                 tr = f.GetValue(comp) as Transform;
                         }
-                        cnt += CollectChildren(items, tr, cnt);
+                        cnt += CollectChildren(items, tags, hases, tr, cnt);
                     }
                 }
                 catch (Exception) { }
             }
 
-            return "\"on\":[" + items + "],\"n\":" + cnt;
+            // ontags: 用**游戏自己的 Unity Tag** 标出台面上每样东西的角色 ——
+            // 锅是 CookingUtensil、盘子是 Plate、食材是 Ingredient/Pre-Ingredient。
+            // 比在 Python 里拿名字猜("utensil_pot_01" 里有 pot)可靠得多。
+            // onhas: 每样东西自己装了什么(盘子上的菜) —— 判"这个盘子是不是空的"。
+            return "\"on\":[" + items + "],\"ontags\":[" + tags
+                 + "],\"onhas\":[" + hases + "],\"n\":" + cnt;
         }
 
         /// <summary>箱子/生成器出什么食材(PickupItemSpawner.m_itemPrefab.name)。</summary>
@@ -521,7 +590,8 @@ namespace Overcooked2AI.Game
             return "\"spawn\":\"\"";
         }
 
-        private static int CollectChildren(StringBuilder sb, Transform tr, int existing)
+        private static int CollectChildren(StringBuilder sb, StringBuilder tags, StringBuilder hases,
+                                           Transform tr, int existing)
         {
             if (tr == null)
                 return 0;
@@ -533,8 +603,27 @@ namespace Overcooked2AI.Game
                 if (ch == null)
                     continue;
                 if (existing + added > 0)
+                {
                     sb.Append(",");
+                    tags.Append(",");
+                }
                 sb.Append("\"").Append(SafeName(ch.name)).Append("\"");
+                string tg = "";
+                try { tg = ch.tag; }
+                catch (Exception) { }
+                // 台面上的东西可能是"占位子物体"(attachPoint 下挂的模型), tag 取不到就退化成 Untagged
+                tags.Append("\"").Append(SafeName(tg)).Append("\"");
+                // onhas: 这个东西自己容器里装了什么(盘子上的菜)。
+                // **关键**: 拿盘子去锅里取菜时, 盘子必须是**空的** ——
+                // ServerPreparationContainer/ServerPlacementContainer 的规则是
+                // "手持容器有内容 → 把内容倒进目标", 拿一个装了菜的盘子去锅边按交互,
+                // 结果是把盘子里的菜倒进锅里, 正好反了。
+                string has = "";
+                try { has = ItemKnowledge.ContentsNames(ch.gameObject); }
+                catch (Exception) { }
+                if (existing + added > 0)
+                    hases.Append(",");
+                hases.Append("\"").Append(SafeName(has)).Append("\"");
                 added++;
             }
             return added;
@@ -702,6 +791,13 @@ namespace Overcooked2AI.Game
                     sb.Append(string.Format(",\"n\":{0}", c));
                     if (c > 0)
                     {
+                        // ⚠ ontags/onhas 必须和 on **同步、同长**(Python 侧按下标一一对应):
+                        //   ontags = 游戏自己的 Unity Tag(锅=CookingUtensil / 盘=Plate)
+                        //   onhas  = 这个东西容器里装了什么 —— 判"这个盘子是不是空的"。
+                        //   拿一个装了菜的盘子去锅边按交互, 会把菜倒进锅里(方向正好相反),
+                        //   所以取菜前必须能认出空盘。这三个数组的长度与上限必须一致。
+                        var tags = new StringBuilder();
+                        var hases = new StringBuilder();
                         sb.Append(",\"on\":[");
                         int shown = 0;
                         for (int i = 0; i < c && shown < 3; i++)
@@ -710,11 +806,24 @@ namespace Overcooked2AI.Game
                             if (ch == null)
                                 continue;
                             if (shown > 0)
+                            {
                                 sb.Append(",");
+                                tags.Append(",");
+                                hases.Append(",");
+                            }
                             sb.Append("\"").Append(SafeName(ch.name)).Append("\"");
+                            string tg = "";
+                            try { tg = ch.tag; }
+                            catch (Exception) { }
+                            tags.Append("\"").Append(SafeName(tg)).Append("\"");
+                            string has = "";
+                            try { has = ItemKnowledge.ContentsNames(ch.gameObject); }
+                            catch (Exception) { }
+                            hases.Append("\"").Append(SafeName(has)).Append("\"");
                             shown++;
                         }
-                        sb.Append("]");
+                        sb.Append("],\"ontags\":[").Append(tags)
+                          .Append("],\"onhas\":[").Append(hases).Append("]");
                     }
                 }
             }

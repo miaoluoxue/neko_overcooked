@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Text;
 using UnityEngine;
 
@@ -224,6 +224,83 @@ namespace Overcooked2AI.Game
 
             sb.Append("}");
             return sb.ToString();
+        }
+
+        /// <summary>容器里装了什么(用逗号拼起来)。**锅的关键信息** ——
+        /// ScanCooking 读的是 CookingHandler, 而锅身上那个 handler 只知道"熟没熟",
+        /// 不知道"煮的是什么", 所以 ItemKnowledge.IngredientName(锅) 永远是空串。
+        /// 要知道锅里是米饭还是别的, 只能读容器的 m_contents。
+        ///
+        /// ⚠ 不能用 node.GetEnumerator() 遍历: IngredientAssembledNode.GetEnumerator 是
+        ///    `yield return this`(无限自递归), CompositeAssembledNode.GetEnumerator 只吐孙辈。
+        ///    只能读数组字段 m_composition 递归。</summary>
+        public static string ContentsNames(GameObject go)
+        {
+            if (go == null)
+                return "";
+            try
+            {
+                var arr = GetContents(go, "ServerIngredientContainer");
+                if (arr == null || arr.Length == 0)
+                    arr = GetContents(go, "ClientIngredientContainer");
+                if (arr == null || arr.Length == 0)
+                    return "";
+                var sb = new StringBuilder();
+                foreach (var n in arr)
+                    AppendNodeName(sb, n);
+                return sb.ToString();
+            }
+            catch (Exception) { }
+            return "";
+        }
+
+        private static Array GetContents(GameObject go, string typeName)
+        {
+            var ct = SceneScanner.FindType(typeName);
+            if (ct == null)
+                return null;
+            var comp = go.GetComponent(ct);
+            if (comp == null)
+                return null;
+            var m = ct.GetMethod("GetContents", Type.EmptyTypes);
+            if (m == null)
+                return null;
+            return m.Invoke(comp, null) as Array;
+        }
+
+        /// <summary>把一个订单节点还原成人类可读的名字(递归, 只读数组字段)。</summary>
+        private static void AppendNodeName(StringBuilder sb, object node)
+        {
+            if (node == null)
+                return;
+            var t = node.GetType();
+            var ing = t.GetField("m_ingriedientOrderNode");     // 食材叶子(注意游戏里就是拼错的)
+            var item = t.GetField("m_itemOrderNode");           // 物品叶子(盘子/锅一类)
+            var field = ing ?? item;
+            if (field != null)
+            {
+                var on = field.GetValue(node);
+                if (on != null)
+                {
+                    var p = on.GetType().GetProperty("name");
+                    var s = p != null ? (string)p.GetValue(on, null) : null;
+                    if (!string.IsNullOrEmpty(s))
+                    {
+                        if (sb.Length > 0)
+                            sb.Append("+");
+                        sb.Append(s);
+                    }
+                }
+                return;
+            }
+            var comp = t.GetField("m_composition");             // 复合节点 → 递归
+            if (comp == null)
+                return;
+            var arr = comp.GetValue(node) as Array;
+            if (arr == null)
+                return;
+            foreach (var e in arr)
+                AppendNodeName(sb, e);
         }
 
         /// <summary>物体代表什么食材(IngredientPropertiesComponent.GetOrderComposition → 食材名)。</summary>

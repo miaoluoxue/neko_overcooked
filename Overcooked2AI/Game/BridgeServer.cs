@@ -133,8 +133,43 @@ namespace Overcooked2AI.Game
             // 机关/陷阱: 按钮 / 传送带方向 / 触发机器 / 平台 / 火 / 关卡变形
             if (line.Contains("\"dyn\""))
                 return _collector.RequestJob("dyn", 8000);
+            // 游戏自己的网格: 格子↔世界坐标换算参数(m_origin/m_size/transform) + 占位表。
+            // 依据 GridManager.cs:9,64-92 与 QuadGridManager.cs:28-38 —— 这是"解析地图"的权威依据,
+            // 不是我们自己采样推断的那套。
+            if (line.Contains("\"grid\""))
+                return _collector.RequestJob("grid", 6000);
+            // **对齐游戏格心的完整格子图**: kind(free/solid/hazard/tight/carry/void) + 占位表
+            // + 台面传送带标记 + 交叉验证。这是地图解析的地基(CellMap.cs)。
+            if (line.Contains("\"cells\""))
+                return _collector.RequestJob("cells", 9000);
             if (line.Contains("\"pad\""))
                 return HandlePad(line);
+            // **直接调游戏自己的交互入口**(绕开输入层与客户端消息链):
+            //   {"cmd":"direct","player":0,"action":"pickup"}
+            // 依据 ServerPlayerControlsImpl_Default.ReceivePickUpEvent (:152-163, 无门)
+            if (line.Contains("\"direct\""))
+            {
+                int pl = GetInt(line, "player", 0);
+                string act = GetStr(line, "action", "pickup");
+                return _collector.RequestJob("direct", 6000, pl + ":" + act);
+            }
+            // 内存级地图小地图(实时绘制): on/off/path
+            if (line.Contains("\"overlay\""))
+            {
+                string act = GetStr(line, "action", "status");
+                if (act == "on")
+                    return MapOverlay.SetEnabled(true);
+                if (act == "off")
+                    return MapOverlay.SetEnabled(false);
+                if (act == "toggle")
+                {
+                    MapOverlay.Toggle();
+                    return MapOverlay.SetEnabled(MapOverlay.Enabled);
+                }
+                if (act == "path")
+                    return MapOverlay.PushPath(GetStr(line, "pts", ""));
+                return "{\"ok\":true,\"overlay\":" + (MapOverlay.Enabled ? "true" : "false") + "}";
+            }
             if (line.Contains("\"action\""))
             {
                 var msg = ParseAction(line);
@@ -146,9 +181,25 @@ namespace Overcooked2AI.Game
             return "{\"error\":\"unknown cmd\"}";
         }
 
-        /// <summary>{"cmd":"pad","pad":0,"connected":1,"A":1,"B":0,"X":0,"Y":0,"start":0,"back":0,"du":0,"dd":0,"dl":0,"dr":0,"lx":0,"ly":0,"rx":0,"ry":0,"lt":0,"rt":0}</summary>
+        /// <summary>虚拟手柄。
+        ///
+        /// 新机制(推荐): 带 action 字段 —— 直接替换 {chef} 的 PlayerControls.ControlSchemeData
+        ///   {"cmd":"pad","action":"install","chef":0}        需要主线程(走 job)
+        ///   {"cmd":"pad","action":"uninstall","chef":0}      需要主线程(走 job)
+        ///   {"cmd":"pad","action":"drive","player":0,"x":0,"y":1,"pickup":0,"use":0,"dash":0}
+        ///                                                    **不需要主线程** —— 只写我们自己的
+        ///                                                    对象字段, 桥线程直调, 延迟最低
+        ///   {"cmd":"pad","action":"release","player":0}
+        ///   {"cmd":"pad","action":"status"}
+        ///
+        /// 旧机制(保留兼容): 不带 action —— 喂 VirtualGamepads(虚拟 InControl 设备)。
+        ///   {"cmd":"pad","pad":0,"connected":1,...}</summary>
         private string HandlePad(string line)
         {
+            string action = GetStr(line, "action", "");
+            if (action.Length > 0)
+                return HandlePadAction(line, action);
+
             int idx = GetInt(line, "pad", -1);
             if (idx < 0 || idx > 1)
                 return "{\"ok\":false,\"error\":\"pad index\"}";
@@ -173,6 +224,53 @@ namespace Overcooked2AI.Game
             pad.LT = GetFloat(line, "lt", 0f);
             pad.RT = GetFloat(line, "rt", 0f);
             return "{\"ok\":true}";
+        }
+
+        /// <summary>虚拟手柄(新机制): install/uninstall 走主线程 job, drive/release/status 桥线程直调。
+        /// 为什么 drive 能直调: 它只写 VirtualValue/VirtualButton 自己的 float/bool 字段,
+        /// 不碰任何 Unity API —— 这样每帧喂值的延迟就是一次 TCP 往返, 而不是排队等主线程。</summary>
+        private string HandlePadAction(string line, string action)
+        {
+            if (action == "status")
+                return VirtualInput.Status();
+            if (action == "install")
+            {
+                int chef = GetInt(line, "chef", 0);
+                return _collector.RequestJob("pad", 6000, "install:" + chef);
+            }
+            if (action == "installplayer")
+            {
+                // 按玩家身份安装(0=Player.One) —— 双人首选, 不依赖对象枚举顺序
+                int pl = GetInt(line, "player", 0);
+                return _collector.RequestJob("pad", 6000, "installp:" + pl);
+            }
+            if (action == "installall")
+                return _collector.RequestJob("pad", 8000, "installall");
+            if (action == "uninstall")
+            {
+                int chef = GetInt(line, "chef", 0);
+                return _collector.RequestJob("pad", 6000, "uninstall:" + chef);
+            }
+            int player = GetInt(line, "player", 0);
+            if (action == "release")
+            {
+                VirtualInput.Release(player);
+                return "{\"ok\":true}";
+            }
+            if (action == "releaseall")
+            {
+                VirtualInput.ReleaseAll();
+                return "{\"ok\":true}";
+            }
+            if (action == "drive")
+            {
+                VirtualInput.Drive(player,
+                    GetFloat(line, "x", 0f), GetFloat(line, "y", 0f),
+                    GetInt(line, "pickup", 0) != 0, GetInt(line, "use", 0) != 0,
+                    GetInt(line, "dash", 0) != 0, GetInt(line, "curse", 0) != 0);
+                return "{\"ok\":true}";
+            }
+            return "{\"ok\":false,\"error\":\"unknown pad action: " + action + "\"}";
         }
 
         private ActionExecutor.ActionMsg ParseAction(string line)

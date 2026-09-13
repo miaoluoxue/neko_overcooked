@@ -57,6 +57,34 @@ _STATION_SEM = {
     "FloorBurner": "floorburner",
 }
 
+#: 锅/平底锅的 Unity Tag(游戏自己给厨具的分类)
+POT_TAG = "CookingUtensil"
+#: 盘子的 Unity Tag
+PLATE_TAG = "Plate"
+
+
+def is_pot(name: str = "", tag: str = "") -> bool:
+    """这东西是不是"能煮东西的锅/平底锅"。
+
+    依据(实测组件清单, s_sushi_1_3 里那三口锅):
+        utensil_pot_01 → CookableContainer + CookingHandler + ServerCookableContainer
+                         + CookingUtensilRespawnBehaviour, tag=CookingUtensil
+    它与灭火器 utensil_fire_extinguisher_01 的区别: 后者没有 CookableContainer/CookingHandler,
+    所以**不能只看名字里的 "utensil"**; 看 "pot"/"pan" 才准, tag 只做兜底。
+    """
+    n = (name or "").lower()
+    if "pot" in n or "pan" in n:
+        return True
+    if (tag or "") == POT_TAG and "extinguish" not in n and "fire" not in n:
+        return True
+    return False
+
+
+def is_plate(name: str = "", tag: str = "") -> bool:
+    if (tag or "") == PLATE_TAG:
+        return True
+    return "plate" in (name or "").lower()
+
 
 @dataclass
 class Station:
@@ -71,6 +99,32 @@ class Station:
     on: list = field(default_factory=list)  # 台面上放着的物品(子物体名)
     n: int = 0                 # 台面上/堆里的物品数量
     plate: str = ""            # 盘子堆/回收站提供哪种容器(PlatingStep 名)
+    # 与 on 一一对应: 用**游戏自己的 Unity Tag** 说每样东西是什么
+    # (锅=CookingUtensil / 盘=Plate / 食材=Ingredient/Pre-Ingredient),
+    # 以及它自己容器里装了什么(盘子上的菜)。onhas 非空 = 这个盘子/锅不是空的。
+    ontags: list = field(default_factory=list)
+    onhas: list = field(default_factory=list)
+
+    def tag_of(self, i: int) -> str:
+        return self.ontags[i] if i < len(self.ontags) else ""
+
+    def has_of(self, i: int) -> str:
+        return self.onhas[i] if i < len(self.onhas) else ""
+
+    def pot_name(self) -> str:
+        """台面上那口锅/平底锅的名字; 没有锅返回 ''。"""
+        for i, o in enumerate(self.on):
+            if is_pot(o, self.tag_of(i)):
+                return o
+        return ""
+
+    def empty_plate_names(self) -> list:
+        """台面上**空**的盘子(装了菜的盘子不能拿去锅里取菜 —— 会反过来倒进锅)。"""
+        out = []
+        for i, o in enumerate(self.on):
+            if is_plate(o, self.tag_of(i)) and not self.has_of(i):
+                out.append(o)
+        return out
 
 
 @dataclass
@@ -85,7 +139,13 @@ class Chef:
 
 @dataclass
 class Cooking:
-    """正在灶上的东西。state 为 Cooked 时才是订单要的状态(Raw/Burnt 都不匹配)。"""
+    """正在灶上的东西。state 为 Cooked 时才是订单要的状态(Raw/Burnt 都不匹配)。
+
+    注意(实测确认, 不是猜的): 在 s_sushi_1_3 这种"锅架在灶上"的关卡里,
+    name 是**锅**的名字(utensil_pot_01 (3)), 因为 CookingHandler 长在锅身上,
+    不是长在食材身上; 此时 ing 是**空串**, 锅里到底是什么只能看 inside
+    (插件读 ServerIngredientContainer.GetContents → ItemKnowledge.ContentsNames)。
+    """
     name: str
     ing: str
     prog: float                # 已煮秒数
@@ -95,6 +155,8 @@ class Cooking:
     station: str
     x: float
     z: float
+    tag: str = ""              # 游戏 Unity Tag(CookingUtensil = 锅)
+    inside: str = ""           # 容器里装了什么("SushiRice" / "")
 
     @property
     def ready(self) -> bool:
@@ -103,6 +165,20 @@ class Cooking:
     @property
     def burn_at(self) -> float:
         return 2.0 * self.need
+
+    @property
+    def is_pot(self) -> bool:
+        return is_pot(self.name, self.tag)
+
+    @property
+    def busy(self) -> bool:
+        """这口锅/这个灶上**有东西**吗。
+
+        为什么不能用 "cooking_on(station) is not None" 判占用: 锅架在灶上时,
+        空锅也有 CookingHandler(进度 0), 条目一直在 —— 那样所有"带锅的灶台"
+        都会被当成"正在煮", 一个都用不了。
+        """
+        return bool(self.inside or self.ing or self.burning)
 
 
 @dataclass
@@ -157,7 +233,9 @@ class KitchenMap:
                 name=s.get("name", ""), x=float(s.get("x", 0)), z=float(s.get("z", 0)),
                 spawn=s.get("spawn", ""), ing=s.get("ing", ""),
                 on=list(s.get("on") or []), n=int(s.get("n", 0) or 0),
-                plate=s.get("plate", ""))
+                plate=s.get("plate", ""),
+                ontags=list(s.get("ontags") or []),
+                onhas=list(s.get("onhas") or []))
         for i, c in enumerate(layout.get("chefs") or []):
             km.chefs.append(Chef(
                 id=int(c.get("id", i)), name=c.get("name", f"P{i}"),
@@ -169,7 +247,8 @@ class KitchenMap:
                 prog=float(c.get("prog", 0)), need=float(c.get("need", 0)),
                 state=c.get("state", ""), burning=bool(c.get("burning")),
                 station=c.get("station", ""),
-                x=float(c.get("x", 0)), z=float(c.get("z", 0))))
+                x=float(c.get("x", 0)), z=float(c.get("z", 0)),
+                tag=c.get("tag", ""), inside=c.get("in", "")))
         return km
 
     # ---- 查询 ----

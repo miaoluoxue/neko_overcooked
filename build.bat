@@ -23,6 +23,7 @@ dotnet %CSC% -nologo -target:library -langversion:7.3 -platform:x86 -nostdlib+ ^
   -r:"%GAME%\UnityEngine.CoreModule.dll" ^
   -r:"%GAME%\UnityEngine.UI.dll" ^
   -r:"%GAME%\UnityEngine.UIModule.dll" ^
+  -r:"%GAME%\UnityEngine.IMGUIModule.dll" ^
   -r:"%GAME%\UnityEngine.InputModule.dll" ^
   -r:"%GAME%\UnityEngine.PhysicsModule.dll" ^
   -r:xinput="%GAME%\XInputDotNetPure.dll" ^
@@ -40,7 +41,12 @@ dotnet %CSC% -nologo -target:library -langversion:7.3 -platform:x86 -nostdlib+ ^
   "%SRC%\Game\LevelInfo.cs" ^
   "%SRC%\Game\InteractiveScan.cs" ^
   "%SRC%\Game\ActionExecutor.cs" ^
-  "%SRC%\Game\VirtualGamepad.cs"
+  "%SRC%\Game\VirtualGamepad.cs" ^
+  "%SRC%\Game\VirtualInput.cs" ^
+  "%SRC%\Game\MapOverlay.cs" ^
+  "%SRC%\Game\GridInfo.cs" ^
+  "%SRC%\Game\CellMap.cs" ^
+  "%SRC%\Game\InteractDirect.cs"
 
 if errorlevel 1 (
   echo BUILD FAILED

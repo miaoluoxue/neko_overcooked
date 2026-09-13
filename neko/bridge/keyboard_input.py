@@ -40,16 +40,49 @@ def _key_code(name: str) -> int:
     return VK[name]
 
 
+#: 输入驱动。None = SendInput(系统级键盘注入, 需要游戏在前台)。
+#: 装了驱动(虚拟手柄)之后, 同一个 key_down/key_up/tap 会改走游戏内注入 ——
+#: **引擎和工具里几十处调用点一个字都不用改**, 这是刻意设计的。
+#:
+#: ⚠ **必须按线程隔离**: 双人方案里每个厨师跑在自己的线程里 (run_team.py),
+#:   两个线程各装一个虚拟手柄。如果用模块全局变量, 后启动的那个线程会把前一个的
+#:   驱动覆盖掉 → P1 的按键全发给 P2 的厨师, 表现是"一个人乱动、另一个不动",
+#:   而且极难从日志看出来。所以用 threading.local()。
+_local = threading.local()
+
+
+def set_driver(d):
+    """切换输入驱动: None=键盘注入; 传 VirtualPad=游戏内虚拟手柄。
+    **只影响当前线程** —— 双人时两个线程各管各的厨师。"""
+    _local.driver = d
+
+
+def get_driver():
+    return getattr(_local, "driver", None)
+
+
 def key_down(name: str):
+    d = get_driver()
+    if d is not None:
+        d.key_down(name)
+        return
     _send_key(_key_code(name))
 
 
 def key_up(name: str):
+    d = get_driver()
+    if d is not None:
+        d.key_up(name)
+        return
     _send_key(_key_code(name), up=True)
 
 
 def tap(name: str, duration: float = 0.08):
     """短按一个键(交互用)。"""
+    d = get_driver()
+    if d is not None:
+        d.tap(name, duration)
+        return
     vk = _key_code(name)
     _send_key(vk)
     time.sleep(duration)
@@ -290,7 +323,12 @@ def game_focused() -> bool:
 
     为什么要单独有它: SendInput 是系统级注入, 键会发给**当前前台窗口**。
     所以脚本必须在"游戏就是前台"时才发键 —— 否则键会打到用户正在用的别的程序里。
+
+    例外: 装了虚拟手柄驱动时**永远返回 True** —— 那种输入直接写游戏内部数据,
+    和窗口在不在前台毫无关系。这正是它要解决的问题(游戏放后台也能继续做菜)。
     """
+    if get_driver() is not None:
+        return True
     user32 = ctypes.windll.user32
     hwnd = _game_hwnd()
     if not hwnd:
@@ -331,6 +369,8 @@ def ensure_focus(steal: bool = None, wait_s: float = 0.0, poll: float = 0.25) ->
       · 不在前台且不抢  -> 等 wait_s 秒(0 = 不等), 期间松开所有键
       · 策略是 always   -> 才真的去抢
     """
+    if get_driver() is not None:
+        return True          # 虚拟手柄: 不需要前台, 也不要去抢用户的焦点
     if game_focused():
         return True
 

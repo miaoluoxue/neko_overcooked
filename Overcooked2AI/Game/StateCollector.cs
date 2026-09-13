@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.SceneManagement;
 
@@ -82,6 +83,26 @@ namespace Overcooked2AI.Game
                     json = LevelInfo.Snapshot(arg);
                 else if (kind == "dyn")
                     json = InteractiveScan.Snapshot();
+                else if (kind == "grid")
+                    json = GridInfo.Snapshot();
+                else if (kind == "cells")
+                    json = CellMap.Snapshot(arg);
+                else if (kind == "direct")
+                {
+                    // arg = "<player>:<action>"
+                    int pl = 0;
+                    string act = "pickup";
+                    try
+                    {
+                        var parts = (arg ?? "").Split(':');
+                        if (parts.Length > 0) int.TryParse(parts[0], out pl);
+                        if (parts.Length > 1) act = parts[1];
+                    }
+                    catch (Exception) { }
+                    json = InteractDirect.Do(pl, act);
+                }
+                else if (kind == "pad")
+                    json = VirtualInputJob(arg);
                 else
                     json = "{\"error\":\"unknown job\"}";
             }
@@ -106,6 +127,9 @@ namespace Overcooked2AI.Game
         public void Refresh()
         {
             PumpJob();
+            // 虚拟手柄: 万一游戏自己把控制方案改回去了(换人/重绑定), 立刻装回来。
+            // 只在主线程做 —— 它要访问 Unity 对象。
+            try { VirtualInput.Tick(); } catch (Exception) { }
             string scene = "";
             bool inRound = false;
             string mode = "";
@@ -184,12 +208,37 @@ namespace Overcooked2AI.Game
             }
 
             string round = inRound ? "true" : "false";
+            string app = "{}";
+            try { app = VirtualInput.AppState(); } catch (Exception) { }
             lock (_lock)
             {
                 _snapshot = string.Format(
-                    "{{\"scene\":\"{0}\",\"inRound\":{1},\"mode\":\"{2}\",\"layout\":{3},\"recipes\":{4},\"details\":{5},\"bridge\":\"ok\"}}",
-                    scene, round, mode, layout, recipePool, _recipeDetailCache);
+                    "{{\"scene\":\"{0}\",\"inRound\":{1},\"mode\":\"{2}\",\"layout\":{3},\"recipes\":{4},\"details\":{5},\"app\":{6},\"bridge\":\"ok\"}}",
+                    scene, round, mode, layout, recipePool, _recipeDetailCache, app);
             }
+        }
+
+        /// <summary>主线程: 虚拟手柄的安装/卸载(要访问 Unity 对象, 不能从桥线程做)。
+        /// arg 形如 "install:0" / "installp:1" / "installall" / "uninstall:0"。</summary>
+        private static string VirtualInputJob(string arg)
+        {
+            string a = arg ?? "";
+            int colon = a.IndexOf(':');
+            string op = colon >= 0 ? a.Substring(0, colon) : a;
+            int n = 0;
+            if (colon >= 0)
+            {
+                int.TryParse(a.Substring(colon + 1), out n);
+            }
+            if (op == "install")
+                return VirtualInput.Install(n);
+            if (op == "installp")
+                return VirtualInput.InstallByPlayer(n);
+            if (op == "installall")
+                return VirtualInput.InstallAll();
+            if (op == "uninstall")
+                return VirtualInput.Uninstall(n);
+            return "{\"ok\":false,\"error\":\"bad pad arg: " + op + "\"}";
         }
 
         private string _recipeCache = "[]";
@@ -364,6 +413,50 @@ namespace Overcooked2AI.Game
             {
                 return _snapshot;
             }
+        }
+
+        /// <summary>给小地图用: 两个厨师的实时位置(主线程调用)。</summary>
+        public struct ChefDot
+        {
+            public int id;
+            public float x;
+            public float z;
+        }
+
+        public static List<ChefDot> ChefsForOverlay()
+        {
+            var outList = new List<ChefDot>();
+            try
+            {
+                var pcType = SceneScanner.FindType("PlayerControls");
+                var idType = SceneScanner.FindType("PlayerIDProvider");
+                if (pcType == null)
+                    return outList;
+                var objs = UnityEngine.Object.FindObjectsOfType(pcType);
+                if (objs == null)
+                    return outList;
+                for (int i = 0; i < objs.Length; i++)
+                {
+                    var comp = objs[i] as Component;
+                    if (comp == null)
+                        continue;
+                    var pos = comp.transform.position;
+                    int id = i;
+                    if (idType != null)
+                    {
+                        var idProv = comp.GetComponent(idType);
+                        var m = idType.GetMethod("GetID", Type.EmptyTypes);
+                        if (idProv != null && m != null)
+                        {
+                            try { id = Convert.ToInt32(m.Invoke(idProv, null)); }
+                            catch (Exception) { }
+                        }
+                    }
+                    outList.Add(new ChefDot { id = id, x = pos.x, z = pos.z });
+                }
+            }
+            catch (Exception) { }
+            return outList;
         }
     }
 }

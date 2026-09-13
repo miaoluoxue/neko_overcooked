@@ -224,6 +224,11 @@ class Op:
     at_x: float = 0.0
     at_z: float = 0.0
     chop_stages: int = 0   # 要切几片(WorkableItem.m_stages)
+    #: 这个材料必须**装进锅(能煮的容器)里**再放到灶上煮, 不能直接放在灶台上。
+    #: 判据见 derive(): 配方说要煮, 但食材自己身上没有 CookingHandler(没有 m_stationType),
+    #: 就只能是容器在煮 —— 典型例子是米饭 SushiRice。
+    #: 这种菜"取出来"的方式也不同: **手拿空盘对着锅按交互**, 锅留在灶上不动。
+    in_pot: bool = False
 
     def __str__(self) -> str:
         extra = f"  ({self.note})" if self.note else ""
@@ -304,10 +309,17 @@ def derive(detail: dict, kb: Knowledge) -> DishFlow:
             if tool is not None:
                 note = f"用 {tool.station}, {tool.cookTime:.0f}s 熟 / 超 {2 * tool.cookTime:.0f}s 就焦"
                 wait = tool.cookTime
+                in_pot = False
             else:
-                note = "⚠ 找不到它的灶台要求"
+                # 配方说要煮, 但这个食材自己没有 CookingHandler(m_stationType 为空)
+                # ⇒ 煮它的是**容器**(锅/平底锅), 必须"装进锅里再放到灶上"。
+                # 典型: 米饭 SushiRice(实测 s_sushi 系关卡的锅 utensil_pot_01 带
+                # CookableContainer + CookingHandler, 米饭本身不带)。
+                note = "需装进锅(能煮的容器)后放灶上 —— 取菜时手拿空盘对锅按交互, 锅留在灶上"
                 wait = 0.0
-            ops.append(Op("cook", name, note, wait=wait, optional=optional))
+                in_pot = True
+            ops.append(Op("cook", name, note, wait=wait, optional=optional,
+                          in_pot=in_pot))
         if mixed:
             ops.append(Op("mix", name, "需要搅拌", optional=optional))
 

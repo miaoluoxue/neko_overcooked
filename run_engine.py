@@ -8,6 +8,11 @@
 
   --mode 可写:  coop | clumsy | sabotage
                也可对多人分别指定(如 --cid 0 时用 "1:sabotage")
+
+输入层(环境变量 NEKO_INPUT):
+  keys     (默认) 系统级键盘注入(SendInput) —— **要求游戏在最前台**, 失焦就暂停
+  virtual  游戏内虚拟手柄 —— 直接换掉厨师的逻辑输入, **游戏放后台也照样做菜**
+           装不上会自动退回 keys(所以这个兜底是自动的)
 """
 
 from __future__ import annotations
@@ -20,6 +25,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "nek
 
 from bridge.client import BridgeClient   # noqa: E402
 from engine import Engine                # noqa: E402
+from world import World                  # noqa: E402
 from modes import Roster, parse_mode_spec  # noqa: E402
 
 
@@ -29,31 +35,93 @@ def main() -> int:
     ap.add_argument("--cid", type=int, default=0, help="驱动哪个厨师(0=P1, 1=P2)")
     ap.add_argument("--mode", default="coop",
                     help="个体模式: coop | clumsy | sabotage(可写 1:sabotage,2:coop)")
+    ap.add_argument("--input", default=os.environ.get("NEKO_INPUT", "keys"),
+                    help="输入层: keys(默认, 键盘注入) | virtual(游戏内虚拟手柄, 后台也能跑)")
     args = ap.parse_args()
 
     # 模式册: 每个个体一份状态, 可热切换(v1 D6/D10)
+    # ⚠ --mode none: **纯执行, 一个失误都不演** —— 调寻路/调流程时必须用这个。
+    #   coop 也带"低概率自然失误"(发呆/绕路/多切/忘盘), 测出来的卡顿分不清是 bug 还是演的。
+    clean = (args.mode or "").strip().lower() in ("none", "off", "clean", "no")
     roster = Roster(chefs=[args.cid])
-    spec = parse_mode_spec(args.mode)
-    for k, v in spec.items():
-        if k == "*":
-            roster.set_all(v)
-        else:
-            roster.set_mode(k, v)
-    print(f"[模式] P{args.cid + 1} → {roster.get(args.cid).mode.value}", flush=True)
+    if not clean:
+        spec = parse_mode_spec(args.mode)
+        for k, v in spec.items():
+            if k == "*":
+                roster.set_all(v)
+            else:
+                roster.set_mode(k, v)
+        print(f"[模式] P{args.cid + 1} → {roster.get(args.cid).mode.value}", flush=True)
+    else:
+        print(f"[模式] P{args.cid + 1} → 纯执行(不演任何失误, --mode none)", flush=True)
 
     bridge = BridgeClient()
     print("连桥...", flush=True)
     bridge.connect(retries=None)
 
-    eng = Engine(bridge, cid=args.cid, mode_state=roster.get(args.cid))
+    # ---- 输入层选择 ----
+    mode = (args.input or "keys").strip().lower()
+    pad = None
+    if mode in ("virtual", "ver", "hook"):
+        from bridge.virtual_pad import attach_virtual_input
+        # 会自己等进对局, 并按"厨师归属的玩家"安装(不依赖对象枚举顺序)
+        pad = attach_virtual_input(bridge, chef=args.cid, log=print)
+        if pad is None:
+            print("[输入] ⚠ 虚拟手柄装不上, 自动退回键盘注入(需要游戏在前台)", flush=True)
+        else:
+            # 这一行就是"体检": 跑全程的同时把决定性的数字打出来, 不用再单独开终端查。
+            #   paused 存在      -> 加载的是新 dll(BepInEx 只在游戏启动时读 dll, 改完必须重启游戏)
+            #   paused.Network   -> 若为 true, 交互那整段更新会被跳过(能走不能按)
+            #   rebinds          -> >0 说明游戏在抢我们的按键(我们每帧抢回)
+            #   pickupIsDownCalls-> 游戏到底有没有来读我们的拾取键
+            #   schemePickupIsOurs-> 那一刻方案里的拾取键还是不是我们的实例
+            st = pad.status()
+            app = st.get("app") or {}
+            if "paused" not in app:
+                print("[输入] ⚠ 加载的是**旧 dll**(没有 paused 遥测) —— "
+                      "完全退出游戏再重开才会加载新版", flush=True)
+            print(f"[输入] 后台遥测: {app}", flush=True)
+            for p in (st.get("pads") or []):
+                print(f"[输入] 手柄 Player={p.get('player')} netButtons={p.get('netButtons')} "
+                      f"rebinds={p.get('rebinds')} pickupIsDownCalls={p.get('pickupIsDownCalls')} "
+                      f"schemePickupIsOurs={p.get('schemePickupIsOurs')}", flush=True)
+                print(f"[输入]   判决书: pickupSetTrue={p.get('pickupSetTrue')} "
+                      f"clientOurs={p.get('clientOurs')} serverOurs={p.get('serverOurs')} "
+                      f"direct={p.get('direct')} forced={p.get('forced')} "
+                      f"missing={p.get('missing')!r}", flush=True)
+            lay = (bridge.get_state().get("layout") or {}).get("chefs") or []
+            for c in lay:
+                print(f"[输入] 厨师#{c.get('id')} local={c.get('local')} canpress={c.get('canpress')} "
+                      f"pick={c.get('pick')!r}", flush=True)
+    else:
+        print("[输入] 键盘注入(需要游戏在最前台; 想后台跑用 --input virtual)", flush=True)
+
+    eng = Engine(bridge, cid=args.cid,
+                 mode_state=None if clean else roster.get(args.cid),
+                 world=World(bridge, log=print))
     try:
         eng.run(dry=args.dry)
     except KeyboardInterrupt:
         print("\n停止", flush=True)
     finally:
         eng.kb.release_all()
+        try:
+            from bridge import keyboard_input as _ki
+            _ki.set_driver(None)          # 松开虚拟手柄(值归零)
+            if pad is not None:
+                pad.uninstall()            # 把厨师的输入还给游戏
+        except Exception:
+            pass
         bridge.close()
         print(f"[模式] 本局统计: {roster.describe()}", flush=True)
+        if pad is not None:
+            # 收尾这一行是"直调到底有没有在用"的唯一凭据:
+            #   calls=0        -> 引擎一次交互都没做过(流程根本没走到)
+            #   hits=0 miss>0  -> 调通了但游戏总说身边没东西 ⇒ 站位问题(寻路/落脚点)
+            #   hits>0         -> 直调真的接上了, 取件不再依赖游戏自己的消息链
+            print(f"[输入] 直调统计: calls={pad.direct_calls} hits={pad.direct_hits} "
+                  f"miss={pad.direct_miss} fails={pad.direct_fails} "
+                  f"last={pad.last_direct.get('method')}->{pad.last_direct.get('target')}", flush=True)
     return 0
 
 
