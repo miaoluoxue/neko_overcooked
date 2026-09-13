@@ -98,9 +98,20 @@ namespace Overcooked2AI.Game
                         // 逐字对齐客户端 Update_Carry(ClientPlayerControlsImpl_Default.cs:238-263)
                         if (holding)
                         {
-                            // 手上有东西 → PlaceHeldItem_Client: 有放置句柄就 Place, 没有就 Take(丢脚下)
-                            method = place != null ? "ReceivePlaceEvent" : "ReceiveTakeEvent";
-                            target = place;
+                            // 手上有东西 = 放置/丢下。这里**不直调**。
+                            //
+                            // 原因(反编译):
+                            //   PlaceHeldItem_Client(PlayerControlsHelper.cs:149-160) 发的是
+                            //   `m_iHandlePlacement as MonoBehaviour`(台面/锅那侧), 服务端
+                            //   OnChefEvent 用 entity id 还原 target(ServerPlayerControlsImpl_Default.cs:333)。
+                            //   直调侧读到的 CurrentInteractionObjects.m_iHandlePlacement 在手持物刚变化时会
+                            //   短暂指向手上的盘子/台面上的盘子, 把 ReceivePlaceEvent 投错目标 ——
+                            //   服务端 PlaceHeldItem_Server 找不到正确放置句柄, 就什么都不做
+                            //   (PlayerControlsHelper.cs:126-147 的 else 分支直接 TakeItem)。
+                            //   与其猜目标, 不如把按键还给游戏自己的客户端链
+                            //   (Update_Carry → PlaceHeldItem_Client → 服务端路由), 那条链现在
+                            //   虚拟手柄已接管(clientOurs/serverOurs=true)。
+                            return Err("HOLDING: 放置/丢下改走原生 pickup 键兜底");
                         }
                         else if (pick != null)
                         {

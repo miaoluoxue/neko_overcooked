@@ -196,8 +196,12 @@ class VirtualPad:
         self.direct_calls += 1
         self.last_direct = r
         if not r.get("ok"):
-            self.direct_fails += 1
             error = str(r.get("error") or "")
+            # 手上有东西 = 放置/丢下: 这是**故意**不走直调, 交给原生 pickup 键。
+            # 不算失败, 也不刷屏(每次空手/手持切换都会经过这里)。
+            if error.startswith("HOLDING"):
+                return False
+            self.direct_fails += 1
             if "未知动作" in error or "unknown action" in error.lower():
                 self._direct_unsupported.add(act)
                 self.log(

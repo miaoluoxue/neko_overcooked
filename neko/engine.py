@@ -1863,8 +1863,16 @@ class Engine:
         """
         _, _, held = self.pos(st)
         if not held:
-            self.log("[步骤] 组装: 手上空, 跳过")
-            return True
+            # 手空也可能是"上次放置失败, 食材已经被丢了"(日志里真实发生过:
+            # 海带放不进盘 -> 重试时手已空 -> 被这条"跳过"当成成功, 后面拿空盘去煮饭)。
+            # 只有台面上确实已经有 op.target 时才允许跳过, 否则老实报失败。
+            spot0 = self.assemble_spot or self.pick_assemble_spot(km, x, z)
+            want_norm = self._norm(op.target or "")
+            if spot0 is not None and self._has_plate(spot0) and want_norm in self._plate_contents_on(spot0):
+                self.log(f"[步骤] 组装: 手上空, 但 {spot0.id} 那盘里已有 {op.target!r}, 跳过")
+                return True
+            self.log(f"[步骤] 组装: 手上空, 且盘里没有 {op.target!r} —— 判失败(不能假装成功)")
+            return False
         holding_plate = self._is_plate(held)
         spot = self.assemble_spot
         if spot is None:
