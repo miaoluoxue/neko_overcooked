@@ -158,7 +158,10 @@ namespace Overcooked2AI.Game
             if (inRound)
             {
                 float now = Time.realtimeSinceStartup;
-                if (now - _lastLayoutScan >= 1f)
+                // 台面/盘子这类"拿走→放到另一边"必须尽快反映, 否则 Python 会拿旧 on/onhas
+                // 做决策(以为盘子还在这/不在那)。原来 1s 一次, 实测盘子换位后会"一会才想起来";
+                // 提到 0.3s。Scan() 只是枚举已知组件 + 读子物体, 0.3s 主线程开销可接受。
+                if (now - _lastLayoutScan >= 0.3f)
                 {
                     _lastLayoutScan = now;
                     try
