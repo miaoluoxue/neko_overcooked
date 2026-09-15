@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 
@@ -199,12 +200,8 @@ class VirtualPad:
         self.direct_calls += 1
         self.last_direct = r
         if not r.get("ok"):
-            error = str(r.get("error") or "")
-            # 手上有东西 = 放置/丢下: 这是**故意**不走直调, 交给原生 pickup 键。
-            # 不算失败, 也不刷屏(每次空手/手持切换都会经过这里)。
-            if error.startswith("HOLDING"):
-                return False
             self.direct_fails += 1
+            error = str(r.get("error") or "")
             if "未知动作" in error or "unknown action" in error.lower():
                 self._direct_unsupported.add(act)
                 self.log(
@@ -395,9 +392,44 @@ def chef_of_player(bridge, player: str = "Two", log=print):
     return hit[0]
 
 
+#: 大厅里"已经加入的玩家"从 state 顶层读(字段名)。
+#: 由 `Overcooked2AI/Game/SceneScanner.cs` 的 `ScanUsers` 上报 ——
+#: 权威来源是游戏自己的 `Team17.Online.ClientUserSystem.m_Users`
+#: (反编译依据: `GamepadEngagementManager.cs:92-105`, 那正是"按 A 加入下一个玩家"的
+#:  轮询器**自己**, 它先判 `ClientUserSystem.m_Users.Count < 4` 才放行)。
+USERS_KEY = "users"
+
+#: 按完 A 之后**等大厅人数涨上来**的时间上限(秒) —— `NEKO_JOIN_VERIFY` 可调。
+#: ⚠ 别调太小: `m_Users` 要经过 `ServerUserSystem.AddUser` → `UsersChanged()` →
+#:   `ClientUserSystem.OnUsersChanged` 才更新(**游戏自己那条链**, 不是我们算的),
+#:   而且大厅里还没装虚拟手柄 ⇒ 游戏失焦时主循环是停的, 会更慢。
+VERIFY_TIMEOUT = float(os.environ.get("NEKO_JOIN_VERIFY") or 5.0)
+
+
+def lobby_users(bridge, st=None, log=None):
+    """大厅里已加入的玩家 → `[{'slot':…, 'local':…, 'name':…}, …]`。
+
+    **返回 `None` 表示"读不到"**, 和"读到 0 个人(`[]`)"是两回事 ——
+    调用方必须分开处理: 把"读不到"当 0 人会去按 A, 而按 A 会**引进 P3**。
+    (插件侧读不到时上报的就是 `null`, 见 `ScanUsers` 的注释。)
+    """
+    try:
+        s = st if st is not None else (bridge.get_state() or {})
+    except Exception as e:                                         # noqa: BLE001
+        if log:
+            log(f"[加入] 读状态失败: {e}")
+        return None
+    if USERS_KEY not in s:
+        return None                     # 旧 dll: 压根没有这个字段
+    u = s.get(USERS_KEY)
+    if u is None:
+        return None                     # 插件报的是"读不到"
+    return u if isinstance(u, list) else None
+
+
 def join_player(bridge, pad: int = 1, hold: float = 0.6, tries: int = 3,
-                log=print) -> bool:
-    """在**主界面**让第二个玩家加入(按虚拟手柄的 A)。
+                log=print, force: bool = False) -> bool:
+    """在**主界面**让**下一个**玩家加入(按虚拟手柄的 A)。**已经是双人就跳过。**
 
     为什么非要有这一步 —— 这是个**鸡生蛋**, 只能走这条"旧路":
       · `pad("installplayer")` 那套(真正消费输入的那个)要求场景里**已经有
@@ -409,18 +441,46 @@ def join_player(bridge, pad: int = 1, hold: float = 0.6, tries: int = 3,
       ⇒ **只有 `VirtualGamepads`(真的 InControl 设备)能触发
         `PCPadInputProvider.OnDeviceAttached`, 也就是"有手柄接上了"那个事件。**
 
-    ⚠ **能否加入，本函数只能确认"命令被接受"** —— 大厅里有几个人在
-      `StartScreen` 是**读不到**的(要进对局才有 `PlayerControls`)。
-      真正加入没有要靠眼睛看, 或者进对局后数 `chefs`。
+    ☠☠ **A 是"加入下一个玩家", 不是 toggle** ⇒ 按多了会**引进第三个人**
+      (用户 2026-09-15 实测; 游戏自己的守卫只挡到 4 人, 挡不住第 3 个)。
+      所以进这个函数**先检查是不是已经双人, 是就跳过** —— 判据只有这一条,
+      而且做在这里(不是做在调用方): **手动跑 `tools\\joinp2.py` 同样受保护**。
+
+    ⚠ **能否加入, 本函数只能确认"命令被接受"** —— 按完要**看一眼大厅**,
+      或者进对局后数 `chefs`(那才是"真的加进来了"的证据)。
+      (这里以前写着"大厅里有几个人读不到" —— **那句是错的**,
+       见 `lobby_users` 与 `ScanUsers` 的反编译依据。现在读得到, 也正因此才敢判。)
 
     `pad`: 用第几个虚拟设备(0/1)。哪个对应"第二玩家"取决于游戏怎么分配槽位,
            默认 1; 不行就试 0。
     `hold`: 按住 A 的时长 —— 设备接上到被枚举可能要几帧, 太短会漏。
+    `force`: **越过"已经双人就跳过"的检查**(也会越过"读不到就不按")。
+             只在确知自己在干什么时用。
     """
+    users = lobby_users(bridge, log=log)
+    if not force:
+        if users is None:
+            log("[加入] ⚠ **读不到大厅玩家名单** —— 不按 A(猜错就是引进第三个人)。")
+            log("[加入]   多半是插件是旧的(没有 `users` 字段): 重编重装 "
+                "`build\\Overcooked2AI.dll`, 并**完全退出游戏再开**(BepInEx 只在启动读 dll)。")
+            log("[加入]   确知大厅里只有自己、要强行按: 加 `--force`。")
+            return False
+        if len(users) >= 2:
+            who = ", ".join(
+                "%s%s" % (u.get("slot") or "?", "(本地)" if u.get("local") else "")
+                for u in users)
+            log(f"[加入] 大厅里**已经有 {len(users)} 个人**({who}) —— "
+                f"已经是双人, **跳过加入**(再按 A 会引进第三个人)")
+            return True
+
     ok_any = False
+    # ☠☠ **每按一次都要**数人数, 够了立刻停** —— 用户 2026-09-15:
+    #   > "按一次之后检查一下玩家数量, 如果是 2 人就可以不需要尝试多按了"
+    #   为什么非做不可: A 是"加入**下一个**玩家", 而 `tries` 默认 3 ——
+    #   原来的循环是"按满 3 遍再说", 于是**第一次就成功**时, 第 2、3 次
+    #   正好把大厅里的人加成为 3 个(游戏自己的守卫只挡到 4 人, 挡不住这个)。
+    #   ⇒ 一次成功 = 后面一次都不许再按。
     for k in range(tries):
-        # ⚠ 整份覆盖: 这个接口是**状态写**不是增量, 少写一个字段就等于把它清零。
-        #   所以 `connected=1` 每次都要带上, 否则设备会被"拔掉"。
         r1 = bridge.vpad(pad, connected=1, A=1)
         time.sleep(hold)
         r2 = bridge.vpad(pad, connected=1, A=0)
@@ -428,9 +488,38 @@ def join_player(bridge, pad: int = 1, hold: float = 0.6, tries: int = 3,
         ok_any = ok_any or ok
         log(f"[加入] 第 {k + 1}/{tries} 次按 A (pad={pad}, 按住 {hold}s) -> "
             f"{'命令已接受' if ok else '失败: ' + str(r1.get('error') or r2.get('error'))}")
-        if ok:
-            time.sleep(0.4)
-    if ok_any:
-        log(f"[加入] pad={pad} 的 A 已按过 {tries} 次 —— "
-            f"**去看一眼大厅里出没出第二个玩家**(这边读不到)")
-    return ok_any
+        if not ok:
+            continue
+        n = _wait_users(bridge, at_least=2, log=log)
+        if n is None:
+            log("[加入] ⚠ 按完**读不到玩家名单** —— 不再多按(无法确认, 宁可少按; "
+                "真没加上就下一趟大厅再来)")
+            return True
+        if n >= 2:
+            log(f"[加入] ✓ 大厅现在 {n} 人 —— **够了, 不再多按**")
+            return True
+        log(f"[加入] 按完还是 {n} 人 —— 再试一次")
+    # ⚠ **走到底就是没加成**, 返回 False —— 不能因为"命令被接受过"就报成功:
+    #   调用方(看护)拿 `ok` 决定"这一趟大厅结束没有", 报 True 会让它以为补上了。
+    log(f"[加入] pad={pad} 按过 {tries} 次, 人数始终没到 2 —— "
+        f"**去看一眼大厅**(可能这个设备号不对, 换 `--pad 0` 试试)")
+    return False
+
+
+def _wait_users(bridge, at_least: int = 2, step: float = 0.4, log=None):
+    """按完 A 之后**轮询人数**, 直到 `>= at_least` 或超时。
+
+    返回最后读到的人数(`int`); **读不到返回 `None`** —— 调用方必须把这两者分开:
+    "读到 1 人"可以再试一次, "读不到"**不行**(再按就是赌, 赌输引进 P3)。
+    超时时间 `VERIFY_TIMEOUT`(`NEKO_JOIN_VERIFY` 可调)。
+    """
+    t0 = time.time()
+    n = None
+    while True:
+        u = lobby_users(bridge, log=log)
+        if u is None:
+            return None
+        n = len(u)
+        if n >= at_least or (time.time() - t0) >= VERIFY_TIMEOUT:
+            return n
+        time.sleep(step)

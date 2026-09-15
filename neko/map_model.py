@@ -224,9 +224,23 @@ class Station:
         return ""
 
     def empty_plate_names(self) -> list:
-        """台面上**空**的盘子(装了菜的盘子不能拿去锅里取菜 —— 会反过来倒进锅)。"""
+        """台面上**空**的盘子(装了菜的盘子不能拿去锅里取菜 —— 会反过来倒进锅)。
+
+        ☠☠ **整叠盘子不算"一个空盘"**(2026-09-15 `s_sushi_1_3` 实机打回来的)。
+          `is_plate` 只判名字里有没有 "plate", 而 `dirtyplatestack` / `cleanplatestack`
+          都含 "plate" ⇒ 整叠**被当成一只盘子**报出去。后果是引擎过去"拿盘子",
+          结果把手伸进**整叠脏盘**里 —— 日志原话:
+            `[引擎] ▶ [杂活] fetch Cucumber   厨师(11.0,9.8) 手持'DirtyPlateStack'`
+            `[步骤] DirtyPlateStack 进不了盘 → 直接丢脚下`
+          然后 `盘里=空` ⇒ `assemble`/`deliver` **全灭**, 最后锅里那份米**烧糊**
+          (用户原话: "**脏盘不会识别并拿去洗**")。
+          ⇒ 判据: 名字里带 **stack** 的是"**盘子的来源**", 不是盘子本身 —— 排除掉。
+          (真正该拿的那只盘, 由 `dirty_plates`/`plates` 这两类台面的**取盘动作**给出。)
+        """
         out = []
         for i, o in enumerate(self.on):
+            if "stack" in (o or "").lower():
+                continue                      # 整叠 ≠ 一只
             if is_plate(o, self.tag_of(i)) and not self.has_of(i):
                 out.append(o)
         return out
@@ -258,6 +272,30 @@ class Item:
     tag: str                   # Pre-Ingredient(生料) / Ingredient(处理过的)
     x: float
     z: float
+    #: **这个实例还能不能被加工**(= 生料还是成品)。来自 C# `ScanItems` 的 `work`
+    #: (该实例身上有没有 `WorkableItem.m_nextPrefab`)。
+    #:
+    #: ☠ **判断加工阶段不能靠 `tag`, 也不能靠名字** —— 这是本轮(2026-09-15)为"传递指令"
+    #: 补的字段, 两边的坑都在代码里记着:
+    #:   · `tag` 不可靠: 同一关里**生虾的 tag 是 `Ingredient`、生鱼却是 `Pre-Ingredient`**
+    #:     (见 `cookbook.raw_for` 的注释), 靠它会漏;
+    #:   · 名字查知识表也不行: "生料和成品同名"那一族(`SushiFish --切8次--> SushiFish`)
+    #:     在表里是**两条同名记录**, 查表取第一条 ⇒ 分不出手上这个是哪个
+    #:     (见 `Engine._needs_work` 的注释)。
+    #:   ⇒ 只有**实例自己**说得准。`workable=True` = 还是生料。
+    workable: bool = False
+    #: **这件东西现在挂在哪** —— 用户 2026-09-15:
+    #:   "地图上预制体的位置、台面和台面上内容物**都需要包括灶台上的锅和地上的**,
+    #:    这样交给**可行性检查**会更可信。"
+    #: `on` = 挂在哪个台面上(物体名; 空 = 没挂在台面上); `carrier` = 谁拿着(空 = 没人拿)。
+    #: 两个都空 ⇒ **自由对象**(在地上/在台面外的空间里)。
+    #: ⚠ 这是**问游戏**要的挂载关系(规则 2), 不是我们按坐标猜的 ——
+    #:   原来"在灶上 / 在地上 / 在手上"三态分不开(`cooking_on` 靠 0.6 格距离猜,
+    #:   锅放在灶台边上或端在手上都会被猜成"在灶上")。
+    #: ⚠ 老 dll 没这两个键 ⇒ 空串 ⇒ 调用方退回"按距离猜"。
+    on: str = ""
+    carrier: str = ""
+    y: float = 0.0            # 高度 —— 多层关卡里同 (x,z) 不同层要靠它分
 
 
 @dataclass
@@ -307,10 +345,45 @@ class Cooking:
     z: float
     tag: str = ""              # 游戏 Unity Tag(CookingUtensil = 锅)
     inside: str = ""           # 容器里装了什么("SushiRice" / "")
+    #: **这个容器是哪种加热方式** —— `CookingHandler.m_cookingType.m_uID`。
+    #: 它就是游戏"这道菜能不能进这口锅"的**权威判据**(和食材的 `cook_steps` 比):
+    #:   `CookableContainer.cs:46-47` `cp.AllowsCookingStep(_handler.AccessCookingType)`
+    #:   `CookableProperties.cs:11-13` 比的是 `CookingStepData.m_uID`
+    #: ⚠ 只在**同一局内**可比值(两边都现读, 够用)。老 dll 没这字段 ⇒ 0 = 未知。
+    cook_id: int = 0
+    #: 上面那个 id 对应的资产名(只为**日志/离线**可读; 判据只用 `cook_id`)。
+    cook_name: str = ""
+    #: **这是"煮"还是"搅"** —— `"cook"` / `"mix"`。
+    #: 用户 2026-09-15: "**不只是锅, 其他一样的, 搅拌器, 烤箱, 平底锅**"。
+    #: 搅拌器身上是 `MixingHandler`(不是 `CookingHandler`), 数据形状却**一模一样**
+    #: (prog/need/state/内容物/坐标/挂载) ⇒ 合并进同一个列表, 靠这个字段区分。
+    kind: str = "cook"
+    #: **这个容器挂在哪张台面上**(物体名; 空 = 没挂/地上/手上)。
+    #: 只有 `ScanMixing` 会报(它照抄了 `MountOf`), 所以**煮的那条一般是空**。
+    #: ⚠ 不叫 `on` —— `Station.on` 是"台面上放着的东西", 同名会看错。
+    mount: str = ""
+    #: **报警从几倍开始**(`prog/need` 的比值)。这是**游戏的阈值**, 不是我们的偏好:
+    #:   · 煮: `> 1×` ⇒ OverDoing(`ServerCookingHandler`);
+    #:   · 搅: `> 1.3×` ⇒ OverDoing(`ServerMixingHandler.cs:56`)。
+    #: 两者**毁掉**的门槛都是 `> 2×`(Burnt / OverMixed, `MixingHandler.cs:16`)。
+    #: ⚠ 老 dll 没有 → 默认 1.0(等于老行为)。
+    alert: float = 1.0
 
     @property
     def ready(self) -> bool:
         return self.state == "Cooked"
+
+    @property
+    def count(self) -> int:
+        """**里面装了几份** —— 由 `inside` 数出来。
+
+        ☠ 不用新字段: C# 那边 `ItemKnowledge.AppendNodeName` 是**用 `+` 拼**的
+          (`if (sb.Length > 0) sb.Append("+")`), 所以 `"Egg+Flour"` 就是**两份**。
+        用途: 搅拌碗的**容量校验**(用户 2026-09-15: "碗的容量是'**<=4 份**任意处理过的料'") ——
+          "碗满了还去放"游戏也会拒, 但**白跑一趟**; 早知道就早拦住。
+        ⚠ 名字里**本来带 `+`** 的情况没有(食材名不含加号), 所以切开数不会数错。
+        """
+        return len([p for p in (self.inside or "").split("+") if p.strip()])
 
     @property
     def burn_at(self) -> float:
@@ -546,7 +619,11 @@ class KitchenMap:
         for it in _aslist(layout.get("items"), "items"):
             km.items.append(Item(
                 name=it.get("name", ""), tag=it.get("tag", ""),
-                x=float(it.get("x", 0) or 0), z=float(it.get("z", 0) or 0)))
+                x=float(it.get("x", 0) or 0), z=float(it.get("z", 0) or 0),
+                workable=bool(it.get("work")),
+                # 挂载关系(问游戏要的) —— 老 dll 没有 ⇒ 空串/0 ⇒ 退回按距离猜
+                on=it.get("on", "") or "", carrier=it.get("carrier", "") or "",
+                y=float(it.get("y", 0) or 0)))
         for c in layout.get("cooking") or []:
             km.cooking.append(Cooking(
                 name=c.get("name", ""), ing=c.get("ing", ""),
@@ -554,7 +631,25 @@ class KitchenMap:
                 state=c.get("state", ""), burning=bool(c.get("burning")),
                 station=c.get("station", ""),
                 x=float(c.get("x", 0)), z=float(c.get("z", 0)),
-                tag=c.get("tag", ""), inside=c.get("in", "")))
+                tag=c.get("tag", ""), inside=c.get("in", ""),
+                # 老 dll 没有这两个键 ⇒ 0/"" = 未知 ⇒ 调用方退回"离我最近"那条老路
+                cook_id=int(c.get("cookId", 0) or 0),
+                cook_name=c.get("cookName", "") or "",
+                kind=c.get("kind", "") or "cook",
+                mount=c.get("on", "") or "",
+                alert=1.0))
+        # 搅拌器**并进同一个列表**(形状一样), 只是报警阈值是 1.3 倍 —— 见 `Cooking.kind/alert`
+        for c in layout.get("mixing") or []:
+            km.cooking.append(Cooking(
+                name=c.get("name", ""), ing=c.get("ing", ""),
+                prog=float(c.get("prog", 0)), need=float(c.get("need", 0)),
+                state=c.get("state", ""), burning=bool(c.get("burning")),
+                station=c.get("station", ""),
+                x=float(c.get("x", 0)), z=float(c.get("z", 0)),
+                tag=c.get("tag", ""), inside=c.get("in", ""),
+                cook_id=int(c.get("cookId", 0) or 0),
+                cook_name=c.get("cookName", "") or "",
+                kind="mix", mount=c.get("on", "") or "", alert=1.3))
         return km
 
     # ---- 查询 ----
@@ -614,8 +709,41 @@ class KitchenMap:
         best.sort(key=lambda t: t[0])
         return best[0][1]
 
+    def pot_on(self, station: Station) -> Optional[Item]:
+        """**这个灶台上架着哪口锅** —— 按**游戏的挂载关系**找, 不按坐标猜。
+
+        用户 2026-09-15: "台面和台面上内容物**都需要包括灶台上的锅和地上的**,
+        这样交给**可行性检查**会更可信"。
+
+        怎么找: `ScanItems` 现在把 `CookingUtensil` 也扫进来了, 每件都带
+        `on`(挂在哪个台面上)。所以"这口锅在这个灶上"是**游戏说的事实**,
+        而不是"它离这个坐标 0.6 格以内"的**推断** ——
+        原来那套推断分不开三种情况: 锅在灶上 / 锅被端在手上 / 锅放在灶台边上。
+        ⚠ 老 dll(没有 `on`)⇒ 返回 None, 调用方退回按距离猜。
+        """
+        if station is None or not station.name:
+            return None
+        for it in self.items:
+            if it.on and it.on == station.name:
+                return it
+        return None
+
     def cooking_on(self, station: Station) -> Optional[Cooking]:
-        """某个灶台上正在煮的东西。"""
+        """某个灶台上正在煮的东西。
+
+        ☠☠ **先按挂载关系找锅, 找不到才退回按距离猜**(用户 2026-09-15 的要求):
+          原来的判据只有 `abs(c.x - station.x) < 0.6 and abs(c.z - station.z) < 0.6` ——
+          那是**推断**, 而且分不开"锅在灶上 / 锅端在手上(就在厨师身边) / 锅放在灶台边上"。
+          有了 `ScanItems` 报的 `on`(见 `pot_on`)之后, "这口锅挂在哪个台面上"是**事实**:
+          先由事实定位到**那口锅**, 再用**锅的名字**去 `cooking` 里找它的烹饪状态。
+        ⚠ 两条都必须留着: 老 dll 没有 `on`,`pot_on` 返回 None ⇒ 走距离那条;
+          而有些关卡锅里还没有 `CookingHandler` 对应条目 ⇒ 也别把距离那条删掉。
+        """
+        pot = self.pot_on(station)
+        if pot is not None:
+            for c in self.cooking:
+                if c.name == pot.name:
+                    return c
         for c in self.cooking:
             if abs(c.x - station.x) < 0.6 and abs(c.z - station.z) < 0.6:
                 return c

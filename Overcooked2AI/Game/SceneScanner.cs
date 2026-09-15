@@ -87,11 +87,18 @@ namespace Overcooked2AI.Game
         {
             public GameObject go;
             public Transform attach;      // 内容物挂点(Stack 优先, 否则 AttachStation.m_attachPoint)
-            public string typeName = "", name = "", tag = "", sub = "", spawn = "", plate = "";
+            public string name = "";
             public int iid;
-            /// <summary>静态部分已经拼好的 JSON 片段(tag/sub/spawn/plate)。**只有这些是缓存的** ——
-            /// 坐标不缓存(锅会被端走、可推物体会动), 每帧从 `go.transform.position` 现读。</summary>
-            public string staticJson = "";
+            /// <summary>**发现时**归入的那个类型 —— 只当**兜底提示**, 不再是"身份"。
+            ///
+            /// ☠ 别拿它当权威: 运行期真的会变(`ServerFlamethrowerSpray.cs:70-71` 给已有台面
+            ///   `AddComponent<CookingStation>()` 并改 `m_stationType`)。
+            ///   每帧要用 `Reclassify()` 拿当下的类型 —— 理由见那边的长注释。</summary>
+            public string hint = "";
+            /// <summary>身份 JSON 片段(tag/sub/spawn/plate/session…)。**每帧重算** ——
+            /// 见 `DescribeIdentity` 的注释(它原来叫 `staticJson`/`DescribeStatic`,
+            /// 是**5 秒缓存**的, 2026-09-15 用户点名改成实时)。</summary>
+            public string identityJson = "";
             /// <summary>上一次算出来的 onhas —— **按子物体下标各存各的**。
             ///
             /// ☠ 原来这里是**一个** `string`。台面上放了两件以上东西时, 节流帧里
@@ -161,7 +168,11 @@ namespace Overcooked2AI.Game
         public static string ScanStations(bool force = false)
         {
             float now = Time.realtimeSinceStartup;
+            long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
             EnsureStationCache(force);
+            // 发现(20 次全场景遍历)到此为止 —— 下面这一段才是**每帧**的部分。
+            // 分开计时是为了让日志里的两个数能回答两个不同的问题, 见 MeasuredScan()。
+            long t1 = System.Diagnostics.Stopwatch.GetTimestamp();
 
             var stations = new StringBuilder();
             stations.Append("[");
@@ -208,10 +219,54 @@ namespace Overcooked2AI.Game
 
             // 厨师位置单独走高频刷新(ScanChefs), 这里不再包含
             stations.Append("]");
+            MeasuredScan(t0, t1, now);
             return stations.ToString();
         }
 
-        /// <summary>把一条台面记录拼成 JSON(位置每帧现读, 内容按 DynamicInterval 节流)。</summary>
+        //: **台面扫描有多贵**(毫秒, 窗口内**最坏**那一帧)。
+        //: `ScanAllMs` = 含每 5 秒一次的发现重建; `ScanFrameMs` = 纯每帧部分(身份+位置+内容)。
+        //: 为什么报**最坏**而不是平均: 卡顿是"某一帧突然贵", 平均值会把它抹平。
+        //: ☠☠ 这两个数是"**身份改成每帧重算**"这件事的成本凭据 —— 用户 2026-09-15
+        //:   定的形状是"**先量再说**"(地形那张图就是这么定下 32ms 的)。
+        //:   若 `ScanFrameMs` 太大, 正确的下一步是去优化 `DescribeIdentity` 里那几次反射
+        //:   (按 `RoundScore.cs` 的 `_monitorM`/`_scoreP` 范例**按类型缓存句柄**),
+        //:   **不是**把身份改回缓存 —— 那等于把刚修掉的错放回来。
+        public static float ScanAllMs;
+        public static float ScanFrameMs;
+
+        private static float _scanAllMax, _scanFrameMax, _scanWinAt;
+
+        private static double _ms(long a, long b)
+        {
+            return (b - a) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+        }
+
+        private static void MeasuredScan(long t0, long t1, float now)
+        {
+            try
+            {
+                long t2 = System.Diagnostics.Stopwatch.GetTimestamp();
+                double all = _ms(t0, t2), frame = _ms(t1, t2);
+                if (all > _scanAllMax) _scanAllMax = (float)all;
+                if (frame > _scanFrameMax) _scanFrameMax = (float)frame;
+                ScanAllMs = _scanAllMax;
+                ScanFrameMs = _scanFrameMax;
+                if (now - _scanWinAt < 10f)
+                    return;
+                _scanWinAt = now;
+                // ⚠ 措辞别把意图写成结果: `ScanAllMs` 那个**含**每 5 秒一次的发现重建,
+                //   所以它天然比 `ScanFrameMs` 大 —— 别读成"每帧都这么贵"。
+                Plugin.Log?.LogInfo(string.Format(
+                    System.Globalization.CultureInfo.InvariantCulture,
+                    "[Overcooked2AI] 台面扫描 10s 内最坏: 每帧部分 {0:F2} ms / 含发现重建 {1:F2} ms",
+                    _scanFrameMax, _scanAllMax));
+                _scanAllMax = 0f;
+                _scanFrameMax = 0f;
+            }
+            catch (Exception) { }
+        }
+
+        /// <summary>把一条台面记录拼成 JSON(**位置、身份、内容, 全部每帧现读**)。</summary>
         private static void AppendRef(StringBuilder stations, ref int n, StationRef r, float now)
         {
             if (r.go == null)
@@ -224,6 +279,13 @@ namespace Overcooked2AI.Game
             }
             catch (Exception) { return; }
 
+            // ☠☠ **身份每帧重算, 不看缓存**(2026-09-15 用户: "台面身份千万别缓冲,
+            //   这一块需要实时的")。理由与确凿依据见 `Reclassify` 的长注释。
+            //   ⚠ **类型名只算一次** —— 它同时当 `id` 前缀和 `kind`, 两处必须是同一个值,
+            //     否则 Python 侧按 `id` 建的索引会和 `kind` 对不上。
+            string typeName = Reclassify(r.go, r.hint);
+            r.identityJson = DescribeIdentity(r.go, typeName);
+
             if (n > 0)
                 stations.Append(",");
             // `active` = 这个物体**现在在不在场**(GameObject.activeInHierarchy)。
@@ -233,11 +295,15 @@ namespace Overcooked2AI.Game
             // **那是显示层在替限时构件打包票**, 和人读到"地图说安全"就去走同一个毛病。
             bool active = true;
             try { active = r.go.activeInHierarchy; } catch (Exception) { }
+            // ⚠ **这条 `string.Format` 的形状一个字都不许动** —— `{8}`/`{9}` 是
+            //   "自带前导逗号"的片段, 逗号归谁是最容易错的地方(少一个前导逗号
+            //   实测废掉过一整局)。本轮只换了 {8} 的**来源**(缓存字段 → 每帧重算),
+            //   参数个数、类型、位置全不变。
             stations.Append(string.Format(
                 System.Globalization.CultureInfo.InvariantCulture,
                 "{{\"id\":\"{0}_{1}\",\"iid\":{2},\"kind\":\"{3}\",\"name\":\"{4}\",\"x\":{5:F2},\"y\":{6:F2},\"z\":{7:F2},\"active\":{10}{8}{9}}}",
-                r.typeName, n, r.iid, r.typeName, SafeName(r.name), x, y, z,
-                r.staticJson, DescribeDynamic(r, now), active ? "true" : "false"));
+                typeName, n, r.iid, typeName, SafeName(r.name), x, y, z,
+                r.identityJson, DescribeDynamic(r, now), active ? "true" : "false"));
             n++;
         }
 
@@ -259,9 +325,10 @@ namespace Overcooked2AI.Game
                         if (go == null)
                             continue;
                         var pos = go.transform.position;
-                        // 手上拿着什么 —— 优先服务端权威值, 客户端那份会晚一帧(见 ReadHeldItems)
-                        string held, heldC;
-                        ReadHeldItems(go, out held, out heldC);
+                        // 手上拿着什么(+ 那件容器里装了什么) —— 优先服务端权威值,
+                        // 客户端那份会晚一帧(见 ReadHeldItems)
+                        string held, heldC, heldHas;
+                        ReadHeldItems(go, out held, out heldC, out heldHas);
                         // **厨师归属哪个玩家** —— 这是决定用哪套键盘的唯一权威依据。
                         // 依据 ClientInputTransmitter.Setup(): iD = GetComponent<PlayerIDProvider>().GetID()
                         // Player.One → 键盘左半(SplitPadHost) → WASD
@@ -283,15 +350,172 @@ namespace Overcooked2AI.Game
                         if (chefCount > 0)
                             chefs.Append(",");
                         chefs.Append(string.Format(
-                            "{{\"id\":{0},\"seq\":{0},\"player\":\"{1}\",\"name\":\"{2}\",\"x\":{3:F2},\"y\":{4:F2},\"z\":{5:F2},\"held\":\"{6}\",\"heldc\":\"{7}\",{8}{9}{10}}}",
+                            "{{\"id\":{0},\"seq\":{0},\"player\":\"{1}\",\"name\":\"{2}\",\"x\":{3:F2},\"y\":{4:F2},\"z\":{5:F2},\"held\":\"{6}\",\"heldc\":\"{7}\",\"heldhas\":\"{8}\"{9}{10}{11}}}",
                             chefCount, player, SafeName(go.name), pos.x, pos.y, pos.z,
-                            held, heldC, control, inter, local));
+                            held, heldC, heldHas, control, inter, local));
                         chefCount++;
                     }
                 }
                 catch (Exception) { }
             }
             return "[" + chefs + "]";
+        }
+
+        /// <summary>**大厅/主界面里已加入的玩家名单** —— 数组, 每项 `{slot, local, name}`。
+        ///
+        /// ☠☠ **为什么必须有这个**(2026-09-15, 用户: "**需要去检查一下游戏本体的数据**"):
+        ///   `tools/joinp2.py` 的注释原来写着"大厅里有几个人在 `StartScreen` 读不到,
+        ///   要进对局才有 `PlayerControls`" —— **那句是错的**, 它让"要不要按 A 加入 P2"
+        ///   变成了一个只能靠猜的决定。而按 A 是**"加入下一个玩家"**(不是 toggle):
+        ///   猜错就会把 **P3 引进来**(用户实测)。所以这一条必须读准。
+        ///
+        /// 真正的名单在 `Team17.Online.ClientUserSystem.m_Users`
+        ///   (`overcooked_decomp/Team17.Online/ClientUserSystem.cs:36`):
+        ///     `public static FastList<User> m_Users = new FastList<User>(4);`
+        ///   (主机/权威视图是 `ServerUserSystem.m_Users`, 同签名, 作后备)
+        /// **铁证**: `GamepadEngagementManager.cs:92-105` —— 那正是"按 A 加入下一个玩家"的
+        ///   轮询器**自己**, 它先判 `ClientUserSystem.m_Users.Count < 4` 才允许 engage。
+        ///   也就是说"够不够人"这条判据, 我们和游戏用的是**同一个数据源**。
+        ///   `FrontendPlayerLobby.cs` 也到处读 `Count` 来渲染玩家槽位。
+        ///
+        /// 沿用 `ScanChefs` 的做法: 能读到就叫"读到了", 读不到就 `[]` ——
+        ///   ⚠ **Python 侧要靠"键在不在"区分"读不到"和"真的只有 0 人"**,
+        ///     所以 `[]` 在这里表示"没读到"(见 `engine`/`virtual_pad` 那边的守卫)。
+        ///
+        /// ⚠ 这是**每帧**都跑的路径(由 `StateCollector.Refresh` 调) ⇒ 反射查出来的
+        ///   `FieldInfo`/`PropertyInfo` **必须缓存**(同 `ItemKnowledge.ContentsMethod`
+        ///   那条教训: 不缓存就是拿帧率换新鲜度)。类型在一次会话里不变, 缓存安全。
+        /// </summary>
+        public static string ScanUsers()
+        {
+            var sb = new StringBuilder();
+            sb.Append("[");
+            int n = 0;
+            bool any = false;       // 有没有**成功读到**过名单(见下面 `return "null"`)
+            // 客户端视图优先(大厅 UI 读的就是它); 读不到再退到 ServerUserSystem。
+            foreach (var typeName in new[] { "Team17.Online.ClientUserSystem",
+                                             "Team17.Online.ServerUserSystem" })
+            {
+                if (!ResolveUserReflection(typeName))
+                    continue;
+                any = true;
+                try
+                {
+                    object list = _usersListField.GetValue(null);
+                    if (list == null)
+                        continue;
+                    // ⚠ **必须给两个参数** —— 目标是 .NET 2.0(`build.bat` 里 `FW=v2.0.50727`),
+                    //   那时 `PropertyInfo.GetValue(object)` 这个单参数重载**还不存在**
+                    //   (CS1501)。`PropStr`/`PropBool` 里也是这个写法。
+                    int cnt = (int)_usersCountProp.GetValue(list, null);
+                    var arr = _usersItemsField.GetValue(list) as Array;
+                    if (arr == null || cnt <= 0)
+                        continue;
+                    for (int i = 0; i < cnt && i < arr.Length && n < MaxUsersShown; i++)
+                    {
+                        object u = arr.GetValue(i);
+                        if (u == null)
+                            continue;
+                        if (n > 0)
+                            sb.Append(",");
+                        // ⚠ 片段自带前导逗号是给"插进别人 JSON"用的; 这里是一个**独立数组**,
+                        //   逗号必须由循环自己控制(上面那行), 别照抄字符串片段那套。
+                        sb.Append(string.Format(
+                            "{{\"slot\":\"{0}\",\"local\":{1},\"name\":\"{2}\"}}",
+                            SafeName(PropStr(_usersEngProp, u)),
+                            PropBool(_usersLocalProp, u) ? "true" : "false",
+                            SafeName(PropStr(_usersNameProp, u))));
+                        n++;
+                    }
+                    break;          // 读到了就不再翻后备
+                }
+                catch (Exception) { }
+            }
+            // ☠☠ **读不到必须与"0 人"区分开** —— 否则 Python 侧会把"读不到"当成
+            //   "大厅里没人", 于是去按 A ⇒ 而按 A 是"加入**下一个**玩家" ⇒ **引进 P3**。
+            //   所以两个类型**一个都没解析出来**时返回 `null`(不是 `[]`)。
+            if (!any)
+                return "null";
+            sb.Append("]");
+            return sb.ToString();
+        }
+
+        /// <summary>`on`/`ontags`/`onhas` 之外, **`users` 最多报几项**。
+        /// 和 `MaxOnShown` 同理: 上限只是别让一条状态撑爆, 这个列表本来就 ≤4。</summary>
+        public const int MaxUsersShown = 4;
+
+        /// <summary>`ScanUsers` 的反射句柄 —— **解析一次、全程复用**(见那边的注释)。
+        /// 只在**成功**时置 `_usersReady`, 否则下次还会重试(程序集可能还没加载完)。</summary>
+        private static bool _usersReady;
+        private static FieldInfo _usersListField;
+        private static PropertyInfo _usersCountProp;
+        private static FieldInfo _usersItemsField;
+        private static PropertyInfo _usersEngProp, _usersLocalProp, _usersNameProp;
+        private static string _usersTypeName = "";
+
+        private static bool ResolveUserReflection(string typeName)
+        {
+            if (_usersReady && _usersTypeName == typeName)
+                return true;
+            _usersReady = false;
+            try
+            {
+                var t = FindType(typeName);
+                if (t == null)
+                    return false;
+                var lf = t.GetField("m_Users",
+                                    BindingFlags.Public | BindingFlags.Static);
+                if (lf == null)
+                    return false;
+                var lt = lf.FieldType;                       // FastList<User>
+                var cnt = lt.GetProperty("Count");
+                var items = lt.GetField("_items");
+                if (cnt == null || items == null)
+                    return false;
+                var et = items.FieldType.GetElementType();   // User
+                if (et == null)
+                    return false;
+                var eng = et.GetProperty("Engagement");
+                var loc = et.GetProperty("IsLocal");
+                var nam = et.GetProperty("DisplayName");
+                if (eng == null || loc == null)
+                    return false;
+                _usersListField = lf;
+                _usersCountProp = cnt;
+                _usersItemsField = items;
+                _usersEngProp = eng;
+                _usersLocalProp = loc;
+                _usersNameProp = nam;                        // DisplayName 可能没有, 允许 null
+                _usersTypeName = typeName;
+                _usersReady = true;
+                return true;
+            }
+            catch (Exception) { }
+            return false;
+        }
+
+        private static string PropStr(PropertyInfo p, object o)
+        {
+            if (p == null)
+                return "";
+            try
+            {
+                object v = p.GetValue(o, null);
+                return v == null ? "" : v.ToString();
+            }
+            catch (Exception) { return ""; }
+        }
+
+        private static bool PropBool(PropertyInfo p, object o)
+        {
+            if (p == null)
+                return false;
+            try
+            {
+                object v = p.GetValue(o, null);
+                return v is bool && (bool)v;
+            }
+            catch (Exception) { return false; }
         }
 
         /// <summary>读厨师"现在能不能被指挥"(PlayerControls 的几个 public 成员)。
@@ -464,9 +688,18 @@ namespace Overcooked2AI.Game
                 }
                 catch (Exception) { }
 
+                // ⚠ **前导逗号必须在这里**(2026-09-15 补): 它是"插在别人 JSON 里的一段",
+                //   调用方(`ScanChefs` 的 `{9}`)因此**不能**再给它加字面逗号。
+                //   原来这里是 `"\"respawning\"…`, 而父格式串写的是 `,\"heldhas\":\"{8}\",{9}{10}{11}`
+                //   —— 两者**只有一边**提供逗号, 于是这个函数一旦走 `return ""`
+                //   (找不到 `PlayerControls` / 组件不在), 拼出来就是 `…,"heldhas":"X",,}`
+                //   ⇒ **整条厨师 JSON 报废**。这正是那条老教训的形状
+                //   (片段必须自带前导逗号; 漏了就编译干净、运行必炸), 只是换了个位置。
+                //   `inter`(`ReadInteraction`) / `local`(`ReadLocallyControlled`)
+                //   本来就是自带的, 只有这一个不是。
                 return string.Format(
                     System.Globalization.CultureInfo.InvariantCulture,
-                    "\"respawning\":{0},\"suppressed\":{1},\"scale\":{2:F2},\"canmove\":{3},"
+                    ",\"respawning\":{0},\"suppressed\":{1},\"scale\":{2:F2},\"canmove\":{3},"
                     + "\"canpress\":{4},\"impacted\":{5},\"wind\":{{\"ok\":{6},\"vx\":{7:F2},\"vz\":{8:F2}}},"
                     + "\"run\":{9:F2},\"alignx\":\"{10}\",\"aligny\":\"{11}\"",
                     respawning ? "true" : "false",
@@ -629,13 +862,81 @@ namespace Overcooked2AI.Game
         ///   ⚠ `Plate` 是自定义 tag(不是内置的), 由游戏的 TagManager 定义 ——
         ///     `FindGameObjectsWithTag` 对它有效; tag 不存在时下面那圈 try/catch 会跳过。
         /// </summary>
+        /// <summary>**这件东西现在挂在哪** —— 往上走父链, 报出"在哪个台面上"和"谁拿着"。
+        ///
+        /// 用户 2026-09-15:
+        ///   > "地图上预制体的位置、台面和台面上内容物**都需要包括灶台上的锅和地上的**,
+        ///   >  这样交给**可行性检查**会更可信。"
+        ///
+        /// 为什么必须问游戏(规则 2): "在灶上 / 在地上 / 在谁手上"是**游戏自己的挂载关系** ——
+        ///   我们原来靠"离某个台面 0.6 格以内"猜(`KitchenMap.cooking_on`, `map_model.py:641`),
+        ///   三种情况**在数据上分不开**; 锅放在灶台边上、或者被端在手上, 都会被猜成"在灶上"。
+        ///   而"这一步要用的容器在不在这关/在哪/够不够得着"正是可行性检查要回答的。
+        ///
+        /// 判据(自底向上, 最多 `MaxMountDepth` 层, 不猜几何):
+        ///   · 祖先里出现**台面那套组件**(`StationTypes` 里任意一个) ⇒ `mount` = 那个物体的名字;
+        ///   · 祖先里出现 `PlayerControls` ⇒ `carrier` = 那个厨师的名字;
+        ///   · 都没有 ⇒ 两个都空 = **自由对象**(在地上/在台面外的空间里)。
+        /// ⚠ 只报**名字**, 不报坐标 —— 坐标由调用方自己读(`ScanItems` 报的是**物品自己**的位置)。
+        /// ⚠ 台面自己不该被当成"挂在自己身上": 所以从**父节点**开始走。
+        /// </summary>
+        private const int MaxMountDepth = 6;
+
+        private static void MountOf(GameObject go, out string mount, out string carrier)
+        {
+            mount = "";
+            carrier = "";
+            if (go == null)
+                return;
+            try
+            {
+                var t = go.transform.parent;
+                for (int d = 0; t != null && d < MaxMountDepth; d++, t = t.parent)
+                {
+                    var p = t.gameObject;
+                    if (p == null)
+                        break;
+                    if (carrier.Length == 0 && FindType("PlayerControls") != null
+                        && p.GetComponent(FindType("PlayerControls")) != null)
+                        carrier = SafeName(p.name);
+                    if (mount.Length == 0)
+                    {
+                        for (int i = 0; i < StationTypes.Length; i++)
+                        {
+                            if (IsVolatile(StationTypes[i]))
+                                continue;
+                            var st = FindType(StationTypes[i]);
+                            if (st == null)
+                                continue;
+                            try
+                            {
+                                if (p.GetComponent(st) != null) { mount = SafeName(p.name); break; }
+                            }
+                            catch (Exception) { }
+                        }
+                    }
+                    if (mount.Length > 0 && carrier.Length > 0)
+                        break;
+                }
+            }
+            catch (Exception) { }
+        }
+
         public static string ScanItems()
         {
             var sb = new StringBuilder();
             sb.Append("[");
             int n = 0;
             var seen = new Dictionary<int, int>();
-            foreach (var tag in new string[] { "Pre-Ingredient", "Ingredient", "Plate" })
+            // ☠☠ **`CookingUtensil` 也在列** —— 用户 2026-09-15:
+            //   "地图上预制体的位置、台面和台面上内容物**都需要包括灶台上的锅和地上的**,
+            //    这样交给可行性检查会更可信。"
+            //   锅/平底锅原来**只以名字**出现在灶台的 `on` 列表里(没有位置、没有挂载点),
+            //   而 `ScanItems` 又只扫这三个"食材"tag ⇒ **地上的锅完全不可见**,
+            //   灶上的锅也没有坐标。于是"这一步要用的容器在不在这关/在哪/够不够得着"
+            //   全都判不了(`cooking_on` 是靠 0.6 格距离**猜**的)。
+            foreach (var tag in new string[] { "Pre-Ingredient", "Ingredient", "Plate",
+                                               "CookingUtensil" })
             {
                 GameObject[] objs = null;
                 try { objs = GameObject.FindGameObjectsWithTag(tag); }
@@ -650,23 +951,198 @@ namespace Overcooked2AI.Game
                     if (seen.ContainsKey(iid))
                         continue;
                     seen[iid] = 1;
-                    float x, z;
+                    float x, z, y = 0f;
                     try
                     {
                         var pos = go.transform.position;
-                        x = pos.x; z = pos.z;
+                        x = pos.x; z = pos.z; y = pos.y;
                     }
                     catch (Exception) { continue; }
+                    // **这件东西还能不能被加工**(= 生料还是成品)。用途: "交出去的那份料
+                    // 回来了没有"要按**实例**判阶段 —— 完成时 GameObject 会被 m_nextPrefab
+                    // 替换, 所以**成品实例身上没有 next**。
+                    // ☠ **不能用 Unity Tag 判** —— 实测同一关里生虾是 Ingredient、生鱼却是
+                    //   Pre-Ingredient(见 neko/cookbook.py 里 raw_for 的注释), 靠 tag 会漏。
+                    // ☠ 也不能靠**名字查知识表** —— "生料和成品同名"那一族
+                    //   (`SushiFish --切8次--> SushiFish`) 表里是两条同名记录, 分不出是哪个。
+                    // 反射整段照抄 ItemKnowledge.One 里那段(同一套 FindType/GetComponent + try/catch)。
+                    // ★ **这件东西现在挂在哪** —— 用户 2026-09-15:
+                    //   "台面和台面上内容物**都需要包括灶台上的锅和地上的**"。
+                    //   有了这两个字段, "在灶上 / 在地上 / 在谁手上"三态才分得开 ——
+                    //   原来全靠"离某个台面 0.6 格以内"猜(`KitchenMap.cooking_on`)。
+                    string mount = "", carrier = "";
+                    try { MountOf(go, out mount, out carrier); }
+                    catch (Exception) { }
+                    bool work = false;
+                    try
+                    {
+                        var wt = FindType("WorkableItem");
+                        if (wt != null)
+                        {
+                            var wi = go.GetComponent(wt);
+                            if (wi != null)
+                            {
+                                var gm = wt.GetMethod("GetNextPrefab");
+                                if (gm != null)
+                                    work = gm.Invoke(wi, null) != null;
+                            }
+                        }
+                    }
+                    catch (Exception) { }
                     if (n > 0)
                         sb.Append(",");
                     sb.Append(string.Format(
                         System.Globalization.CultureInfo.InvariantCulture,
-                        "{{\"name\":\"{0}\",\"tag\":\"{1}\",\"x\":{2:F2},\"z\":{3:F2}}}",
-                        SafeName(go.name), SafeName(tag), x, z));
+                        "{{\"name\":\"{0}\",\"tag\":\"{1}\",\"x\":{2:F2},\"z\":{3:F2},\"work\":{4},\"on\":\"{5}\",\"carrier\":\"{6}\",\"y\":{7:F2}}}",
+                        SafeName(go.name), SafeName(tag), x, z, work ? "true" : "false",
+                        SafeName(mount), SafeName(carrier), y));
                     n++;
                 }
             }
             sb.Append("]");
+            return sb.ToString();
+        }
+
+        /// <summary>**搅拌进度** —— 形状**照抄 `ScanCooking`**, 因为它就是同一件事:
+        /// 一个"带进度/需时/状态/内容物"的容器挂在某张台面上。
+        ///
+        /// 用户 2026-09-15:
+        ///   > "**不只是锅, 其他一样的, 搅拌器, 烤箱, 平底锅**"
+        ///
+        /// ☠ 为什么原来完全没有: 搅拌器身上是 **`MixingHandler`**, **不是 `CookingHandler`** ⇒
+        ///   它**根本不在 `cooking` 那一份里** ⇒ "里面有什么、搅了多久"**全看不见**。
+        ///   而过搅会**毁菜**, 依据(反编译, 规则 1):
+        ///     · `ServerMixingHandler.cs:56` —— `_mixingProgress > 1.3f * m_mixingTime`
+        ///       ⇒ `CookingUIController.State.OverDoing`(**这就是"报警"**, 和锅的 OverDoing 同一个状态);
+        ///     · `MixingHandler.cs:16` —— `_mixingProgress > 2f * m_mixingTime`
+        ///       ⇒ `MixingProgress.OverMixed`(**ruined**)。
+        ///   ⇒ 和锅的 `>1×`报警 / `>2×`烧糊**结构完全一样**, 只是报警阈值是 **1.3 倍**。
+        ///
+        /// 字段(来源都是游戏自己的公开面):
+        ///   · `prog` = `ServerMixingHandler.GetMixingProgress()`
+        ///   · `need` = `ServerMixingHandler.AccessMixingTime` → `MixingHandler.m_mixingTime`
+        ///   · `state` = `ServerMixingHandler.GetMixedOrderState()` → Unmixed/Mixed/OverMixed
+        ///   · `in`   = 容器里装了什么(和锅一样靠 `ItemKnowledge.ContentsNames`)
+        ///   · `cookId`/`cookName` = `MixingHandler.m_mixingType`(`CookingStepData`, 同 `cookId` 家族)
+        ///   · `on`/`carrier` = 挂在哪 / 谁拿着(和 `ScanItems` 同一套 `MountOf`)
+        /// ⚠ **`cooking` 那一条一个字都不改** —— 新开一份 `mixing`, 由 Python 侧合并
+        ///   (改老字段会牵动已经在跑的判据)。
+        /// </summary>
+        public static string ScanMixing()
+        {
+            var sb = new StringBuilder();
+            int n = 0;
+            var mt = FindType("ClientMixingHandler");
+            if (mt == null)
+                mt = FindType("MixingHandler");
+            if (mt == null)
+                return "";                          // 这关没有搅拌器
+            // `GetMixingHandler()` 拿到的是那个带 `m_mixingTime` 的组件; 优先用它读配置
+            Type mhType = null;
+            try
+            {
+                var gm = mt.GetMethod("GetMixingHandler");
+                if (gm != null)
+                    mhType = gm.ReturnType;
+            }
+            catch (Exception) { }
+            if (mhType == null)
+                mhType = FindType("MixingHandler");
+
+            try
+            {
+                var objs = UnityEngine.Object.FindObjectsOfType(mt);
+                foreach (var o in objs)
+                {
+                    if (o == null)
+                        continue;
+                    var go = GetGameObject(o);
+                    if (go == null)
+                        continue;
+
+                    float prog = 0f, need = 0f;
+                    string state = "";
+                    try
+                    {
+                        var m = mt.GetMethod("GetMixingProgress");
+                        if (m != null)
+                            prog = (float)m.Invoke(o, null);
+                    }
+                    catch (Exception) { }
+                    try
+                    {
+                        var m = mt.GetMethod("GetMixedOrderState");
+                        if (m != null)
+                        {
+                            var v = m.Invoke(o, null);
+                            state = v == null ? "" : v.ToString();
+                        }
+                    }
+                    catch (Exception) { }
+                    // `m_mixingTime` 声明在 `MixingHandler` 上(`MixingHandler.cs:6`), 不是 Server 那份
+                    try
+                    {
+                        object mh = o;
+                        var gm = mt.GetMethod("GetMixingHandler");
+                        if (gm != null)
+                            mh = gm.Invoke(o, null);
+                        if (mh != null && mhType != null)
+                        {
+                            var hf = mhType.GetField("m_mixingTime");
+                            if (hf != null)
+                                need = (float)hf.GetValue(mh);
+                        }
+                    }
+                    catch (Exception) { }
+
+                    string inside = "";
+                    try { inside = ItemKnowledge.ContentsNames(go); }
+                    catch (Exception) { }
+                    string tag = "";
+                    try { tag = go.tag; }
+                    catch (Exception) { }
+                    // **要哪种搅拌方式**(和 `cookId` 同一个家族, 见 `CookableProperties` 那条)
+                    int cookId = 0;
+                    string cookName = "";
+                    try
+                    {
+                        object mh = o;
+                        var gm = mt.GetMethod("GetMixingHandler");
+                        if (gm != null)
+                            mh = gm.Invoke(o, null);
+                        if (mh != null && mhType != null)
+                        {
+                            var tf = mhType.GetField("m_mixingType");
+                            var step = tf != null ? tf.GetValue(mh) : null;
+                            if (step != null)
+                            {
+                                var so = step as UnityEngine.Object;
+                                if (so != null)
+                                    cookName = SafeName(so.name);
+                                var f = step.GetType().GetField("m_uID");
+                                if (f != null)
+                                    cookId = Convert.ToInt32(f.GetValue(step));
+                            }
+                        }
+                    }
+                    catch (Exception) { }
+                    // 挂在哪 / 谁拿着 —— 和 `ScanItems` **同一套**(别另写一份)
+                    string mount = "", carrier = "";
+                    try { MountOf(go, out mount, out carrier); }
+                    catch (Exception) { }
+                    var pos = go.transform.position;
+                    if (n > 0)
+                        sb.Append(",");
+                    sb.Append(string.Format(
+                        System.Globalization.CultureInfo.InvariantCulture,
+                        "{{\"name\":\"{0}\",\"ing\":\"{1}\",\"in\":\"{2}\",\"tag\":\"{3}\",\"prog\":{4:F1},\"need\":{5:F1},\"state\":\"{6}\",\"burning\":false,\"station\":\"\",\"x\":{7:F2},\"z\":{8:F2},\"cookId\":{9},\"cookName\":\"{10}\",\"on\":\"{11}\",\"carrier\":\"{12}\",\"kind\":\"mix\"}}",
+                        SafeName(go.name), "", SafeName(inside), SafeName(tag),
+                        prog, need, SafeName(state), pos.x, pos.z, cookId, cookName,
+                        SafeName(mount), SafeName(carrier)));
+                    n++;
+                }
+            }
+            catch (Exception) { }
             return sb.ToString();
         }
 
@@ -747,14 +1223,52 @@ namespace Overcooked2AI.Game
                     string inside = "";
                     try { inside = ItemKnowledge.ContentsNames(go); }
                     catch (Exception) { }
+                    // ☠☠ **这个容器"是哪种加热方式"** —— 它就是游戏拒收那道菜的**权威判据**。
+                    //
+                    // 依据(反编译, 规则 1):
+                    //   `CookableContainer.cs:44-60` `AllowItemPlacement(_object, _ctx, _handler)`:
+                    //       var cp = _object.RequestComponent<CookableProperties>();
+                    //       if (cp == null || !cp.AllowsCookingStep(_handler.AccessCookingType))
+                    //           return false;
+                    //   而 `CookableProperties.cs:11-13` 的判据是**比 `m_uID`**:
+                    //       Array.FindIndex(AllowedCookingSteps, x => x.m_uID == _stepData.m_uID) != -1
+                    //   `AccessCookingType`(=`CookingHandler.m_cookingType`, `CookingHandler.cs:9`)
+                    //   是个 `CookingStepData`(ScriptableObject), 身份就是 `CookingStepData.m_uID`。
+                    // ⇒ **食材能进哪个容器 ⇔ 食材的 `AllowedCookingSteps` 里有没有这个 `m_uID`。**
+                    //   两边都是**运行时读的同一个整数**, 不需要跨会话稳定, 直接比就行。
+                    //
+                    // 为什么必须报出来(用户 2026-09-15): `s_mine_2_5` 里米被拿去用了
+                    //   **煮切过的肉**那口平底锅 —— 引擎只知道"要装进容器", 不知道该装哪个,
+                    //   于是挑"最近那口有锅的灶台"。游戏当场拒收(`placeCanHandle=false`)。
+                    // ⚠ 空锅也有 `CookingHandler`(进度 0), 所以**这一条对空锅同样有效** ——
+                    //   `_pick_stove` 正是在"空锅"上做选择, 这个字段就是为那一步准备的。
+                    // ⚠ 名字只为**日志/离线**可读; **判据只用 `m_uID`**(名字可能重复或为空)。
+                    int cookId = 0;
+                    string cookName = "";
+                    try
+                    {
+                        var p = ct.GetProperty("AccessCookingType");
+                        var step = p != null ? p.GetValue(o, null) : null;
+                        if (step != null)
+                        {
+                            var st2 = step as UnityEngine.Object;
+                            if (st2 != null)
+                                cookName = SafeName(st2.name);
+                            var f = step.GetType().GetField("m_uID");
+                            if (f != null)
+                                cookId = Convert.ToInt32(f.GetValue(step));
+                        }
+                    }
+                    catch (Exception) { }
                     if (n > 0)
                         sb.Append(",");
                     sb.Append(string.Format(
-                        "{{\"name\":\"{0}\",\"ing\":\"{1}\",\"in\":\"{2}\",\"tag\":\"{3}\",\"prog\":{4:F1},\"need\":{5:F1},\"state\":\"{6}\",\"burning\":{7},\"station\":\"{8}\",\"x\":{9:F2},\"z\":{10:F2}}}",
+                        System.Globalization.CultureInfo.InvariantCulture,
+                        "{{\"name\":\"{0}\",\"ing\":\"{1}\",\"in\":\"{2}\",\"tag\":\"{3}\",\"prog\":{4:F1},\"need\":{5:F1},\"state\":\"{6}\",\"burning\":{7},\"station\":\"{8}\",\"x\":{9:F2},\"z\":{10:F2},\"cookId\":{11},\"cookName\":\"{12}\"}}",
                         SafeName(go.name), SafeName(ItemKnowledge.IngredientName(go)),
                         SafeName(inside), SafeName(tag),
                         prog, need, SafeName(state), burning ? "true" : "false",
-                        SafeName(station), pos.x, pos.z));
+                        SafeName(station), pos.x, pos.z, cookId, cookName));
                     n++;
                 }
             }
@@ -765,6 +1279,139 @@ namespace Overcooked2AI.Game
         /// <summary>全量清单: 枚举场景里所有带 Collider 的物体及其"游戏自定义组件"。
         /// 用途: 不靠预设类型名猜台子种类, 一次看清某关到底有哪些组件(如 CleanPlateStack/Stack/PlateStation)。
         /// 过滤掉 UnityEngine.* 命名空间的组件, 只留 Assembly-CSharp / Team17.* 等游戏类型。</summary>
+        /// <summary>把一个组件的**全部字段**摊出来(名字 + 值)。
+        ///
+        /// 用户 2026-09-15: "**让 mod 多扒一点信息下来, 别这么吝啬, 有的信息全拔下来**"。
+        ///
+        /// 为什么值得(这一条比"多读几个字段"重要得多): 我们一直在**手挑字段** ——
+        ///   `m_stationType` / `m_stages` / `m_itemPrefab` / `AllowedCookingSteps` /
+        ///   `m_cookingType` / `m_exitPortal`… 每遇到一个新机制, 都要先**猜**"该读哪个",
+        ///   猜错了就是白烧一局实机(而一局要人工开、150 秒)。就在今天, "米该进哪口锅"
+        ///   这件事就花了两个来回(`CookableProperties.AllowsCookingStep` 那条判据)。
+        ///   **全摊出来**之后, 新关卡/新机制只要 dump 一次就看得见, 不用再猜。
+        ///
+        /// ⚠ 这是**诊断口**(`raw` 命令), **不在每帧路径上** ⇒ 宽一点没关系。
+        /// ⚠ 但**必须有上限**: 桥是"一行一个 JSON", 无界 dump 会把整条连接撑爆。
+        ///   所以: 数组只取前 `MaxFieldItems` 项、字符串截断、每个组件最多
+        ///   `MaxFieldsPerComp` 个字段 —— **宁可少, 不可断**。
+        /// ⚠ 值只做**一层**展开(数组/List 的元素会再取一层), 不做深递归:
+        ///   游戏对象互相引用成环, 深递归会死循环。
+        ///   `UnityEngine.Object` 一律只报**名字** —— 那正是我们要看的东西
+        ///   (`m_itemPrefab` 报出 "SushiRice" 这种, 比一串实例 id 有用得多)。
+        /// </summary>
+        private static void AppendFields(StringBuilder sb, Component c)
+        {
+            sb.Append("{\"type\":\"").Append(SafeName(c.GetType().Name)).Append("\",\"fields\":{");
+            int k = 0;
+            try
+            {
+                var flds = c.GetType().GetFields(
+                    System.Reflection.BindingFlags.Instance
+                    | System.Reflection.BindingFlags.Public
+                    | System.Reflection.BindingFlags.NonPublic);
+                for (int i = 0; i < flds.Length && k < MaxFieldsPerComp; i++)
+                {
+                    var f = flds[i];
+                    if (f.IsStatic)
+                        continue;
+                    string val;
+                    try { val = FieldValue(f.GetValue(c), 0); }
+                    catch (Exception) { val = "\"<读不到>\""; }
+                    if (k > 0)
+                        sb.Append(",");
+                    sb.Append("\"").Append(SafeName(f.Name)).Append("\":").Append(val);
+                    k++;
+                }
+            }
+            catch (Exception) { }
+            sb.Append("}}");
+        }
+
+        private const int MaxFieldsPerComp = 40;
+        private const int MaxFieldItems = 10;
+        private const int MaxStrLen = 60;
+
+        private static string Trunc(string s)
+        {
+            s = s ?? "";
+            return s.Length <= MaxStrLen ? s : s.Substring(0, MaxStrLen) + "…";
+        }
+
+        /// <summary>把一个字符串安全地塞进 JSON(转义 + 拍平控制字符)。
+        ///
+        /// ☠☠ **`SafeName` 不够** —— 它只把 `"` 换成 `'`, 而 **`\`、换行、制表符**
+        ///   在 JSON 字符串里都是**非法**的: 裸 `\` 后面跟个 `U`(如 `C:\Users`)
+        ///   直接让整行解析失败, 一个换行符更会把"一行一个 JSON"的协议**撕开**。
+        ///   物体名/字段名里从来不会出现这些, 所以一直没暴露; 但 `AppendFields` 喂的是
+        ///   **任意 `ToString()` 的输出** —— 那就什么都可能有了。
+        ///   (2026-09-15 已经因为**少一个逗号**废掉过一整局, 这条比那个更容易踩。)
+        /// </summary>
+        private static string JsonStr(string s)
+        {
+            if (string.IsNullOrEmpty(s))
+                return "";
+            var sb = new StringBuilder(s.Length + 8);
+            foreach (char ch in s)
+            {
+                switch (ch)
+                {
+                    case '"': sb.Append('\''); break;      // 与 `SafeName` 同风格: 换成单引号
+                    case '\\': sb.Append('/'); break;      // 反斜杠换斜杠 —— 路径照样看得懂
+                    case '\n': case '\r': case '\t': sb.Append(' '); break;
+                    default: sb.Append(ch < ' ' ? ' ' : ch); break;
+                }
+            }
+            return sb.ToString();
+        }
+
+        private static string Quote(string s)
+        {
+            return "\"" + JsonStr(Trunc(s)) + "\"";
+        }
+
+        /// <summary>把一个字段值渲染成 JSON 里能放的东西(见 `AppendFields` 的注释)。</summary>
+        private static string FieldValue(object v, int depth)
+        {
+            if (v == null)
+                return "null";
+            if (v is string)
+                return Quote((string)v);
+            if (v is bool)
+                return ((bool)v) ? "true" : "false";
+            if (v is Enum)
+                return Quote(v.ToString());          // 枚举报**名字**(Oven/Hob/Fried…)
+            var uo = v as UnityEngine.Object;
+            if (uo != null)
+                return Quote(SafeName(uo.name));     // 资产/物体引用 → **名字**
+            var t = v.GetType();
+            if (t.IsPrimitive)
+                return Convert.ToString(v, System.Globalization.CultureInfo.InvariantCulture);
+            var en = v as System.Collections.IEnumerable;
+            if (en != null && depth < 2)
+            {
+                var inner = new StringBuilder();
+                int k = 0;
+                bool more = false;
+                try
+                {
+                    foreach (var e in en)
+                    {
+                        if (e == null)
+                            continue;
+                        if (k >= MaxFieldItems) { more = true; break; }
+                        if (k > 0)
+                            inner.Append(",");
+                        inner.Append(FieldValue(e, depth + 1));
+                        k++;
+                    }
+                }
+                catch (Exception) { }
+                return "[" + inner + (more ? ",\"…\"" : "") + "]";
+            }
+            // 其它一律 `ToString()` 截断 —— **不深递归**(会顺着引用成环)
+            return Quote(Trunc(v.ToString()));
+        }
+
         public static string ScanRaw()
         {
             var sb = new StringBuilder();
@@ -788,7 +1435,8 @@ namespace Overcooked2AI.Game
 
                     var comps = go.GetComponents(typeof(Component));
                     var names = new StringBuilder();
-                    int cn = 0;
+                    var full = new StringBuilder();      // ★ 全字段(见 AppendFields)
+                    int cn = 0, fn = 0;
                     foreach (var c in comps)
                     {
                         if (c == null)
@@ -800,7 +1448,11 @@ namespace Overcooked2AI.Game
                         if (cn > 0)
                             names.Append(",");
                         names.Append("\"").Append(SafeName(t.Name)).Append("\"");
-                        cn++;
+                        // ★ **别吝啬**: 每个游戏组件把**全部字段**摊出来。理由见 `AppendFields`。
+                        if (fn > 0)
+                            full.Append(",");
+                        AppendFields(full, c);
+                        cn++; fn++;
                     }
                     if (cn == 0)
                         continue;
@@ -812,10 +1464,12 @@ namespace Overcooked2AI.Game
 
                     if (n > 0)
                         sb.Append(",");
+                    // ⚠ `comps` 保持**原样**(数组 of 名字) —— 别的工具在吃它, 别改形状。
+                    //   全字段挂在**新键** `compsFull` 上(纯新增, 谁都不受影响)。
                     sb.Append(string.Format(
-                        "{{\"i\":{0},\"name\":\"{1}\",\"tag\":\"{2}\",\"x\":{3:F2},\"y\":{4:F2},\"z\":{5:F2},\"comps\":[{6}],{7},{8}}}",
+                        "{{\"i\":{0},\"name\":\"{1}\",\"tag\":\"{2}\",\"x\":{3:F2},\"y\":{4:F2},\"z\":{5:F2},\"comps\":[{6}],\"compsFull\":[{9}],{7},{8}}}",
                         n, SafeName(go.name), SafeName(tag), pos.x, pos.y, pos.z, names,
-                        ReadContent(go), ReadSpawn(go)));
+                        ReadContent(go), ReadSpawn(go), full));
                     n++;
                 }
             }
@@ -1063,15 +1717,72 @@ namespace Overcooked2AI.Game
             return false;
         }
 
-        /// <summary>给一个台面物体建缓存记录 —— 只有身份是"算一次"的, 坐标不存(每帧现读)。</summary>
+        /// <summary>给一个台面物体建缓存记录 —— **只存结构事实**(引用 / iid / 名字 / 挂点)。
+        ///
+        /// ☠☠ **身份不在这里算** —— 那正是本轮改掉的东西。这里原来会
+        ///   `r.staticJson = DescribeStatic(go, typeName)`, 于是身份跟着缓存一起吃 5 秒
+        ///   (`StaticRescanInterval`), 而运行期真的会变: 见 `Reclassify` 的长注释。
+        ///   现在身份由 `AppendRef` **每帧**重算。
+        /// ⚠ 坐标本来就不存(锅会被端走、可推物体会动), 现在连身份也不存了 ——
+        ///   这个类里剩下的全是"物体活着就不会变"的东西。
+        /// </summary>
         private static StationRef MakeRef(GameObject go, string typeName)
         {
-            var r = new StationRef { go = go, typeName = typeName, name = go.name };
+            var r = new StationRef { go = go, hint = typeName, name = go.name };
             try { r.iid = go.GetInstanceID(); } catch (Exception) { }
-            try { r.tag = go.tag; } catch (Exception) { }
             r.attach = AttachPointOf(go);
-            r.staticJson = DescribeStatic(go, typeName);
             return r;
+        }
+
+        /// <summary>**这个物体现在是什么台面** —— 每帧重判, 不看缓存。
+        ///
+        /// ☠☠ 为什么"台面身份"不能缓存(2026-09-15 用户原话:
+        ///   "**台面身份千万别缓冲, 这一块需要实时的**")。反编译里有**两处**确凿依据:
+        ///
+        ///   ① `ServerFlamethrowerSpray.cs:70` —— 火焰喷到一个台面上时
+        ///      `attachStation.gameObject.AddComponent&lt;CookingStation&gt;()`,
+        ///      紧接着 `:71` `stationSmouldering.Cooker.m_stationType =
+        ///      CookingStationType.Flamethrower`
+        ///      ⇒ 那个台面**当场从"普通台面"变成一台火炬灶**, 而缓存里还是老身份
+        ///      (Python 侧按 `typeName`/`sub` 落到 `_STATION_SEM`, 于是把它当普通台面);
+        ///   ② `ClientSessionInteractable.cs:101` `m_session = BuildSession(_avatar)` /
+        ///      `:108` `m_session = null` —— **上车/下车**时赋值
+        ///      ⇒ 遥感台那句"现在是不是正在驾驶"是**纯运行态**, 见 `DescribeIdentity`。
+        ///
+        /// 缓存 5 秒 ⇒ 这 5 秒里引擎**把平台当厨师开**(navigate 发移动键 → 平台乱跑、
+        /// 卡住检测误判、侧移脱困 → 更乱)、**把火炬台当普通台面**。
+        ///   这正是本项目最贵的那类错 —— "**假'能'的代价是执行一个错的物理动作**"。
+        ///
+        /// ⚠ **优先级顺序必须和 `EnsureStationCache` 那轮发现完全一致**
+        ///   (`StationTypes` 的先后就是优先级: 派生类在前)。否则同一个物体会在
+        ///   "发现时叫 A、每帧叫 B"之间来回抖, 而 `id` 前缀就是类型名 ⇒ **id 跟着抖**
+        ///   ⇒ Python 侧按 id 建的索引(`_spot_now`/`assemble_spot`)整片失效。
+        /// ⚠ **易变类型**(火/油渍/可推物体)在 `ScanStations` ② 里每帧另扫, 这里
+        ///   **跳过**(和发现那轮一致) —— 它们认不出来, 落到 `hint` 兜底。
+        /// ⚠ 代价: 每帧对**已经在手里的** ~N 个物体各做几次 `GetComponent`。
+        ///   它和那轮发现**不是一个数量级** —— 发现是 20 次 `FindObjectsOfType`
+        ///   (**全场景遍历**), 这里是已知物体上的**组件查找**。实测数见 `IdentityMs`。
+        /// </summary>
+        private static string Reclassify(GameObject go, string hint)
+        {
+            if (go == null)
+                return hint;
+            for (int i = 0; i < StationTypes.Length; i++)
+            {
+                string tn = StationTypes[i];
+                if (IsVolatile(tn))
+                    continue;                  // 每帧另扫, 见 ScanStations ②
+                var type = FindType(tn);
+                if (type == null)
+                    continue;
+                try
+                {
+                    if (go.GetComponent(type) != null)
+                        return tn;
+                }
+                catch (Exception) { }
+            }
+            return hint;
         }
 
         /// <summary>按名字反射读一个字段, 读不到返回 null(不抛)。
@@ -1268,7 +1979,26 @@ namespace Overcooked2AI.Game
 
         /// <summary>台面的**身份**部分(tag / sub / spawn / plate) —— 只在建缓存时算一次。
         /// 内容(`ing`/`n`/`on`/`ontags`/`onhas`)见 DescribeDynamic()。</summary>
-        private static string DescribeStatic(GameObject go, string typeName)
+        /// <summary>**身份**片段(tag/sub/spawn/plate/session…) —— **每帧现读, 不许缓存**。
+        ///
+        /// ☠☠ 它原来叫 `DescribeStatic`, 结果被塞进 `StationRef.staticJson` 缓存 5 秒。
+        ///   改名的理由就是"名字别把意图写成结果": 这里面**混着运行态**
+        ///   (`session` 是"现在是不是正在驾驶")。
+        ///
+        /// 为什么必须实时(用户 2026-09-15: "台面身份千万别缓冲, 这一块需要实时的"):
+        ///   · `ServerFlamethrowerSpray.cs:70-71` —— 运行期给已有台面
+        ///     `AddComponent&lt;CookingStation&gt;()` 并改 `m_stationType`
+        ///     ⇒ **类型名和 `sub` 当场就变**(所以调用方得先 `Reclassify`);
+        ///   · `ClientSessionInteractable.cs:101/108` —— 上车/下车写 `m_session`
+        ///     ⇒ `session` 是纯运行态。
+        ///   ⚠ 这个文件已经为**内容**(`ing`/`n`/`on`/`ontags`/`onhas`)做过同一次搬家
+        ///     (见下面那段"已经搬到 DescribeDynamic"的注释) —— 本轮补的是**身份**那一半。
+        ///
+        /// ⚠ 这里剩下的 `exitPortal`/`land`/`arc`/`cooldown`/`recvDelay`/`spawn`/`plate`
+        ///   在反编译里**没有**找到运行期写入(是 prefab/序列化配置), 但既然身份整体
+        ///   改成每帧算了, 就**一起现读** —— 省得以后再判一次"这个到底会不会变"。
+        /// </summary>
+        private static string DescribeIdentity(GameObject go, string typeName)
         {
             var sb = new StringBuilder();
 
@@ -1318,6 +2048,13 @@ namespace Overcooked2AI.Game
             //   而"退出"用的正是交互键, 所以 `interact()` 在会话中等于**踩刹车**。
             //
             // 信号是现成的公开属性: `ClientSessionInteractable.HasSession => m_session != null`。
+            //
+            // ☠☠ **这一条就是"身份不能缓存"最直接的证据** —— `m_session` 在
+            //   `ClientSessionInteractable.cs:101`(BuildSession, 上车)与 `:108`(= null, 下车)
+            //   被赋值, 是**纯运行态**。而它原来躺在 5 秒缓存的 `staticJson` 里
+            //   ⇒ 用户按下交互键上了驾驶台之后, 引擎**最多 5 秒后才知道**,
+            //   这 5 秒里它以为厨师还能走, 于是把平台当厨师开。
+            //   (用户 2026-09-15: "台面身份千万别缓冲, 这一块需要实时的"。)
             if (typeName == "Terminal")
             {
                 try
@@ -1434,9 +2171,12 @@ namespace Overcooked2AI.Game
             }
             catch (Exception) { }
 
-            // ⚠ `ing` 和 `n/on/ontags/onhas` **已经搬到 DescribeDynamic()** ——
-            //   它们是动态内容(每帧在变), 留在"只算一次"的静态部分里就等于
-            //   又变回"1 秒前的世界"。这里只留身份: tag / sub / spawn / plate。
+            // ⚠ 到这里为止的内容**全部每帧现读**(调用方 `AppendRef` 每帧调一次)。
+            //   历史: `ing` / `n/on/ontags/onhas` 先是搬去了 `DescribeDynamic()`
+            //   (它们是内容, 会每帧变); 本轮把**身份**(tag / sub / spawn / plate /
+            //   session / 传送门那一组)也改成每帧 —— 依据见本函数的头注释。
+            //   ⇒ 现在这个名字叫 `DescribeIdentity`, 不再叫 `DescribeStatic`:
+            //     **名字别把意图写成结果**(这个文件里为这条踩过好几次)。
 
             // 盘子堆提供哪种容器(PlateStackBase.GetPlatingStep → 对比订单的 m_platingStep)
             if (typeName == "CleanPlateStack" || typeName == "DirtyPlateStack"
@@ -1489,25 +2229,56 @@ namespace Overcooked2AI.Game
         ///
         /// 两份都返回, 便于发现"客户端滞后"这类问题。
         /// </summary>
+        /// <summary>厨师手上拿着什么, 以及**手上那件容器里装了什么**。
+        ///
+        /// ☠☠ `heldHas` 是 2026-09-15 加的(用户实机描述的现象):
+        ///   > "脚本拿着食材去盘子那, 放上盘子**被我拿着并且重新放一个空盘子**,
+        ///   >  脚本会拿着**空盘子**去提交。"
+        ///
+        ///   根因: 插件原来只报 `held`(`equipment_plate_01 (3)`)—— **只有名字, 没有内容**
+        ///   ⇒ Python 侧唯一能做的核对是 `_is_plate(held)`, 而**空盘和装好的菜
+        ///   在它眼里一模一样**。于是"端起来之后"这一段完全没有判据可用:
+        ///     · `_deliver_plate` 送出前只知道"手上是个盘子";
+        ///     · 台面的 `onhas` 只覆盖**还在台面上**的那盘, 一端起来就看不见了。
+        ///
+        ///   复用**现成的** `ItemKnowledge.ContentsNames(go)` —— 台面 `onhas`
+        ///   就是它算的(见 `CollectChildren`), 同一个盘子对象, 不另写一份。
+        ///   判据(反编译)也是同一条: `ServerIngredientContainer.GetContents()`
+        ///   → `m_composition` 递归(见 `ContentsNames` 的注释)。
+        ///
+        ///   ⚠ 取值口径与 `held` **一致**: 服务端权威优先, 客户端那份晚一帧。
+        /// </summary>
         private static void ReadHeldItems(GameObject chefGo, out string serverHeld,
-                                          out string clientHeld)
+                                          out string clientHeld, out string heldHas)
         {
             serverHeld = "";
             clientHeld = "";
+            heldHas = "";
             try
             {
-                clientHeld = ReadFromCarrier(chefGo, "ClientPlayerAttachmentCarrier");
-                serverHeld = ReadFromCarrier(chefGo, "ServerPlayerAttachmentCarrier");
+                string ch, sh;
+                clientHeld = ReadFromCarrier(chefGo, "ClientPlayerAttachmentCarrier", out ch);
+                serverHeld = ReadFromCarrier(chefGo, "ServerPlayerAttachmentCarrier", out sh);
+                heldHas = sh.Length > 0 ? sh : ch;      // 和 `held` 同一个取舍: 服务端优先
                 if (serverHeld.Length == 0 && clientHeld.Length == 0)
-                    serverHeld = ReadFromCarrier(chefGo, "PlayerAttachmentCarrier");
+                {
+                    serverHeld = ReadFromCarrier(chefGo, "PlayerAttachmentCarrier", out sh);
+                    heldHas = sh;
+                }
             }
             catch (Exception) { }
         }
 
         private static volatile string _lastReflectErr = "";
 
-        private static string ReadFromCarrier(GameObject chefGo, string typeName)
+        /// <summary>读厨师某个 carrier 上的东西 —— 返回**物体名**; `contents` 顺带给出
+        /// **这件容器里装了什么**(如盘子上的菜)。
+        ///
+        /// `contents` 见 `ReadHeldItems` 的注释: 光盘子名分不出"空盘"和"装好的菜"。</summary>
+        private static string ReadFromCarrier(GameObject chefGo, string typeName,
+                                              out string contents)
         {
+            contents = "";
             try
             {
                 var ct = FindType(typeName);
@@ -1533,7 +2304,20 @@ namespace Overcooked2AI.Game
                     return "";
                 }
                 var item = m.Invoke(carrier, null) as UnityEngine.Object;
-                return item == null ? "" : SafeName(item.name);
+                if (item == null)
+                    return "";
+                // **容器内容** —— 复用台面 `onhas` 用的同一个原语(见 `CollectChildren`)。
+                //   ⚠ 单独 try: 读内容失败不该把"手上拿着什么"一起弄丢 ——
+                //     `held` 是很多判据的命根子(`_is_plate`/`verify_hold_change`)。
+                try
+                {
+                    var igo = item as GameObject
+                              ?? (item as Component != null ? (item as Component).gameObject : null);
+                    if (igo != null)
+                        contents = SafeName(ItemKnowledge.ContentsNames(igo));
+                }
+                catch (Exception) { }
+                return SafeName(item.name);
             }
             catch (Exception ex)
             {
@@ -1551,8 +2335,8 @@ namespace Overcooked2AI.Game
 
         private static string ReadHeldItem(GameObject chefGo)
         {
-            string s, c;
-            ReadHeldItems(chefGo, out s, out c);
+            string s, c, h;
+            ReadHeldItems(chefGo, out s, out c, out h);
             return s.Length > 0 ? s : c;
         }
 
