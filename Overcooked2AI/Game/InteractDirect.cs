@@ -384,7 +384,8 @@ namespace Overcooked2AI.Game
                 //   (见结果那段 `{7}{8}{9}`), 和 `extra` 一样 —— 少一个逗号就是
                 //   整条 JSON 报废(实测: 每一次"手上有东西"的直调都解析失败,
                 //   表现成"东西放不进盘", 而日志只报 `Expecting ',' delimiter`)。
-                return ",\"" + key + "\":" + ((ok is bool && (bool)ok) ? "true" : "false");
+                return ",\"" + key + "\":" + ((ok is bool && (bool)ok) ? "true" : "false")
+                     + ",\"placeHandler\":\"" + Safe(handler.GetType().Name) + "\"";
             }
             catch (Exception)
             {
