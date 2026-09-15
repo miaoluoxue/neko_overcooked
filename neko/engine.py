@@ -557,9 +557,9 @@ class Engine:
             r = getattr(d, "last_direct", None)
             if not r:
                 return ""
-            return ("\n         直调那一趟: ok=%s method=%s target=%r pick=%r place=%r"
+            return ("\n         直调那一趟: ok=%s method=%s target=%r pick=%r place=%r placeCanHandle=%s"
                     % (r.get("ok"), r.get("method"), r.get("target"),
-                       r.get("pick"), r.get("place")))
+                       r.get("pick"), r.get("place"), r.get("placeCanHandle")))
         except Exception:
             return ""
 
