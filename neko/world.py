@@ -19,6 +19,7 @@
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 
@@ -26,10 +27,23 @@ import time
 class World:
     """共享的只读世界视图 + 一张"占位预约表"。"""
 
-    def __init__(self, bridge, log=print, state_ttl: float = 0.10):
+    def __init__(self, bridge, log=print, state_ttl: float = None):
         self.br = bridge
         self.log = log
-        self.state_ttl = state_ttl
+        #: 状态快照的保质期(秒)。**默认 0 —— 每次读都要最新的一帧。**
+        #:
+        #: ☠ **2026-09-15 从 0.10 改成 0**(用户定的规矩, 原话):
+        #:   "我们的地图更新是**和雷达一样**的机制, 使用要求脚本**每次都使用最新的地图**,
+        #:    本身地图就小, 占用无关紧要。"
+        #:   原来那个 0.1 秒服务的是"整帧一致性 + 省桥流量"(见类文档), 那是给**规划**用的;
+        #:   可它同时喂给了**判据** —— 台面上还有没有那个盘子、我手上是不是已经空了,
+        #:   于是判据读到的最多可以是 0.1 秒前的世界。0.1 秒在这个游戏里是**半个动作**
+        #:   (一次交互认定 0.35 秒、按一下切菜 0.35 秒) ⇒ 陈旧读数直接变成
+        #:   "对着空台子按放置""东西明明在手上却报了空"。
+        #:   ⚠ 桥读本身不贵(插件主线程**每帧刷新的字符串**, 读一次就一个本地 TCP 往返),
+        #:     真正贵的 map/raw 另有缓存。`NEKO_STATE_TTL` 可以调回去(双人省流量时)。
+        self.state_ttl = (float(os.environ.get("NEKO_STATE_TTL") or 0.0)
+                          if state_ttl is None else float(state_ttl))
         self._lock = threading.RLock()
         self._st: dict | None = None
         self._st_t = 0.0
@@ -37,9 +51,17 @@ class World:
         self._km_t = 0.0
         self._tm = None
         self._tm_scene = ""
-        self._dyn_t = 0.0
-        self._dyn_deforming = False
-        self._dyn_cache = {}
+        self._tm_ver = ""       # 上面那份地形的版本号(C# 算的), 见 terrain()
+        self._tm_at = 0.0       # 上面那份是什么时候取的
+        #: 地形保质期(秒)。**这是"跳海"的保险丝** —— 理由见 terrain() 的注释:
+        #: 限时平台升降只改高度不改字符, 整局不刷新就会拿着旧图走进海里。
+        #: ⚠ **2026-09-14 从 1.5 压到 0.5**(用户要求"提高地图更新的频率"):
+        #:   实测强制扫一次 **32ms**(41x24 关, 逐格 2 条射线) ⇒ 0.5 秒的占空比 6%。
+        #:   而 1.5 秒 = 厨师走出 **6 格**, 拿 6 格前的图规划就是往海里走。
+        #:   ⚠ 和 `Engine.terrain_ttl` **必须一致** —— 双人时两个引擎走的是
+        #:     这一条(`Engine.terrain()` 有 world 就直接 return `world.terrain()`)。
+        #:   `NEKO_TERRAIN_TTL` 可覆盖(大关卡耗时 ∝ 格子数)。
+        self.terrain_ttl = float(os.environ.get("NEKO_TERRAIN_TTL") or 0.5)
         self._resv: dict[tuple, tuple] = {}     # cell -> (cid, 过期时刻)
         self.state_fetches = 0
         self.state_cache_hits = 0
@@ -89,21 +111,23 @@ class World:
 
     # ---------------- 地形(整关可走图) ----------------
     def terrain(self, force: bool = False):
-        """共享的 TerrainMap: 同一关卡只拉一次、只解一次。"""
+        """共享的 TerrainMap: 同一关卡只拉一次、只解一次 —— **但有保质期**。
+
+        ⚠ 保质期和版本号的理由同 `Engine.terrain()` 那段长注释: 限时平台升降、
+          荷叶沉浮这类变化**只改高度不改字符**, 整局不刷新就会拿着"平台还升着"
+          的旧图去寻路 → 走进海里。双人模式走的就是这一条路径, 所以这里也必须改。
+        """
         from terrain import TerrainMap
         st = self.state()
         scene = (st or {}).get("scene") or ""
+        now = time.time()
         with self._lock:
             if (not force and self._tm is not None
-                    and self._tm_scene == scene and self._tm.ok):
-                # 关卡中途会变形(海鲜/矿坑/荷叶等): 一旦 dyn.transitions 报"正在变形",
-                # 静态网格就过时了, 必须强制重建。这里用 2 秒 TTL 的脏标记, 别每步都拉 dyn。
-                if self._layout_deforming():
-                    force = True
-                else:
-                    return self._with_dynamic(self._tm)
+                    and self._tm_scene == scene and self._tm.ok
+                    and (now - self._tm_at) < self.terrain_ttl):
+                return self._tm
         try:
-            data = self.br.get_map(force=force)
+            data = self.br.get_map(force=force, max_age=self.terrain_ttl)
         except Exception as e:
             self.log(f"[地形] 取图失败: {e}")
             with self._lock:
@@ -121,50 +145,23 @@ class World:
                 return self._tm
         with self._lock:
             old = self._tm
+            if old is not None and old.ok and self._tm_scene == scene:
+                if tm.ver:
+                    same = (tm.ver == self._tm_ver)       # 权威判据
+                else:
+                    same = (tm.counts == old.counts)      # 老 dll: 退化成比计数
+                self._tm_at = now
+                if not force and same:
+                    return old                                # 没变 → 沿用旧对象
             if old is None or not old.ok or tm.counts != old.counts:
-                self.log(f"[地形] {tm.w}x{tm.h} 格 步长({tm.cellx:.2f},{tm.cellz:.2f}) "
-                         + tm.describe_dangers())
+                self.log(f"[地形] 更新 ver={tm.ver or 'n/a'}  {tm.w}x{tm.h} 格 "
+                         f"步长({tm.cellx:.2f},{tm.cellz:.2f}) " + tm.describe_dangers())
             self._tm = tm
             self._tm_scene = scene
+            self._tm_ver = tm.ver
+            self._tm_at = now
             self.tm_rebuilds += 1
-        return self._with_dynamic(tm)
-
-    def _dyn_snapshot(self) -> dict:
-        """取 dyn(动态层), 2 秒内复用缓存, 避免寻路每步都拉一次。"""
-        now = time.time()
-        with self._lock:
-            if now - self._dyn_t < 2.0:
-                return self._dyn_cache
-        try:
-            dyn = self.br.get_dyn() or {}
-        except Exception:
-            dyn = self._dyn_cache
-        with self._lock:
-            self._dyn_t = time.time()
-            self._dyn_cache = dyn
-            self._dyn_deforming = bool(dyn.get("transitions"))
-        return dyn
-
-    def _with_dynamic(self, tm):
-        """把 dyn 里的实时火/移动平台覆盖到静态图上, 返回补丁后的新图。"""
-        if tm is None or not tm.ok:
-            return tm
-        dyn = self._dyn_snapshot()
-        overrides = {}
-        try:
-            for f in dyn.get("fires") or []:
-                x, z = float(f.get("x") or 0), float(f.get("z") or 0)
-                overrides[tm.cell_of(x, z)] = "F"
-            for p in dyn.get("platforms") or []:
-                x, z = float(p.get("x") or 0), float(p.get("z") or 0)
-                overrides[tm.cell_of(x, z)] = "P"
-        except (TypeError, ValueError):
-            pass
-        return tm.patched(overrides)
-
-    def _layout_deforming(self) -> bool:
-        """这一关此刻是不是正在做布局变形(动态关卡)。2 秒内只问一次游戏。"""
-        return bool(self._dyn_snapshot().get("transitions"))
+        return tm
 
     # ---------------- 两个厨师的实时位置 ----------------
     # ⚠ 位置相关的一律 **force 读**, 不吃 TTL 缓存。
