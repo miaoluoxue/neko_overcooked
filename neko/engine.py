@@ -5629,6 +5629,25 @@ class Engine:
             return True
         now = time.time()
         need = float(ck.need)
+        # ☠☠ **"已放进"可能是假的**(2026-09-17 实机 `s_mine_2_6` 的定案点 —— 先取证据)。
+        #   那局 P2 每轮都打 `已放进 hob0(需 12s, 11s 后熟)` **紧接着**
+        #   `hob0 的账清了(糊了/过了 —— 交给救锅线)`, 重复 6 次以上, `cook` 永远做不完。
+        #   而"下一轮立刻判糊"要求**登记那一刻** `prog >= need*2`(或 `burning`) ——
+        #   也就是说**锅里那口旧的糊菜还在**: 新料**根本没进去**, 可
+        #   `interact("pickup", verify_hold_change=True)` 报了成功(手上确实空了)。
+        #   ⇒ 于是 台账记了一笔"我放进去的" ⇒ 下一轮 `_pot_valid` 立刻判它失效 ⇒
+        #     丢给救锅线 ⇒ 而救锅**也要盘子** ⇒ 锅永远清不掉 ⇒ 死循环。
+        #   ⚠ **这一行只打证据, 不改行为**(照样登记) —— 定案要看下一局的日志:
+        #     若这行真出现, 就证明"放进去"那一下没落地, 病根在放置那一步(或锅满了),
+        #     不在台账、也不在取菜。
+        try:
+            _in = self._norm(getattr(ck, "inside", "") or getattr(ck, "ing", "") or "")
+        except Exception:                                        # noqa: BLE001
+            _in = ""
+        if _in and _in != self._norm(op.target):
+            self.log(f"[煮] ⚠ 游戏说锅里现在是 {_in!r}, 不是刚放进去的 "
+                     f"{self._norm(op.target)!r} —— **这一笔可能没真放进去**"
+                     f"(旧菜还在锅里? 那下一轮会立刻判它'糊了/过了')")
         live[stove.id] = {
             "raw": op.target,
             "target": self._norm(op.target),
