@@ -69,6 +69,7 @@ from cookbook import Knowledge, derive, Op, DishFlow
 from team import OrderBoard
 import lookahead                       # 提前备料: 由订单算"该备多少"(纯函数, 可离线钉死)
 import scoring
+import region                          # 区域自治: 台面切两半, 一人一片(纯函数, 可离线钉死)
 
 # 灶台语义(按食材要求的 CookingStationType 映射)
 COOK_SEMS = ("hob", "oven", "fryer", "firepit", "barbeque", "floorburner", "flamethrower")
@@ -419,6 +420,28 @@ COOP_PLATE = COOP and (os.environ.get("NEKO_COOP_PLATE") or "1").strip().lower()
 #:   这个是"**我不管它了**, 你可以接"。两者混用会让"走过去拿一趟"就被判成弃盘。
 #: ☠ 数据来源是**最后一次写入**(`touch_plate` 的心跳)⇒ 不引中心节点、不引心跳线程。
 PLATE_IDLE_TTL = float(os.environ.get("NEKO_PLATE_TTL") or 20.0)
+
+#: **区域自治 —— 两个厨师各管半片厨房**(2026-09-17 用户:
+#: "理想状态是两个厨师**各自占据一个小区域**, 这个区域里的事情**完全由这个厨师负责**,
+#:  另一个厨师通过**传递**来将食材和下一步处理交给对方")。
+#:
+#: `0` = **一键回退**(扣分恒 0、传球理由不变 ⇒ 与加它之前逐字相同)。
+#:
+#: ☠☠ **首版默认 `0`(关)是故意的, 不是忘了翻**: 这是**组织原则级**的改动, 而它有一种
+#:   **很贵**的失效模式 —— 两个厨师对"哪半归谁"算出不同的结果(或切得离谱)时,
+#:   **谁也不去那一处**, 比不分区还糟(不分区至少有人会去)。⇒ 先在实机看清一局、
+#:   确认两边日志里 `[区域]` 的**切分位置一致**, 再翻默认。翻它就是改这一个字符。
+#:   (分区的正确性在 `runtime/_region_probe.py` 里钉着: 确定性 + 互补, 43 条。)
+REGION_ON = (os.environ.get("NEKO_REGION") or "0").strip().lower() \
+    not in ("0", "off", "no", "false", "none")
+#: **越界扣几分** —— 这是**软**边界: 扣分, **不是禁止**(用户选的两层里"平时"那层)。
+#: 标定锚点: `W_DIST` 是 2.0/格 ⇒ **20 分 ≈ 10 格路**。意思是"**我那半边上有一处
+#: 只要不比他那边的远 10 格以上, 就别越界**" —— 越界要**明显更划算**才成立。
+#: ⚠ 调大的后果是"成片传球、一边忙死"; 调小到 0 就是关掉这层(硬的那层仍在: 够不着 ⇒ -inf)。
+#: ⚠ 它**压不过紧迫度**: 糊锅(`BURN_URGENCY_MAX` 200)和快到期(`ORDER_URGENCY_CAP` 60)
+#:   都远大于 20 ⇒ "紧急时仍然可以去"这条是自动成立的, 不需要另写规则。
+REGION_W = float(os.environ.get("NEKO_REGION_W") or 20.0)
+
 #: **三处资源共享的保护**(切菜板/盘子/台面)总开关。关掉 = 退回"靠软避让 + 物理竞态"。
 COOP_RES = (os.environ.get("NEKO_COOP_RES") or "1").strip().lower()     not in ("0", "off", "no", "false", "none")
 
@@ -957,8 +980,10 @@ class Engine:
 
         ⚠ 返回 `None` 的三种情形(**都退回老行为, 不猜**):
           ① 厨师那一格**不在表里** —— 他被推到不可走区/被孤立, 或目标在**另一个连通块**
-             (实测 `MovingPlatform4`: `我的可达格 59/160`) ⇒ 这时**本来就到不了**,
-             该由上层判"够不着"换目标, 而不是让控制器继续顶;
+             (实测 `MovingPlatform4`: `我的可达格 59/160`)。
+             ☠ **这一支 2026-09-17 起不再返回 `None`**(用户: "退回在步数表的格子。
+               **移除直线硬推**"): 先试 `_field_frontier` —— 走到"够得着目标的那块区域"
+               里去; 只有**两块区域之间真的没有一条路**时才 `None`(那时上层会换目标)。
           ② 地形不可用;
           ③ 没有步数更小的邻格(已经在表的最低点)。
         ⚠ 表按 `(地形版本, 目标格)` 缓存 —— 一趟导航建一次, 不是每个 tick 建一次。
@@ -977,8 +1002,62 @@ class Engine:
         dist = cached[1]
         c = tm.cell_of(x, z)
         if c not in dist:
-            return None
-        cur = dist[c]
+            # ☠☠ **"步数表里没有我这一格" ⇒ 退回到步数表里的那一格**(用户 2026-09-17:
+            #   "直线不通, 而**步数表里没有我这一格** —— 退回在步数表的格子。
+            #    **移除直线硬推**")。
+            #
+            # 为什么原来是错的: `dist` 是**从目标**泛洪出来的 ⇒ `c not in dist` 的含义
+            #   就是"**从厨师这一格根本到不了目标**"(他被推到不可走区/被孤立, 或目标在
+            #   另一个连通块)。这时**直线硬推永远不可能成功** —— 它只会撞墙, 然后被
+            #   卡住检测记一格禁行、重规划、再撞下一格, 看起来"每次都有新信息", 其实
+            #   走的是同一条路。实机账(`s_sushi_1_3`): 一整列 `(10,7)…(10,11)` 被挨个
+            #   撞了一遍, `4/4` 次跑满判这一步失败 → `重试 1/2` → 同一圈。
+            #   ⇒ 正解是**先走进"够得着目标的那块区域"**, 而不是继续朝目标顶。
+            #
+            # 两次泛洪(只在这一支里跑, 且**带缓存** —— `navigate_smart` 是**每 tick**
+            #   调的, 不缓存就是每 tick 两次 BFS):
+            #   ① 从**厨师**泛洪 ⇒ 他**真能走到**哪些格(同一套 `walkable`/`step_ok`);
+            #   ② 取"我也走得到、而且从它出发到得了目标"的那些格里**离我最近**的那一格 `f`
+            #      —— 那就是"步数表里的那一格": 走到它, 剩下的路步数表就管得了了;
+            #   ③ 再从 `f` 泛洪一次, 用它当表。
+            # ☠ **不能拿 ① 那张表直接"降一步"** —— 它的值是"离厨师多远", 往下走只会
+            #   退回厨师自己, 方向是反的(这正是"两张表不能混"的地方)。
+            # 边界: ② 一个都挑不出来 ⇒ **真够不着**(同一套边模型两边就是不连通)
+            #   ⇒ 照旧 `None`, 由上层判"够不着"换目标 —— **但不再直线硬推**。
+            _fk = (tm.ver, c, tgt)
+            _fc = getattr(self, "_field_frontier_cache", None)
+            if _fc is None or _fc[0] != _fk:
+                _fc = (_fk, self._field_frontier(tm, dist, x, z, st, tedges))
+                self._field_frontier_cache = _fc
+            _ff = _fc[1]
+            if _ff is None:
+                return None                      # 真够不着 ⇒ 上层换目标, 不硬推
+            _fcell, dist = _ff
+            tx, tz = tm.world_of(*_fcell)
+        # ☠☠ **厨师站在不可走格里时, 表里没有他那一格** —— `distances_from` 明写着
+        #   "起点恒在表里, **即使起点本身不可走**(人被平台推到边上是常见情况)",
+        #   但那只对**它自己那次泛洪的起点**成立: 从 `f` 泛出来的这张表里,
+        #   厨师那格是**不可走的邻格**, 泛洪根本不会走进去 ⇒ `dist[c]` 不存在。
+        #   而这恰恰是本节要服务的主要情形("被推到不可走区")—— 不能判死。
+        #   ⇒ 把他那格当成"**离最近的邻格再远一步**": 把 `cur` 抬到邻格里最小的
+        #     步数之上, 于是下面那圈 8 邻格里**步数最小的那个**自然当选
+        #     (= 朝 `f` 迈出的第一步), 而所有闸门(`walkable`/危险/禁行/`step_ok`)
+        #     仍然由**下面那段同一份代码**判 —— 闸门只有一份, 不在这儿抄。
+        #   ⚠ 若那一步恰好被闸门挡掉 ⇒ `best is None` ⇒ 返回 `None` ⇒ 上层换目标。
+        #     那是**安全的**结局(不再硬推), 且被上层的重试上限兜着。
+        cur = dist.get(c)
+        if cur is None:
+            cur = None
+            for _di in (-1, 0, 1):
+                for _dj in (-1, 0, 1):
+                    if _di == 0 and _dj == 0:
+                        continue
+                    _dn = dist.get((c[0] + _di, c[1] + _dj))
+                    if _dn is not None and (cur is None or _dn < cur):
+                        cur = _dn
+            if cur is None:
+                return None                      # 连"迈出这一步"都没地方去
+            cur += 1
         best, pick_d, best_dot = None, None, -2.0
         ux, uz = (tx - x), (tz - z)
         _un = (ux * ux + uz * uz) ** 0.5 or 1.0
@@ -1016,6 +1095,49 @@ class Engine:
         if vn < 1e-6:
             return None
         return (vx / vn, vz / vn, vn)
+
+    def _field_frontier(self, tm, dist, x: float, z: float, st: dict, tedges):
+        """**厨师到不了目标时, 找"步数表里的那一格"** —— 返回 `(格子, 从该格泛洪的步数表)`。
+
+        调用处与理由见 `_field_dir` 里那段 ☠☠(`c not in dist` = "从厨师这一格到不了目标"):
+        正解是**走进"够得着目标的那块区域"**, 而不是继续朝目标直线硬推。
+
+        `dist` = 从**目标**泛洪的那张表(调用方给的)。返回 `None` = **真够不着**
+        ——"我也走得到 ∩ 从它出发到得了目标"是**空集**, 同一套 `walkable`/`step_ok`
+        两边就是不连通 ⇒ 由上层判"够不着"换目标。
+
+        ☠ **两次泛洪缺一不可**, 且**不能拿第一张表去"降一步"**: 第一张 `me` 的值是
+          "**离厨师多远**", 沿着它往下走只会退回**厨师自己**(方向是反的)。
+          第二张(从选中的那一格泛洪)才是"离那一格多远", 才能往下走 —— 这和
+          `_field_dir` 主体用的是同一个模型, 所以"每一步都是规划器认可的一步"这条
+          性质**照旧成立**。
+        ⚠ 调用方**必须缓存**这个结果: `navigate_smart` 是每 tick 调的, 这里两次 BFS。
+        """
+        _at_y, _te = self.chef_y(st), (tedges or {})
+        try:
+            me = tm.distances_from(x, z, at_y=_at_y, extra_edges=_te)
+        except Exception:                                        # noqa: BLE001
+            return None
+        if not me:
+            return None
+        # ② "步数表里的那一格" = 我也走得到 **且** 从它出发到得了目标; 取**离我最近**的,
+        #    并列时取**离目标更近**的(更快接上主表)。
+        best, best_d, best_q = None, None, None
+        for cell, dm in me.items():
+            dt = dist.get(cell)
+            if dt is None:
+                continue
+            if best_d is None or dm < best_d or (dm == best_d and dt < best_q):
+                best, best_d, best_q = cell, dm, dt
+        if best is None:
+            return None                      # 空集 ⇒ 真够不着
+        try:
+            fdist = tm.distances_from(*tm.world_of(*best), at_y=_at_y, extra_edges=_te)
+        except Exception:                                        # noqa: BLE001
+            return None
+        if not fdist:
+            return None
+        return best, fdist
 
     def chef_speed(self, st: dict) -> float:
         """厨师此刻的**真实推进速度** `R = RunSpeed × MovementScale`(世界单位/秒)。
@@ -1499,14 +1621,24 @@ class Engine:
                                          tedges=_te_f,
                                          blocked=self._dynamic_blocks(_km_f, tm))
                     if _f is None:
-                        # 步数表也答不了 ⇒ **逐字退回老行为**(直线 + 下面那道守卫)。
-                        # 最常见的一种: 目标在**另一个连通块**里(`MovingPlatform4` 实测
-                        # `我的可达格 59/160`) —— 那时本来就到不了, 该由上层判"够不着"
-                        # 换目标, 不是让控制器继续顶。
-                        if not getattr(self, "_field_none_told", False):
-                            self._field_none_told = True
-                            self.log("[导航] ⚠ 直线不通, 而**步数表里没有我这一格**"
-                                     "(被推到不可走区/目标在另一个连通块) —— 退回直线硬推")
+                        # ☠☠ **不再直线硬推**(用户 2026-09-17: "退回在步数表的格子。
+                        #   **移除直线硬推**")。这条原来只打一行日志、然后**照旧朝目标
+                        #   直线顶** —— 而它自己的注释就写着"该由上层判'够不着'换目标,
+                        #   不是让控制器继续顶"。注释和代码是矛盾的, 顶了整整一路。
+                        # `_field_dir` 返回 `None` 说明**步数表也给不出方向**(两种:
+                        #   我这一格到不了目标 / 地形读不到)。前者是**结构性到不了**,
+                        #   顶一万次也到不了; 后者没有地图可依, 硬推等于蒙。
+                        #   ⇒ 这一趟到此为止, 把"够不着"这件事**交回上层**去换目标/换支
+                        #     —— 和下面那道"前方是危险格就不往里迈"同一个处置形状
+                        #     (`return False`, 一趟结束, 不是停机)。
+                        # ⚠ 原来那个 `_field_none_told` 一次性闸门**去掉了**: 它让
+                        #   "到底发生过多少次"在日志里**不可数**(整局只打一行),
+                        #   而这正是排查"一直撞墙"要数的那件事。现在每次都是一趟的终点,
+                        #   次数天然被上层的 `4/4` 重试上限兜住, 不会刷屏。
+                        self.kb.release_all()
+                        self.log("[导航] ✗ 步数表也给不出方向(我这一格到不了目标) —— "
+                                 "**不直线硬推**, 这一趟到此为止, 交给上层换目标")
+                        return False
                     elif self.NAV_MODE == "compare":
                         # 只读对照: **一行行为都不改**, 只把分歧记下来(和 `NEKO_PLAN=shadow` 一个用法)
                         self.log("[导航] ⇄ 对照: 直线朝 (%.2f,%.2f), 步数表朝 (%.2f,%.2f)"
@@ -8783,13 +8915,23 @@ class Engine:
             r = info[i]
             d = my_reach.get(r["cell"]) if r["cell"] is not None else None
             follow = 0.0
-            if d is not None:
+            # ☠☠ **救锅不吃"顺路"扣分**(2026-09-17)。`_chore_admitted` 早就声明了
+            #   "救锅**不是顺手**, 是再不动就废了"(它豁免了入池的顺路闸门),
+            #   但**闸门豁免 ≠ 分数豁免** —— 这里原来照扣 `1.5 × follow`。
+            #   实机账(`s_lunar_1_4`): `rescue SushiRice 格距 14.0 顺路 12.0` ⇒ 扣 28+18=46,
+            #   而当时的紧迫度只有 38 ⇒ `15−46+38 = 7.3`, 输给了 `fetch SushiRice` 的 16.0,
+            #   那口锅一路烧到糊。
+            #   ⚠ `follow` 和 `W_DIST × dist` 说的是**同一件事**(都是"离我多远"), 对救锅是扣两遍;
+            #     `dist` **留着** —— 近的锅该优先于 30 格外的锅。
+            if d is not None and r["op"].action != "rescue":
                 others = [my_reach[info[j]["cell"]] for j in recipe
                           if j != i and info[j]["cell"] is not None]
                 if others:
                     follow = float(min(abs(d - o) for o in others))
+            # ⚠ **必须写在落表之前**: 队友那份 `other_raw`(见下面 `_mate_can` 那段)读的是
+            #   这同一个 `r["follow"]` ⇒ 两条路只有一份值, 否则 `choose` 是在比两件事。
             r["dist"], r["follow"] = d, follow
-            # 紧迫度(目前只有"锅快糊了"非 0): `scoring.burn_urgency` 算好的加成分。
+            # 紧迫度(目前只有"锅快糊了"非 0): `scoring.burn_urgency_alert` 算好的加成分。
             # 推进(手上这份先做完): 见 `_advance_bonus` —— 用**我手上**的那份算。
             # **订单倒计时的时钟分**(2026-09-17 按步协作): `t` 是**这个候选所属那张单**的
             # 剩余比例 ⇒ 快到期的那张单的**便宜步骤**也能压过新单的贵步骤。
@@ -8798,10 +8940,18 @@ class Engine:
             if COOP_CLOCK and t_of is not None and i < len(t_of):
                 _clock = scoring.order_urgency(t_of[i], cap=ORDER_URGENCY_CAP,
                                                floor=ORDER_URGENCY_FLOOR)
+            # **区域分**(2026-09-17): 这一步的台面在**他那半边** ⇒ 扣 `REGION_W`。
+            # ☠ 和上面那段 `_plan_bonus` 同一个理由加在 `raw` 上 —— **不动 `scoring.py` 的签名**。
+            # ☠ **传球不吃它**: `pass` 的目标是**队友本人**(`at` 是他的坐标), 而传球正是
+            #   跨区交接的**唯一出路** —— 给它扣分等于把这条出路自己堵上。
+            # ⚠ `getattr`: 离线桩的 Engine 子类**不调 `__init__`**(本仓惯例) ——
+            #   而 `self.cid` 会在**进函数之前**就被求值, 哪怕 `REGION_ON` 是关的。
+            _region = 0.0 if r["op"].action == "pass" \
+                else self._region_bonus(km, r.get("at"), getattr(self, "cid", None))
             raw.append(scoring.score(r["op"].action, d, follow,
                                      urgency=getattr(r["op"], "urgency", 0.0),
                                      advance=self._advance_bonus(r["op"], held),
-                                     clock=_clock))
+                                     clock=_clock) + _region)
             # **计划给的"就是这一步"奖励** —— 见 `_plan_bonus`。
             # ☠ **只加不减**, 且 `NEKO_PLAN != "on"` 时恒为 0(老路径一行不生效)。
             #   加在 `raw` 上而不是改 `scoring.score` 的签名 —— `scoring.py` 是**纯函数模块**
@@ -8852,10 +9002,15 @@ class Engine:
                     # ⚠ 但"推进"要按**队友自己手上**的那份算 —— 谁拿着才算谁的。
                     # ☠ **`clock` 必须也加到这里**(和 `urgency` 同一条纪律: 它**位置无关**)
                     #   —— 否则 `scoring.choose` 拿"我含时钟分"和"队友不含"比, 让位判定失真。
+                    # ☠ **区域分要用"他的"归属算** —— 和 `advance`("谁拿着算谁的")同一条纪律:
+                    #   给两边加**不同**的值, `scoring.choose` 就不是在比同一件事了。
+                    #   (取他的 cid 见 `_mate_cid`; 拿不到 ⇒ `_region_bonus` 返 0。)
+                    _oregion = 0.0 if r["op"].action == "pass" \
+                        else self._region_bonus(km, r.get("at"), self._mate_cid())
                     o = scoring.score(r["op"].action, od, r["follow"],
                                       urgency=getattr(r["op"], "urgency", 0.0),
                                       advance=self._advance_bonus(r["op"], mate[2] if mate else ""),
-                                      clock=_clock)
+                                      clock=_clock) + _oregion
             other_raw.append(o)
 
         # 4) 状态 = 对评分向量的变换(coop 原样 / clumsy 加噪声 / sabotage 取负+重复)
@@ -8885,26 +9040,41 @@ class Engine:
         # ⚠ `getattr`: 离线桩里的 Engine 子类**不调 `__init__`**(本仓惯例), 直接摸
         #   `self.board` 会把它们炸掉(`_splitkitchen_probe` 就栽在这)。
         _bd = getattr(self, "board", None)
-        if (COOP_STEPS and _bd is not None and chosen is not None
-                and slot_of is not None and step_of is not None):
+        if COOP_STEPS and _bd is not None and chosen is not None:
             _ord = sorted([n for n in range(len(pending)) if final[n] > scoring.NEG_INF],
                           key=lambda n: final[n], reverse=True)
             _got = None
             #: `[(键, 占位者, 建议可做否)]` —— **全被占**时用它说清"**谁**占着"。
             #: 见下面 `_got is None` 那段 ☠: 没有它, "泄漏"和"池子小"在日志里一模一样。
             _lost = []
-            #: 这一轮**真正去占过**的菜谱候选有几个 —— 见下面"0 个"那段的 ☠。
+            #: 这一轮**真正去占过**的可占候选有几个 —— 见下面"0 个"那段的 ☠。
             _tried = 0
             for _n in _ord:
                 _j = pending[_n]
-                if _j >= n_recipe or _j >= len(slot_of) or _j >= len(step_of):
-                    continue                       # 杂活/越界 ⇒ 不占
+                _op = ops[_j]
+                # ☠☠ **救锅也占位**(2026-09-17 用户: "**分派一个人去救**")。原来这里一句
+                #   `杂活/越界 ⇒ 不占` 把 5 件杂活一起挡在门外(理由写的是"不销号、每轮
+                #   重新生成, 占它没有意义")—— 那条理由对 `work`/`wash` 成立, 对**救锅不成立**:
+                #   一口锅是**有身份的**, 两个人各算一遍必然指向**同一口锅**。
+                #   实机账(`s_lunar_1_4`): 台账把那口锅判给了 P2(`_rescues` 那条
+                #   "自己开的火还没过硬上限"⇒ 不生成), P2 不提议, **只有 P1 能救**,
+                #   而 P1 正好错过了它 —— 没有占位, 就没人"被分派"。
+                #   ⚠ 键走**资源键空间**(`("__res__", …)`, 见 `_claim_res` 那条正交约定),
+                #     所以两种键在同一张表里天然不撞车。
+                if (slot_of is not None and step_of is not None
+                        and _j < n_recipe and _j < len(slot_of) and _j < len(step_of)):
+                    _k = _bd.step_key(slot_of[_j], step_of[_j])   # 菜谱步: 照旧
+                    _why = "错开(队友刚占了这一步)"
+                elif _op.action == "rescue":
+                    _k = self._rescue_claim_key(_op)              # 救锅: 按**哪口锅**
+                    _why = "错开(队友去救了)"
+                else:
+                    continue                     # 其余杂活/越界 ⇒ 照旧不占
                 _tried += 1
-                _k = _bd.step_key(slot_of[_j], step_of[_j])
                 if _bd.claim_step(_k, self.cid, STEP_CLAIM_TTL):
                     _got = (_n, _k)
                     break
-                verdict[_n] = "错开(队友刚占了这一步)"
+                verdict[_n] = _why
                 # ⚠ `step_owner` 与 `claim_step` 是同一张表的两面(都在 `OrderBoard`),
                 #   但离线桩的黑板可能只给了 `claim_step`/`step_key` ⇒ 读不到就记 None,
                 #   **不能让它把这一轮炸掉**(那是"绝不停机"的一部分)。
@@ -8913,8 +9083,15 @@ class Engine:
                 except Exception:                                  # noqa: BLE001
                     _lost.append((_k, None))
                 if _n == chosen:
-                    self.log(f"[分工] {ops[_j].action} {ops[_j].target} "
-                             f"({slot_of[_j]} 第{step_of[_j]}步) 队友在做 —— 我改选下一个")
+                    # ☠ 两个分支**必须分开** —— 菜谱步那边要 `slot_of[_j]`/`step_of[_j]`,
+                    #   而救锅是杂活(`_j >= len(slot_of)`) ⇒ 走老那句会 **IndexError**
+                    #   (放开"救锅也占位"之前, 杂活根本到不了这里, 所以那时是安全的)。
+                    if _op.action == "rescue":
+                        self.log(f"[分工] rescue {_op.target} ({_k[2]}) "
+                                 f"队友去救了 —— 我改选下一个")
+                    else:
+                        self.log(f"[分工] {_op.action} {_op.target} "
+                                 f"({slot_of[_j]} 第{step_of[_j]}步) 队友在做 —— 我改选下一个")
             if _got is None:
                 # ☠☠ **"全被占"必须说清是谁占着**(2026-09-17 用户要求: "**先分清**是
                 #   物理挡路还是选到同一处")。这一行原来只说"都被占" ⇒ **占位泄漏**和
@@ -8935,13 +9112,18 @@ class Engine:
                 #     那一轮 `chosen` 是个**杂活**(`chop Potato ↺回溯`), 而杂活在上面
                 #     `_j >= n_recipe: continue` 就被跳过了 ⇒ 循环体**一次都没进** ⇒
                 #     `_lost` 是空的, 却照样打了"全池的步位都被占(0 个)"。
-                #   ⇒ 日志上写着"被占 0 个", 而**真相是"这一轮一个可占的菜谱步都没有"**。
+                #   ⇒ 日志上写着"被占 0 个", 而**真相是"这一轮一个可占的步都没有"**。
+                #   ⚠ 措辞 2026-09-17 从"菜谱步"改成"步": **救锅也开始占位**了
+                #     (`_rescue_claim_key`), 可占的不只是菜谱步。
                 #     用户拿这行去分清"泄漏 vs 池子小"时, 会被它**直接带偏**。
                 #   ⇒ 分开报: 一个可占的都没有 ⇒ 说清是"候选全是杂活"; 真被占了才列 owner。
                 if _tried and _lost:
                     _own: dict = {}
                     for _k, _o in _lost:
-                        _own.setdefault(_o, []).append(f"{_k[0]}第{_k[1]}步")
+                        # ⚠ 用 `_claim_key_label`, **别直接下标** —— 两种键空间
+                        #   (`(槽位,步号)` / `("__res__",…)`)直接下标会印出
+                        #   `__res__第rescue步` 这种读不懂的东西(救锅键是 2026-09-17 加的)。
+                        _own.setdefault(_o, []).append(self._claim_key_label(_k))
                     _who = "; ".join(
                         "%s(cid=%r)占 %d 个: %s%s"
                         % ("我" if _o == self.cid else "队友" if _o is not None else "?",
@@ -8950,12 +9132,21 @@ class Engine:
                     self.log(f"[分工] ⚠ 全池的步位都被占({len(_lost)} 个) —— "
                              f"规则 5: 宁可重复也别让人站着")
                     self.log(f"[分工]    谁占着: {_who}")
-                else:
+                elif slot_of is not None and step_of is not None:
                     # ⚠ `_lost` 空但 `_tried > 0` 走不到这儿(占不到就一定会 append),
                     #   所以这一支就是 `_tried == 0`。
-                    self.log(f"[分工] 这一轮**一个可占的菜谱步都没有**"
-                             f"({len(_ord)} 个候选全是杂活/越界) —— "
+                    # ⚠ 措辞**不再叫"菜谱步"**(2026-09-17): 救锅也占位了 ⇒ 可占的
+                    #   不只是菜谱步。这句是给人分辨"泄漏 vs 池子小"用的, 说窄了会带偏。
+                    self.log(f"[分工] 这一轮**一个可占的步都没有**"
+                             f"({len(_ord)} 个候选全是杂活/越界, 或只剩不可占的杂活) —— "
                              f"**不是被占**, 只是没得占(规则 5: 照做)")
+                # ☠ `slot_of is None`(单池 / `COOP` 关 / 订单池只有一张 —— 见
+                #   `_execute_scored` 里 `flow_of = slot_of = … = None` 那个默认值)
+                #   ⇒ **这一轮本来就没有"可占的菜谱步"可言**, 不是"没得占"。
+                #   老代码在这里整个块都不进(所以没这句); 放开救锅占位之后块会进,
+                #   若不挡就会**每轮刷一行假的"一个可占的步都没有"** —— 而日志是本仓
+                #   唯一的诊断面, 假信号比没信号更贵。(救锅在这种池里**照旧照占** ——
+                #   它的键不依赖平行表, 这正是本次要的行为。)
             else:
                 chosen = _got[0]
                 self._claimed_step = _got[1]       # 释放时用它(见 `_release_step_claim`)
@@ -9016,6 +9207,145 @@ class Engine:
                     pass
         if why:
             self.log(f"[分工] 放掉占位({why})")
+
+    # ---------------- 区域自治(2026-09-17) ----------------
+    #
+    # 见 `REGION_ON` 那段与 `neko/region.py` 开头。这里只负责三件事:
+    #   · 把**共享的**台面表喂给纯函数、缓存结果;
+    #   · 把"归不归我"换成一个**加在 `raw` 上**的分(照 `_plan_bonus` 的先例,
+    #     **不动 `scoring.py` 的签名**);
+    #   · 给 `_pass_candidates` 多一个"不该我做"的理由。
+
+    def _mate_cid(self):
+        """队友的 cid(没有队友 ⇒ `None`)。
+
+        ⚠ 需要它是因为**队友那一列的归属要用"他的"算** —— `_mate()` 返回的
+          五元组**不带 cid**(它在内部读过又丢了), 所以这里单独取一次。
+          和 `advance`("谁拿着算谁的")是同一条纪律: 两边加不同的值, `choose` 就是在比两件事。
+        """
+        w = getattr(self, "world", None)
+        if w is None:
+            return None
+        try:
+            for o in w.others(getattr(self, "cid", 0)) or ():
+                if o.get("id") is not None:
+                    return int(o["id"])
+        except Exception:                                        # noqa: BLE001
+            return None
+        return None
+
+    def _region_owners(self, km, st=None):
+        """`{(round(x,1),round(z,1)): cid}` —— 这一局谁管哪张台面。按**台面表指纹**缓存。
+
+        ☠⚠ **键按坐标、不按台面 id**: 调用方手上只有"这一步要去的世界坐标"
+          (`_op_target_for_score` 给的就是 `(tx,tz)`), 而台面 id 在那条路上拿不齐。
+          分区本身就是**空间**划分 ⇒ 用坐标当键是它本来的语义。
+        ☠⚠ **输入必须是两人共享的那份台面表**(`World.kitchen()` 是共享缓存)——
+          各自扫一遍、结果不一致 ⇒ 两人对"哪半归谁"的看法不同 ⇒ **谁也不去**。
+          见 `region.py` 开头那条硬约束。
+        ⚠ 缓存键包含**厨师表**: 中途有人加入/掉线时归属要跟着变。
+        ⚠ 拿不到台面/厨师 ⇒ `{}` ⇒ 调用方一律"归我" ⇒ 逐字退回老行为。
+        """
+        if not REGION_ON or km is None:
+            return {}
+        pts = []
+        for s in (getattr(km, "stations", None) or {}).values():
+            x, z = getattr(s, "x", None), getattr(s, "z", None)
+            if x is None or z is None:
+                continue
+            try:
+                pts.append(((round(float(x), 1), round(float(z), 1)),
+                            float(x), float(z)))
+            except (TypeError, ValueError):
+                continue
+        if not pts:
+            return {}
+        w = getattr(self, "world", None)
+        ids = []
+        try:
+            ids = sorted({int(c["id"]) for c in (w.chefs() if w is not None else ())
+                          if c.get("id") is not None})
+        except Exception:                                        # noqa: BLE001
+            ids = []
+        # ⚠ `getattr`: 离线桩里的 Engine 子类**不调 `__init__`**(本仓惯例), 直接摸
+        #   `self.cid` 会把它们炸掉(`_splitkitchen_probe` 就栽在这 —— 和 `self.board` 同一个坑)。
+        _me = int(getattr(self, "cid", 0) or 0)
+        if not ids:
+            ids = [_me]                   # 读不到名单 ⇒ 至少知道自己(⇒ 全归我)
+        fp = (tuple(sorted(p[0] for p in pts)), tuple(ids))
+        cached = getattr(self, "_region_cache", None)
+        if cached is not None and cached[0] == fp:
+            return cached[1]
+        own = {}
+        try:
+            own = region.owners(pts, ids)
+        except Exception as e:                                   # noqa: BLE001
+            # ☠ 分区算崩了**不能把这一轮带死** —— 空表 ⇒ 一律"归我"(老行为)。
+            self.log(f"[区域] ⚠ 切分算崩了({e!r}) —— 这一局按'没有分区'跑")
+        self._region_cache = (fp, own)
+        # 整个指纹只打**一次**(指纹变了才重打 —— 那是真的换了关卡/重开局)。
+        # ☠ 这一行是**实机唯一的验收指纹**: 两个厨师的 **张数必须加起来等于总数**,
+        #   而且两边的切分位置要一致。不一致就是那条"谁也不去"的失效模式。
+        if not own:
+            self.log("[区域] 台面不够 / 只有一个厨师 —— **不分区**(逐字回老行为)")
+        else:
+            _mine = sum(1 for k in own if own[k] == _me)
+            self.log(f"[区域] 我(P{_me + 1})管 {_mine} 张台面 / 队友 "
+                     f"{len(own) - _mine} 张(共 {len(pts)} 张, 切分见 mapview)")
+        return own
+
+    def _region_bonus(self, km, at, cid) -> float:
+        """`at`(世界坐标)那一处**不归 `cid`** ⇒ 扣 `REGION_W` 分; 否则 0。
+
+        ⚠ 返回值**直接加在 `raw` 上**(可以是负的), 形状照 `_plan_bonus` ——
+          `scoring.py` 是纯函数模块, 不为这个多开一个参数(那条注释写明了理由)。
+        ⚠ **`cid` 是"给谁算分"**: 我那一列传 `self.cid`, 队友那一列传 `self._mate_cid()`。
+        ☠ 查不到/读不到 ⇒ **0(不扣)** —— 见 `region.mine` 那段:
+          对"拿不到依据"也罚, 会让两个人**同时**放弃同一处。
+        """
+        if not REGION_ON or at is None:
+            return 0.0
+        own = self._region_owners(km)
+        if not own:
+            return 0.0
+        key = (round(float(at[0]), 1), round(float(at[1]), 1))
+        if region.mine(own, key, cid):
+            return 0.0
+        return -REGION_W
+
+    @staticmethod
+    def _rescue_claim_key(op) -> tuple:
+        """**救锅的占位键** = `("__res__", "rescue", <哪口锅>)` —— 走资源键空间。
+
+        用户 2026-09-17: "**分派一个人去救**"。一口锅是**有身份的** ⇒ 两个人各算一遍
+        必然指向**同一口锅**, 而这一口锅只需要一个人。
+
+        ☠☠ **不能用 `_norm`**: 它**会把实例后缀剥掉**(`"utensil_pot_01 (1)"` → `"utensilpot01"`)
+          ⇒ 两口同名锅会被合进**同一个键**, 于是"占了一口"变成"两口都别去" ——
+          比不占还糟。用**原始名**(和 `_claim_res` 那边拿台面原名当 `rid` 是同一个形状)。
+        ☠ **也不能只拿"锅里是什么"当身份**: 两口锅同时煮米饭是常态
+          (`step_key` 那条"步号是身份, 材料名只是内容"是同一个教训)。
+        ⚠ 名字拿不到时退回挂载点/坐标 —— 一口锅在灶上不会动, 坐标够稳。
+        """
+        rid = (getattr(op, "vessel", "") or getattr(op, "at_name", "")
+               or "@%.1f,%.1f" % (float(getattr(op, "at_x", 0) or 0),
+                                  float(getattr(op, "at_z", 0) or 0)))
+        return ("__res__", "rescue", rid)
+
+    @staticmethod
+    def _claim_key_label(k) -> str:
+        """占位键 → 日志里那个短标签(`counter7第1步` / `锅 utensil_pot_01 (1)`)。
+
+        ⚠ 键有**两种空间**(任务键 `(槽位键, 步号)` / 资源键 `("__res__", kind, rid)`),
+          直接下标会把资源键印成 `__res__第rescue步` —— 读的人分不清那是锅还是步。
+          **只给日志用**, 不参与任何判据。
+        """
+        if isinstance(k, tuple) and len(k) == 3 and k[0] == "__res__":
+            return f"锅 {k[2]}" if k[1] == "rescue" else f"{k[1]} {k[2]}"
+        try:
+            return f"{k[0]}第{k[1]}步"
+        except (TypeError, IndexError, KeyError):
+            return str(k)
 
     def apply_commands(self) -> None:
         """读一次外部命令文件并执行(`neko/control.py`)—— `run()` 每轮调一次。
@@ -11294,7 +11624,11 @@ class Engine:
         #     多几个键不影响它。
         return {"op": op, "label": label, "why": why, "cell": cell,
                 "dist": None, "follow": 0.0,
-                "action": bool(ok), "ground": _ground}
+                "action": bool(ok), "ground": _ground,
+                #: 这一步的**目标世界坐标**(可能 None) —— 给"区域"判归属用(2026-09-17)。
+                #: 与 `cell`(站位格)不同: 这是**台面自己**的位置, 而分区是按台面切的。
+                #: ⚠ 加法键(同上那条纪律), `_rank_candidates` 的老读者一行不用改。
+                "at": target}
 
     def _dish_foreign(self, have, flow) -> set:
         """`have`(一盘里装的东西)里**本单不要**的那些 —— **非空就是"别的单的菜"**。
@@ -11758,10 +12092,26 @@ class Engine:
                                           ortho_only=True, reach=reach)
                 if _sc is not None:
                     _d = reach.get(_sc)
-                    if _d is None or _d <= self.PASS_TOO_FAR_CELLS:
+                    # ☠☠ **区域**（2026-09-17）：这张台面在**他那半边** ⇒ 交给他做。
+                    #   这是闸门②的**又一种"我这边不该做"** —— 和"太远"同族, 只是理由
+                    #   从"路远"换成了"**分工上就不归我**"（用户: "这个区域里的事情
+                    #   **完全由这个厨师负责**, 另一个厨师通过传递来…"）。
+                    #   ⚠ 排在上面那条"太远"**之前**打理由 —— 区域是**先验约定**,
+                    #     比"这一趟多少格"更根本, 日志里说"那在他那半边"比说"走过去要
+                    #     18 格"更能让人一眼看懂发生了什么。
+                    #   ⚠ **`REGION_ON=0` 时 `_region_bonus` 恒 0 且这里也一样** ⇒
+                    #     逐字退回"只看够不够得着 / 远不远"。
+                    #   ⚠ `getattr`: 离线桩不调 `__init__`(`self.cid` 会在短路之前求值)。
+                    if REGION_ON and not region.mine(
+                            self._region_owners(km),
+                            (round(tgt[0], 1), round(tgt[1], 1)),
+                            getattr(self, "cid", None)):
+                        _why = "那在他那半边(区域分工)"
+                    elif _d is None or _d <= self.PASS_TOO_FAR_CELLS:
                         continue        # 够得着而且不远 → 自己做, 不用丢
-                    _why = (f"走过去要 {_d:.0f} 格"
-                            f"(超过 {self.PASS_TOO_FAR_CELLS:.0f})")
+                    else:
+                        _why = (f"走过去要 {_d:.0f} 格"
+                                f"(超过 {self.PASS_TOO_FAR_CELLS:.0f})")
                 else:
                     _why = "台面够不着"
             # ③ 这份料我拿得到吗
