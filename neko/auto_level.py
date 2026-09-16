@@ -70,8 +70,21 @@ MODE_PARTY = "Party"
 #: ☠ **这里写的是"裸键"** —— 到底走虚拟手柄还是键盘, 由 `NEKO_WATCH_AUTO_INPUT`
 #:   决定(`norm_seq` 给它们补前缀)。**序列本身不绑定输入后端** —— 换后端不用改序列。
 #:
-#: 依据:
-#:   · 主界面(StartScreen): 先补 P2(`join`), 再切到 Coop/Party 标签, 再确认。
+#: ☠☠ **只驱动"大厅 → 进关卡"这一半**(用户 2026-09-17: *"主菜单进入的部分不要了,
+#:   保留自动进关卡的"*)。
+#:   `screen`(主界面加入 → 切 Party)与 `wrong`(回主菜单的退路)**默认都不配动作**
+#:   —— `tick()` 见到没配动作的阶段只打一行 `⚠ 阶段 X 没有配任何动作` 然后
+#:   **什么都不做** ⇒ 这是**可逆**的, 想恢复就照抄下面这份原默认值:
+#:     `NEKO_WATCH_AUTO_SEQ=screen=join,D,D,SPACE;lobby=SPACE,SPACE;wrong=ESC,DOWN,DOWN,DOWN,SPACE,LEFT,SPACE`
+#:   ⚠ **为什么 `wrong` 也一起去掉**: 它的动作**全是主菜单导航**(`ESC,↓↓↓,SPACE,←,SPACE`),
+#:     而"回主菜单**再重来**"里的"再重来"已经没有了; 更麻烦的是它会在**任意非大厅
+#:     界面**盲发这一串(判据只有 `mode != Party`)—— 正是用户要避免的"别把界面按乱"。
+#:
+#: 依据(留着 —— 以后要把主菜单那半加回来时**不用重新逆向一遍**):
+#:   · 玄关/大厅(Lobbies): `UISelectNotStart` 的**键盘分支硬编码含 `Space`**
+#:     (`PlayerInputLookup.cs:482-489`) ⇒ 键盘上确认键就是 `SPACE`。
+#:   · 主界面(StartScreen)【默认已关, 见上】: 先补 P2(`join`), 再切到 Coop/Party
+#:     标签, 再确认。
 #:     ☠ `join` **必须走虚拟手柄** —— 那是加入流程唯一的入口(见模块头), 所以它是
 #:       一个**独立动作**, 不是按键, 不受 `AUTO_INPUT` 影响。
 #:     ☠☠ **要按`俩`下 `D`** —— 用户 2026-09-17 实机: *"按一下之后进入了现在在
@@ -79,14 +92,9 @@ MODE_PARTY = "Party"
 #:     ☠ 切标签用 `D`/`RIGHT`, **不是肩键** —— 用户报"按 RB 没用"; 依据
 #:       `PlayerInputLookup.cs:612-616`: 前端移动输入是 `MovementX = StickX + DPadX`,
 #:       **只有摇杆和十字键, 没有肩键**。
-#:   · 玄关/大厅(Lobbies): `UISelectNotStart` 的**键盘分支硬编码含 `Space`**
-#:     (`PlayerInputLookup.cs:482-489`) ⇒ 键盘上确认键就是 `SPACE`。
-#:   · **走错**(`wrong`): 用户给的退路 —— `ESC,↓,↓,↓,SPACE,←,SPACE` 回主菜单。
 #: ⚠ **用户 2026-09-17: "那用键盘, 键盘有效"** ⇒ `NEKO_WATCH_AUTO_INPUT` 默认 `kbd`。
 DEFAULT_SEQ = {
-    STAGE_SCREEN: ["join", "D", "D", "SPACE"],
     STAGE_LOBBY: ["SPACE", "SPACE"],
-    STAGE_WRONG: ["ESC", "DOWN", "DOWN", "DOWN", "SPACE", "LEFT", "SPACE"],
 }
 
 #: 不是按键的动作 —— `norm_seq` 不给它们补前缀。
@@ -228,11 +236,18 @@ class AutoLevel:
 
         if s != self._stage:
             if s == STAGE_WRONG:
-                # ☠ 这一行要**显眼** —— 它是"按错标签了、正在退回来", 不是正常推进。
-                #   用户 2026-09-17 给的判据与退路都在这条日志里点出来。
+                # ☠ 这一行要**显眼** —— 它说的是"当前这一屏不是我们要的 Party 模式"。
+                #   用户 2026-09-17 给的判据在这条日志里点出来。
+                # ⚠ **"⇒ 按退路…" 那句话只在真配了动作时才打** —— 默认序列**不含
+                #   `wrong`**(见 `DEFAULT_SEQ`), 那时脚本**一动不动**, 还打"按退路"
+                #   就是骗读日志的人。
+                # ⚠ 没配动作时**只报诊断、不说处置** —— 紧接着下面那条通用的
+                #   `⚠ 阶段 wrong 没有配任何动作` 已经把"什么都不做 + 怎么配"说全了,
+                #   两行都说就是重复。
                 self.log(f"[进关] ⚠ **走错分支了** —— scene={(st or {}).get('scene')!r} "
-                         f"mode={(st or {}).get('mode')!r}(要的是 {MODE_PARTY}) ⇒ "
-                         f"按退路回主菜单再重来")
+                         f"mode={(st or {}).get('mode')!r}(要的是 {MODE_PARTY})"
+                         + (" ⇒ 按退路回主菜单再重来"
+                            if self.seq.get(STAGE_WRONG) else ""))
             else:
                 self.log(f"[进关] 阶段 → {s}(scene={(st or {}).get('scene')!r}"
                          f" mode={(st or {}).get('mode')!r} "

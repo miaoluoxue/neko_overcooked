@@ -241,9 +241,10 @@ AUTO_TRIES = int(os.environ.get("NEKO_WATCH_AUTO_TRIES") or 2)
 AUTO_SETTLE = float(os.environ.get("NEKO_WATCH_AUTO_SETTLE") or 8.0)
 #: 用哪个虚拟手柄(0/1)。与 `join_player` 的默认值一致。
 AUTO_PAD = int(os.environ.get("NEKO_WATCH_AUTO_PAD") or 1)
-#: **换序列**(不用改代码): `NEKO_WATCH_AUTO_SEQ=screen=join,RB,A;lobby=A,A`。
-#: 空 = 用 `auto_level.DEFAULT_SEQ`。☠ 默认值按逆向文档推的, **实机第一次跑很可能要微调** ——
-#: 对着 `[进关] ▶ …` 那几行改配置就行。
+#: **换序列**(不用改代码): `NEKO_WATCH_AUTO_SEQ=lobby=A,A`。
+#: 空 = 用 `auto_level.DEFAULT_SEQ`(☠ **2026-09-17 起只含 `lobby`** —— 用户
+#: "主菜单进入的部分不要了"; 想把主界面那半加回来见 `DEFAULT_SEQ` 的注释)。
+#: ⚠ 对着 `[进关] ▶ …` 那几行改配置就行。
 AUTO_SEQ = parse_seq(os.environ.get("NEKO_WATCH_AUTO_SEQ") or "")
 
 

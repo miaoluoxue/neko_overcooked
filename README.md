@@ -109,13 +109,22 @@ NEKO_INPUT=keys,virtual                             # 单独一行(那是 --inpu
 
 ### 全自动进关（`NEKO_WATCH_AUTO`，默认 **关**）
 
-开着时：**主界面加入 → 切 Party 模式 → 大厅选主题 → 进可进入的关卡**。
+开着时：**在大厅里选主题 → 进可进入的关卡**。
 逻辑在 `neko/auto_level.py`（纯模块 + I/O 注入，可离线验；探针 `_autolevel_probe`）。
+
+☠☠ **2026-09-17 起默认只管"大厅 → 进关卡"这一半**（用户：*"主菜单进入的部分不要了，
+保留自动进关卡的"*）。主界面那一半（`screen`：补 P2 → 切 Party）和走错分支的退路
+（`wrong`）**默认都不配动作** ⇒ 脚本在主界面上**一个键都不按**。
+要恢复就照抄原默认值（见 `neko/auto_level.py` 的 `DEFAULT_SEQ` 注释，逐字那份）：
+
+```
+NEKO_WATCH_AUTO_SEQ=screen=join,D,D,SPACE;lobby=SPACE,SPACE;wrong=ESC,DOWN,DOWN,DOWN,SPACE,LEFT,SPACE
+```
 
 | 变量 | 默认 | 干什么 |
 |---|---|---|
 | `NEKO_WATCH_AUTO` | `0` | **总开关**。`1` = 开。关着时**逐字退回老行为**（只补 P2，一个菜单键都不按） |
-| `NEKO_WATCH_AUTO_SEQ` | 见下 | **换序列**（不用改代码）：`screen=join,RB,A;lobby=A,A` |
+| `NEKO_WATCH_AUTO_SEQ` | 只管 `lobby` | **换序列**（不用改代码）：`lobby=A,A` |
 | `NEKO_WATCH_AUTO_GAP` | `1.5` | 每个动作之间等多久（秒） |
 | `NEKO_WATCH_AUTO_TRIES` | `3` | 同一阶段最多重来几遍；跑完还不变就**停手打警告** |
 | `NEKO_WATCH_AUTO_PAD` | `1` | 用哪个虚拟手柄（`0`/`1`） |
@@ -127,14 +136,14 @@ NEKO_INPUT=keys,virtual                             # 单独一行(那是 --inpu
 （`app.menu` 读的是**游戏内**暂停菜单，主界面里恒为空串），也报不出"大厅里选了哪个主题"。
 能用的只有 `scene` / `inRound` / `users`：
 
-| `scene` | 阶段 | 动作 |
+| `scene` | 阶段 | 默认动作 |
 |---|---|---|
-| `StartScreen` | 主界面 | 补 P2 → 切 Party/Coop → 确认 |
-| `Lobbies` | Coop 大厅 | 选主题（`PickLevel` **随机挑图**）→ 厨师选择那一屏再确认 |
+| `Lobbies` | Coop 大厅 | ✅ **`SPACE, SPACE`** —— 选主题（`PickLevel` **随机挑图**）→ 厨师选择那一屏再确认 |
+| `StartScreen` | 主界面 | ⛔ **默认不配动作**（打一行 `⚠ 阶段 screen 没有配任何动作` 就等着） |
+| 其它 + `mode≠Party` | 走错分支 | ⛔ **默认不配动作**（同上；只打一行显眼的 `⚠ 走错分支了`） |
 | 其它 | 加载/过场 | **一个键都不按**（乱按只会帮倒忙） |
 
 ⇒ 卡住就看 `[进关] ▶ <阶段>: <动作>` 那几行，对着改 `NEKO_WATCH_AUTO_SEQ`。
-**默认序列是按逆向文档推的，实机第一次跑很可能要微调。**
 
 > 其它所有参数（评分/杂活/风/地图新鲜度/文件通道…）见
 > [`docs/参数配置.md`](docs/参数配置.md) —— 那张表是从代码里扫出来的全量 49 个。
