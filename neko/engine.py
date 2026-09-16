@@ -138,6 +138,25 @@ PLAN_INTERVAL = float(os.environ.get("NEKO_PLAN_INTERVAL") or 6.0)
 #: 一份计划**能用多久** —— 两者独立: 重算可以有节流, 但用的时候必须判新鲜度。
 PLAN_TTL = float(os.environ.get("NEKO_PLAN_TTL") or 20.0)
 
+#: **"这一步的货源, 引擎自己都说解析不出来"的罚分**(2026-09-17)。
+#:
+#: 由来(实机 `s_balloon_5_2`, 用户: "**菜单的制作链有问题**"):
+#:   订单卡第 1 步是 `fetch Bun`, 备注 `⚠ 找不到货源(箱子/生料/成品都没匹配上)`
+#:   (`cookbook.resolve_leaf` 三条路全落空 ⇒ `Op.nosrc=True`), 引擎自己也打了
+#:   `⚠ 重拉知识表后还是找不到货源 —— 这关可能真的没有这种料`。
+#:   ☠ **可这个信号全仓只有 `_derive_with_retry` 一处读它** —— 评分、候选池、
+#:     `⊕备料`、执行层**一处都不看** ⇒ 一个**已判定不可行**的步骤照样拿 `fetch`
+#:     的满分 20 分并被选中 ⇒ 每轮抓一把 `ChoppedBun`、发现不是 `Bun`、放回去
+#:     ⇒ 整单从 99% 烧到 63%, 一个料都没进去。
+#:
+#: 量级取 60(= `assemble` 的步骤价): 足够让 `fetch X`(20) **输给任何一步正常的活**
+#:   (最远的 `fetch` 也只到 20 - 2×30 = -40), 但**不是 `-inf`** ——
+#:   `nosrc` 说的是"**知识表**里精确匹配不到", 而执行层还有"地上的料"那条运行时兜底
+#:   (`_op_target_for_score` 的解析链)。**真没别的活时它还得能试**(规则 5:
+#:   闸门是用来排序的, 不是用来把活干没的)。
+#: `0` = 关掉这个罚分(退回老行为)。
+NOSRC_PENALTY = float(os.environ.get("NEKO_NOSRC_PENALTY") or 60.0)
+
 #: **"这一步是计划排给我的"奖励分**。见 `Engine._plan_bonus`。
 #:
 #: 量级取 8: 比 `fetch`(20) 的一个格距(2.0)大得多 ⇒ 同样一步, 计划排的会赢过
@@ -999,9 +1018,19 @@ class Engine:
         if not self.ensure_knowledge(st, force=True):
             return flow
         flow2 = derive(detail, self.know)
-        if any(getattr(op, "nosrc", False) for op in flow2.ops):
-            self.log(f"[引擎] ⚠ {flow.name}: **重拉知识表后还是找不到货源** —— "
-                     f"这关可能真的没有这种料(不是'开局还没扫到')")
+        _miss = [op.target for op in flow2.ops if getattr(op, "nosrc", False) and op.target]
+        if _miss:
+            # ☠☠ **把"缺哪几样"点出来**(2026-09-17, 用户: "菜单的制作链有问题")。
+            #   原来只说"找不到货源" ⇒ 得自己去订单卡上逐行找。而这一条正是
+            #   "这单做不了"的**根因行** —— 缺的那一样是**游戏数据**里没有对应货源
+            #   (知识表的边断了), 不是时机问题: 重拉过一遍还是一样。
+            #   ⚠ 实测那一局缺的是 `Bun`, 而箱子实际出的是 `ChoppedBun` ——
+            #     两边在表里**没有任何一条边**(`next`/`ing`/`spawn` 全落空)。
+            #     要定案得**游戏在线**(见 `runtime/_nosrc_live.py`)。
+            self.log(f"[引擎] ⚠ {flow.name}: **重拉知识表后还是找不到货源**: "
+                     f"{', '.join(sorted(set(_miss)))} —— 这关可能真的没有这种料"
+                     f"(不是'开局还没扫到')。这几步会被压分/不进备料, "
+                     f"但**这一单多半做不完**; 要查根因跑 `runtime\\_nosrc_live.py`(需游戏在线)")
             return flow
         self.log(f"[引擎] ↻ {flow.name}: 知识表**重拉**后货源齐了(开局时还没扫到) —— "
                  f"规划已换成**带加工**的版本({len(flow2.ops)} 步)")
@@ -7935,6 +7964,14 @@ class Engine:
                 slot_of[i] if (slot_of is not None and i < len(slot_of)) else "")
             if _pb:
                 raw[-1] += _pb
+            # ☠☠ **"这一步的货源引擎自己都说没有" ⇒ 罚分**(见 `NOSRC_PENALTY`)。
+            #   信号是现成的(`cookbook.resolve_leaf` 给的 `Op.nosrc`), 只是**从来没接到
+            #   评分上** —— 于是"已知不可行"和"很划算"在表里长得一模一样。
+            #   ⚠ **只对有限的候选扣**(`-inf` 是硬闸门, 扣它没有意义, 也免得把
+            #     "本就不可达"混进这条账里)。
+            #   ⚠ 罚分**只影响排序**: 真没别的活时它照样能被选中(规则 5), 见常量注释。
+            if NOSRC_PENALTY and getattr(r["op"], "nosrc", False) and raw[-1] != scoring.NEG_INF:
+                raw[-1] -= NOSRC_PENALTY
             sigs.append(f"{r['op'].action} {r['op'].target}")
 
         # 3) 队友的原始分: 只换位置相关的项 —— 步骤价对两个人都一样。
@@ -11184,8 +11221,25 @@ class Engine:
         mine = lookahead.shortfall_of(flow, inv) if flow is not None else dict(gap)
         if not mine:
             return []
-        out = []
+        #: ☠☠ **货源解析不出来的那几样, 备料不该提**(2026-09-17 实机 `s_balloon_5_2`)。
+        #   信号是现成的: `cookbook.resolve_leaf` 落空时会给那一步盖 `Op.nosrc`。
+        #   备料的语义是"**提前多做一份**" —— 而这一样**连货源都没有**, 提了就是
+        #   每轮去抓一把错的: 实测 `fetch Bun ⊕备料`(0 格距、20 分)**反复被选中**,
+        #   每次抓回来的是 `ChoppedBun` ⇒ 放回去 ⇒ 重试 3 次 ⇒ 整单从 99% 烧到 63%,
+        #   **一个料都没进去**。评分那道罚分(`NOSRC_PENALTY`)管菜谱步, 这一条管备料。
+        #   ⚠ 只跳**本单链上自己标了 `nosrc` 的**(名字对得上才跳), 不是按名字黑名单。
+        _nosrc = set()
+        for _f in ([flow] if flow is not None else list(flows or [])):
+            if _f is None:
+                continue
+            for _o in (getattr(_f, "ops", None) or []):
+                if getattr(_o, "nosrc", False) and _o.target:
+                    _nosrc.add(self._norm(_o.target))
+        out, _skipped = [], []
         for mat in sorted(mine):
+            if self._norm(mat) in _nosrc:
+                _skipped.append(mat)
+                continue
             # 份数报**订单栏口径**(那才是"该备几份"的来源); 这单刚下架、不在订单栏里时,
             # 退回本单口径 —— 别让一次读不到算出 0 份(那等于静默把备料关掉)。
             n = int(gap.get(mat, mine[mat]))
@@ -11196,6 +11250,15 @@ class Engine:
                           chop_stages=src.chop_stages, in_pot=src.in_pot,
                           prep=True, note=f"提前备料(本单还缺 {mine[mat]} 份, "
                                           f"订单栏共缺 {n} 份)"))
+        # ☠ **跳过这件事不能静默** —— 用户就是靠日志发现"制作链有问题"的, 而"备料
+        #   少了几样"和"本来就不缺"在日志里必须分得开。
+        #   ⚠ 这是**每 0.5 秒一轮**的循环 ⇒ **只报状态变化那一次**(同 `_no_order_said` 的纪律)。
+        _key = tuple(sorted(_skipped))
+        if _key != getattr(self, "_nosrc_said", None):
+            self._nosrc_said = _key or None
+            if _key:
+                self.log(f"[备料] ⚠ 这几样的**货源解析不出来**, **不提前备**: "
+                         f"{', '.join(_key)}(链上标着'找不到货源') —— 备了也是去抓一把错的")
         return out
 
     def _prep_src(self, flow, mat: str, km, inv, flows=None):
