@@ -112,10 +112,19 @@ NEKO_INPUT=keys,virtual                             # 单独一行(那是 --inpu
 开着时：**在大厅里选主题 → 进可进入的关卡**。
 逻辑在 `neko/auto_level.py`（纯模块 + I/O 注入，可离线验；探针 `_autolevel_probe`）。
 
-☠☠ **2026-09-17 起默认只管"大厅 → 进关卡"这一半**（用户：*"主菜单进入的部分不要了，
-保留自动进关卡的"*）。主界面那一半（`screen`：补 P2 → 切 Party）和走错分支的退路
-（`wrong`）**默认都不配动作** ⇒ 脚本在主界面上**一个键都不按**。
-要恢复就照抄原默认值（见 `neko/auto_level.py` 的 `DEFAULT_SEQ` 注释，逐字那份）：
+☠☠ **2026-09-17 起默认 = 补 P2 + "大厅 → 进关卡"**（用户：*"主菜单进入的部分不要了，
+保留自动进关卡的"*）：
+- 主界面 **只按 `join`**（补 P2）—— **切标签那两下 `D` 去掉了**；
+- 走错分支的退路（`wrong`）**不配动作** ⇒ 那一屏上**一个键都不按**
+  （它的动作全是主菜单导航，会盲发）。
+
+☠☠☠ **`join` 绝不能删**：`NEKO_WATCH_AUTO=1` 时看护的 `tick` 里那条老路
+（`join_lobby`）**直接 `return`，一次都不会被调**（`run_watch.py:455-457`）
+⇒ 序列里这个 `join` 是**补 P2 的唯一路径**，删了就**永远单人开局**。
+（大厅那一档也带着它：看护可能在大厅才启动，那时 `screen` 根本不会被经过。
+`join_player` 自己先查人数、≥2 就跳过，所以多调几次是安全的。）
+
+要恢复主界面那一整套就照抄原默认值（见 `neko/auto_level.py` 的 `DEFAULT_SEQ` 注释，逐字那份）：
 
 ```
 NEKO_WATCH_AUTO_SEQ=screen=join,D,D,SPACE;lobby=SPACE,SPACE;wrong=ESC,DOWN,DOWN,DOWN,SPACE,LEFT,SPACE
@@ -124,8 +133,12 @@ NEKO_WATCH_AUTO_SEQ=screen=join,D,D,SPACE;lobby=SPACE,SPACE;wrong=ESC,DOWN,DOWN,
 | 变量 | 默认 | 干什么 |
 |---|---|---|
 | `NEKO_WATCH_AUTO` | `0` | **总开关**。`1` = 开。关着时**逐字退回老行为**（只补 P2，一个菜单键都不按） |
-| `NEKO_WATCH_AUTO_SEQ` | 只管 `lobby` | **换序列**（不用改代码）：`lobby=A,A`。⚠ 写死序列就**失去了"第几次"那套**（见下） |
+| `NEKO_WATCH_AUTO_SEQ` | `screen`+`lobby` | **换序列**（不用改代码）：`lobby=join,A,A`。⚠ 写死 `lobby` 就**失去了"第几次"那套**（见下） |
 | `NEKO_WATCH_AUTO_PICK` | `1,2,0` | 大厅**第几次进关 ⇒ 按几下右**（逗号分隔）。用完在 `0..N-1` 里**随机** |
+| `NEKO_WATCH_AUTO_GAP` | `1.5` | 每个动作之间等多久（秒） |
+| `NEKO_WATCH_AUTO_TRIES` | `3` | 同一阶段最多重来几遍；跑完还不变就**停手打警告** |
+| `NEKO_WATCH_AUTO_PAD` | `1` | 用哪个虚拟手柄（`0`/`1`） |
+
 
 ### 大厅选主题：`pick`（2026-09-17）
 
@@ -147,10 +160,6 @@ NEKO_WATCH_AUTO_SEQ=screen=join,D,D,SPACE;lobby=SPACE,SPACE;wrong=ESC,DOWN,DOWN,
   （`StartLevel() → PickTheme() → PickLevel()`，判据 `AvailableInLobby && Theme==选中主题`）。
   所以"右 N 下"是选**第 N 个主题**，"随机"那一段是在**三个主题里随机挑一个**。
 - 换表：`NEKO_WATCH_AUTO_PICK=0,3`（不用改代码）。
-| `NEKO_WATCH_AUTO_GAP` | `1.5` | 每个动作之间等多久（秒） |
-| `NEKO_WATCH_AUTO_TRIES` | `3` | 同一阶段最多重来几遍；跑完还不变就**停手打警告** |
-| `NEKO_WATCH_AUTO_PAD` | `1` | 用哪个虚拟手柄（`0`/`1`） |
-
 **动作面**：`join`（补 P2，复用既有的 `join_lobby`）/ `wait` / `pad:<键>`（虚拟手柄，默认）/
 `kbd:<键>`（键盘，会当场把前台拽回游戏）。裸键名自动当 `pad:`。
 
@@ -160,8 +169,8 @@ NEKO_WATCH_AUTO_SEQ=screen=join,D,D,SPACE;lobby=SPACE,SPACE;wrong=ESC,DOWN,DOWN,
 
 | `scene` | 阶段 | 默认动作 |
 |---|---|---|
-| `Lobbies` | Coop 大厅 | ✅ **`pick`** —— 按"第几次进关"右移 N 下选主题 → 确认 |
-| `StartScreen` | 主界面 | ⛔ **默认不配动作**（打一行 `⚠ 阶段 screen 没有配任何动作` 就等着） |
+| `Lobbies` | Coop 大厅 | ✅ **`join` + `pick`** —— 先确认 P2 在，再按"第几次进关"右移 N 下选主题 → 确认 |
+| `StartScreen` | 主界面 | ⚠️ **只按 `join`**（补 P2）—— 不切标签、不确认 |
 | 其它 + `mode≠Party` | 走错分支 | ⛔ **默认不配动作**（同上；只打一行显眼的 `⚠ 走错分支了`） |
 | 其它 | 加载/过场 | **一个键都不按**（乱按只会帮倒忙） |
 

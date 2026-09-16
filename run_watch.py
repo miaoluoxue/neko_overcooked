@@ -691,8 +691,9 @@ def main() -> int:
                             settle=AUTO_SETTLE, prefix=AUTO_KEY_PREFIX, log=log,
                             pick_rights=AUTO_PICK)
         w.auto_do = do_auto
-        log(f"[看护] **全自动进关已开** —— 大厅选主题 → 进图"
-            f"(⚠ 主界面那一半**没开**: 用户 2026-09-17 \"主菜单进入的部分不要了\")")
+        log(f"[看护] **全自动进关已开** —— **补 P2 → 大厅选主题 → 进图**"
+            f"(⚠ 主界面**只补 P2**, 切标签那一半没开: 用户 2026-09-17 "
+            f"\"主菜单进入的部分不要了\"; 但 `join` **不能删** —— 老路已被 AUTO 挡掉)")
         log(f"[看护]   序列 = {AUTO_SEQ or norm_seq(_DEF_SEQ)}"
             f"   裸键走 **{AUTO_INPUT}**(`NEKO_WATCH_AUTO_INPUT`; join 永远走虚拟手柄)")
         log(f"[看护]   大厅选主题: 第几次进关按几下右 = "

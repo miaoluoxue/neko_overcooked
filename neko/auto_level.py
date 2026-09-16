@@ -99,12 +99,26 @@ MODE_PARTY = "Party"
 #:       `PlayerInputLookup.cs:612-616`: 前端移动输入是 `MovementX = StickX + DPadX`,
 #:       **只有摇杆和十字键, 没有肩键**。
 #: ⚠ **用户 2026-09-17: "那用键盘, 键盘有效"** ⇒ `NEKO_WATCH_AUTO_INPUT` 默认 `kbd`。
-#:   · 大厅(Lobbies): **`pick`** —— "按第几次进关"决定按几下右(见 `PICK_RIGHTS`)。
-#:     ⚠ 原来是写死的 `["SPACE", "SPACE"]`, 而它在实机里**没跑通**
+#:   · 主界面(StartScreen): **只留 `join`(补 P2)**。
+#:     ☠☠ **切标签那两下 `D` + `SPACE` 去掉了**(用户: "主菜单进入的部分不要了") ——
+#:       它们是"主界面导航", 而用户自己会走到大厅。
+#:     ☠☠☠ **`join` 绝不能跟着一起删**(2026-09-17 用户当场打回来的:
+#:       *"加队友的怎么也删了啊"*)。理由在代码里是硬的:
+#:       `run_watch.Watcher.tick` 里 `AUTO` 开着时**直接 `return`**
+#:       (`run_watch.py:455-457`) ⇒ **`join_lobby` 那条老路一次都不会被调**
+#:       ⇒ 序列里这个 `join` 是**补 P2 的唯一路径**, 删了就是**永远单人开局**。
+#:   · 大厅(Lobbies): **`join` + `pick`** —— 先确认 P2 在, 再选主题。
+#:     ⚠ 大厅这一档也要 `join`: 看护**可能就是在主界面之后才启动的**
+#:       (实机那局第一行就是 `阶段 → lobby(...)`, 压根没见过 `screen`)——
+#:       只挂在 `screen` 上的话, 那种开局**永远补不上 P2**。
+#:     ⚠ 多调几次是**安全**的: `join_player` 自己**先查人数、`>= 2` 就跳过**
+#:       (`bridge/virtual_pad.py:468`), 不会"引进第三个人"。
+#:     ⚠ `pick` 原来是写死的 `["SPACE", "SPACE"]`, 而它在实机里**没跑通**
 #:       (`[进关] ⚠ lobby 阶段按了 2 遍还是没动`), 而且写死的序列**表达不了
 #:       "第几次"** ⇒ 改成这个动态动作。
 DEFAULT_SEQ = {
-    STAGE_LOBBY: [PICK],
+    STAGE_SCREEN: ["join"],
+    STAGE_LOBBY: ["join", PICK],
 }
 
 #: 不是按键的动作 —— `norm_seq` 不给它们补前缀。
