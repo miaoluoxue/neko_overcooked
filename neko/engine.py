@@ -2200,8 +2200,21 @@ class Engine:
             pass
         return getattr(spot, "name", "") or ""
 
+    #: **`_align_for_place` 原地挪不出来时, 换不换相邻站位格**(2026-09-17)。
+    #:
+    #: `0` = 逐字退回老行为(只在原地朝台面中心挪 + 转身) —— 本仓"一键回退"的惯例。
+    #: 要它是因为下面那条 ☠: 老行为**没有任何机制能换到台子的另一侧**。
+    ALIGN_TRY_CELLS = (os.environ.get("NEKO_ALIGN_TRY_CELLS") or "1").strip().lower() \
+        not in ("0", "off", "no", "false")
+
     def _align_for_place(self, spot, tries: int = 8) -> bool:
         """朝 `spot` 挪到**游戏说"放置目标就是它"**为止。返回是否对齐。
+
+        ☠☠ **两段式**(2026-09-17, 用户点名的"锅的定位不是很好"):
+          ① **原地微调** `tries` 次 —— 老行为, 常见情形(游戏已经认了)在这里就返回,
+             **一步都没变**;
+          ② 原地挪不出来 ⇒ **换一个相邻站位格再问**(`_align_try_other_cells`)。
+          要第 ② 段的理由见那个函数的注释 —— 一句话: **老行为换不了边**。
 
         ☠ 为什么必须确认(实测 `s_wonderland_1_5`, 整局报废):
           导航只保证"站到了旁边", `face` 只保证"面朝那边" —— 而**两个台子挨得近时**,
@@ -2251,9 +2264,89 @@ class Engine:
                 time.sleep(0.15)
                 key_up(key)
             time.sleep(0.12)
+        # ---- ☠ 原地挪不出来 ⇒ **换一个相邻站位格再问游戏**(见那个函数的注释) ----
+        if self.ALIGN_TRY_CELLS and self._align_try_other_cells(spot, want):
+            return True
         st = self.state(force=True)
         self.log("[步骤] ⚠ 挪了 %d 次, 游戏仍说放置目标是 %r(期望 %r) —— **不再按下去**"
                  % (tries, (self.chef(st) or {}).get("placeh") or "", want))
+        return False
+
+    def _align_try_other_cells(self, spot, want: str, most: int = 7) -> bool:
+        """**换一个相邻站位格, 再问一次游戏"放置目标是它吗"**。
+
+        ☠☠ 为什么必须有它(用户 2026-09-17 点名"锅的定位不是很好"; 实机 `s_sushi_1_3`):
+          所有 `_align_for_place` 的调用点都是
+          `navigate_smart(km, spot.x, spot.z, tight=0.8)` → `face` → `_align_for_place`
+          —— 而那是**朝台面中心走**。本仓自己的规矩(`_stand_cell` 的注释)早写明:
+            「**不能直接朝台面坐标走**…台面本身就是障碍格, 厨师站不上去」
+          那条规矩在 `_approach`(pick/use)那条路上守住了, **取菜/切菜/摆盘/送餐这几条没守**。
+          `navigate_smart` 只保证"到中心 `tight` 格以内", **从哪一侧到达完全看寻路**;
+          而灶台有四个相邻格, **只有朝向锅的那一侧**游戏才认 ⇒ 从
+          `workstation_plate_return` 那一侧到达时 `placeh` 就报隔壁台子。
+          老 `_align_for_place` 落空后**只会朝中心再挪一步 + 转身** —— 台面是障碍格,
+          那一步要么被挡、要么把人往中心推 ⇒ **它没有任何机制能换到另一侧**,
+          `tries` 次只是把同一个错重复 `tries` 遍。
+          实测原话: `⚠ 挪了 8 次, 游戏仍说放置目标是 'workstation_cooker_01 (3)'`。
+
+        ☠ 这一招 `_approach` **早就做出来了**(取目标的全部相邻能站格 → 就近试几个 →
+          每个都 `face` + 问游戏), 它自己的注释就是这条教训:
+            「只试"最近那个"是不够的…**那个方向的相邻格多半被挡住/够不着, 换个方位站就好了**」
+          ⇒ 同一个病, `pick`/`use` 那条路治过, `place` 这条没治 —— 这里补上, **不另写一套**。
+
+        ⚠ **判据仍然只有一份**: 够不够得着永远由**游戏报的 `placeh`** 说了算,
+          这里只负责换**起点**。一行几何都不自己算(同 `_align_for_place` 的纪律)。
+        ☠☠ **`max_di=1` + `most=7` = "围着这台子转一圈"**, 而且**是有界的**:
+          台面是一格, 相邻格**恰好 8 个**; 跳掉脚下那一格 ⇒ 最多 7 次, 一次不多。
+          ⚠ **不能沿用 `_stand_cells` 的 `max_di=2`**: 那会连"隔着两格"的格子一起
+            返回(5×5 去掉中心 = 24 个), 而**隔两格根本够不着台面**(交互半径 1.0,
+            格距 1.2) —— 拿它当候选是纯浪费, 还会把真正相邻的那几个挤到 `most` 之外。
+          ⚠ 也不要"只试最近的 3 个": 实测排序里最近的正是**背后那几格**, 而要找的
+            "另一侧"排在第 4~7 位 ⇒ 试 3 个**永远试不到**。
+          ⚠ **脚下这一格跳过** —— 刚才那 `tries` 次已经把它试透了。
+          ⚠ 顺序仍按**离当前远近**(`_stand_cells` 已排好): 先去最近的, 省时间。
+        ⚠ 队友站着的格**先让开**(`occupied_by_others`, 同 `_approach`):
+          两个人挤在同一格只会互相推, 而 `_stand_cells` 的纪律是"全被占了照常返回"
+          (宁可挤一下, 也别站着什么都不做)。
+        ⚠ 只在**落空之后**走这一趟 ⇒ 是**加法**: `ALIGN_TRY_CELLS=0` 就等于没改过。
+        """
+        if not want or spot is None:
+            return False
+        tm = self.terrain()
+        if tm is None or not getattr(tm, "ok", False):
+            return False
+        st = self.state(force=True)
+        if not st or not st.get("inRound"):
+            return False
+        km = self.map(st) if st else None
+        cx, cz, _ = self.pos(st) if st else (None, None, "")
+        if cx is None:
+            return False
+        avoid = set()
+        if getattr(self, "world", None) is not None:
+            avoid = self.world.occupied_by_others(getattr(self, "cid", 0), tm)
+        # ⚠ `max_di=1` —— 见 docstring: 只围**相邻那一圈**, 隔着两格的够不着台面。
+        cands = self._stand_cells(tm, spot.x, spot.z, cx, cz, max_di=1, avoid=avoid)
+        here = tm.cell_of(cx, cz)
+        tried = 0
+        for (sx, sz) in cands:
+            if tried >= most:
+                break
+            if tm.cell_of(sx, sz) == here:
+                continue                       # 脚下这一格刚才那 `tries` 次试过了
+            tried += 1
+            self.navigate_smart(km, sx, sz, tight=0.5)
+            self.face(spot.x, spot.z)
+            st2 = self.state(force=True)
+            ph = (self.chef(st2) or {}).get("placeh") or ""
+            # ☠ 与 `_align_for_place` **同一条判据**(精确比, 连实例号) —— 别在这儿
+            #   换一个宽松的比法, 那正是那里注释里记着的实机翻车(`countertop_01_standard_wood`
+            #   裸名 vs `(2)`, 宽松比判"对上了" ⇒ 按下去 placeCanHandle=false ⇒ 整单放弃)。
+            if ph and ph == want:
+                self.log("[步骤] ↻ 原地挪不出来, 换到 (%.1f,%.1f) 再问: 游戏说放置目标=%r ✓"
+                         % (sx, sz, ph))
+                return True
+            self.log("[步骤] ↻ 换到 (%.1f,%.1f) 再问: 游戏仍说 %r ✗" % (sx, sz, ph))
         return False
 
     def _aim_ok(self, st: dict, want: str) -> bool:
@@ -7841,6 +7934,9 @@ class Engine:
             _ord = sorted([n for n in range(len(pending)) if final[n] > scoring.NEG_INF],
                           key=lambda n: final[n], reverse=True)
             _got = None
+            #: `[(键, 占位者, 建议可做否)]` —— **全被占**时用它说清"**谁**占着"。
+            #: 见下面 `_got is None` 那段 ☠: 没有它, "泄漏"和"池子小"在日志里一模一样。
+            _lost = []
             for _n in _ord:
                 _j = pending[_n]
                 if _j >= n_recipe or _j >= len(slot_of) or _j >= len(step_of):
@@ -7850,11 +7946,42 @@ class Engine:
                     _got = (_n, _k)
                     break
                 verdict[_n] = "错开(队友刚占了这一步)"
+                # ⚠ `step_owner` 与 `claim_step` 是同一张表的两面(都在 `OrderBoard`),
+                #   但离线桩的黑板可能只给了 `claim_step`/`step_key` ⇒ 读不到就记 None,
+                #   **不能让它把这一轮炸掉**(那是"绝不停机"的一部分)。
+                try:
+                    _lost.append((_k, _bd.step_owner(_k)))
+                except Exception:                                  # noqa: BLE001
+                    _lost.append((_k, None))
                 if _n == chosen:
                     self.log(f"[分工] {ops[_j].action} {ops[_j].target} "
                              f"({slot_of[_j]} 第{step_of[_j]}步) 队友在做 —— 我改选下一个")
             if _got is None:
-                self.log("[分工] ⚠ 全池的步位都被占 —— 规则 5: 宁可重复也别让人站着")
+                # ☠☠ **"全被占"必须说清是谁占着**(2026-09-17 用户要求: "**先分清**是
+                #   物理挡路还是选到同一处")。这一行原来只说"都被占" ⇒ **占位泄漏**和
+                #   **池子太小**在日志里长得**一模一样**, 只能猜。
+                # ⚠ **别和 `_no_order_why` 的 ③ 搞混 —— 两处问的不是同一个时刻**:
+                #   那一条在**我一个候选都没有**(空转)时打, 统计的是**整个池**里
+                #   `taken/total` 有多少步在队友名下; 这一条在**我有候选、但每个
+                #   step_key 都被占**时打, 列的是**刚才试过的那几个键分别归谁**。
+                #   两条用的都是 `step_owner` 同一个面, 别在这儿另立一套判据。
+                #   判据(对着**同一时刻**的 `[引擎] ▶ 第N步 …` 看):
+                #     · 占位**全在同一个 cid** 名下、而那个 cid 此刻在做**别的**事  ⇒ **泄漏**;
+                #     · 两边各占自己那几步, 都在做自己那步                        ⇒ 不是泄漏,
+                #       是**池子小**(或候选被冷板凳/交给队友剔光了) ⇒ 调 `NEKO_COOP_ORDERS`;
+                #     · owner 是**已经停掉的那个厨师**(它那轮日志停了)          ⇒ 泄漏,
+                #       `_claimed_step` 没清干净。
+                _own: dict = {}
+                for _k, _o in _lost:
+                    _own.setdefault(_o, []).append(f"{_k[0]}第{_k[1]}步")
+                _who = "; ".join(
+                    "%s(cid=%r)占 %d 个: %s%s"
+                    % ("我" if _o == self.cid else "队友" if _o is not None else "?",
+                       _o, len(_v), ", ".join(_v[:4]), "…" if len(_v) > 4 else "")
+                    for _o, _v in _own.items()) or "(一个步位都没试到)"
+                self.log(f"[分工] ⚠ 全池的步位都被占({len(_lost)} 个) —— "
+                         f"规则 5: 宁可重复也别让人站着")
+                self.log(f"[分工]    谁占着: {_who}")
             else:
                 chosen = _got[0]
                 self._claimed_step = _got[1]       # 释放时用它(见 `_release_step_claim`)
