@@ -7958,10 +7958,13 @@ class Engine:
             #: `[(键, 占位者, 建议可做否)]` —— **全被占**时用它说清"**谁**占着"。
             #: 见下面 `_got is None` 那段 ☠: 没有它, "泄漏"和"池子小"在日志里一模一样。
             _lost = []
+            #: 这一轮**真正去占过**的菜谱候选有几个 —— 见下面"0 个"那段的 ☠。
+            _tried = 0
             for _n in _ord:
                 _j = pending[_n]
                 if _j >= n_recipe or _j >= len(slot_of) or _j >= len(step_of):
                     continue                       # 杂活/越界 ⇒ 不占
+                _tried += 1
                 _k = _bd.step_key(slot_of[_j], step_of[_j])
                 if _bd.claim_step(_k, self.cid, STEP_CLAIM_TTL):
                     _got = (_n, _k)
@@ -7992,17 +7995,32 @@ class Engine:
                 #       是**池子小**(或候选被冷板凳/交给队友剔光了) ⇒ 调 `NEKO_COOP_ORDERS`;
                 #     · owner 是**已经停掉的那个厨师**(它那轮日志停了)          ⇒ 泄漏,
                 #       `_claimed_step` 没清干净。
-                _own: dict = {}
-                for _k, _o in _lost:
-                    _own.setdefault(_o, []).append(f"{_k[0]}第{_k[1]}步")
-                _who = "; ".join(
-                    "%s(cid=%r)占 %d 个: %s%s"
-                    % ("我" if _o == self.cid else "队友" if _o is not None else "?",
-                       _o, len(_v), ", ".join(_v[:4]), "…" if len(_v) > 4 else "")
-                    for _o, _v in _own.items()) or "(一个步位都没试到)"
-                self.log(f"[分工] ⚠ 全池的步位都被占({len(_lost)} 个) —— "
-                         f"规则 5: 宁可重复也别让人站着")
-                self.log(f"[分工]    谁占着: {_who}")
+                # ☠☠☠ **`_tried == 0` 和"全被占"是两件完全不同的事**(2026-09-17 实机
+                #   `s_rapids_3_5` 打回来的):
+                #     那一轮 `chosen` 是个**杂活**(`chop Potato ↺回溯`), 而杂活在上面
+                #     `_j >= n_recipe: continue` 就被跳过了 ⇒ 循环体**一次都没进** ⇒
+                #     `_lost` 是空的, 却照样打了"全池的步位都被占(0 个)"。
+                #   ⇒ 日志上写着"被占 0 个", 而**真相是"这一轮一个可占的菜谱步都没有"**。
+                #     用户拿这行去分清"泄漏 vs 池子小"时, 会被它**直接带偏**。
+                #   ⇒ 分开报: 一个可占的都没有 ⇒ 说清是"候选全是杂活"; 真被占了才列 owner。
+                if _tried and _lost:
+                    _own: dict = {}
+                    for _k, _o in _lost:
+                        _own.setdefault(_o, []).append(f"{_k[0]}第{_k[1]}步")
+                    _who = "; ".join(
+                        "%s(cid=%r)占 %d 个: %s%s"
+                        % ("我" if _o == self.cid else "队友" if _o is not None else "?",
+                           _o, len(_v), ", ".join(_v[:4]), "…" if len(_v) > 4 else "")
+                        for _o, _v in _own.items())
+                    self.log(f"[分工] ⚠ 全池的步位都被占({len(_lost)} 个) —— "
+                             f"规则 5: 宁可重复也别让人站着")
+                    self.log(f"[分工]    谁占着: {_who}")
+                else:
+                    # ⚠ `_lost` 空但 `_tried > 0` 走不到这儿(占不到就一定会 append),
+                    #   所以这一支就是 `_tried == 0`。
+                    self.log(f"[分工] 这一轮**一个可占的菜谱步都没有**"
+                             f"({len(_ord)} 个候选全是杂活/越界) —— "
+                             f"**不是被占**, 只是没得占(规则 5: 照做)")
             else:
                 chosen = _got[0]
                 self._claimed_step = _got[1]       # 释放时用它(见 `_release_step_claim`)
