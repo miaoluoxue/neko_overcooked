@@ -1422,6 +1422,35 @@ class Engine:
                     pass
             self.kb.release_all()
 
+    #: **`face` 的"危险格不转身"守卫要不要给游戏留一条退路**(2026-09-17)。
+    #: `0` = 逐字退回老行为(地图说危险就一律不转)。见 `face` 里那段 ☠。
+    FACE_TRUST_GAME = (os.environ.get("NEKO_FACE_TRUST_GAME") or "1").strip().lower() \
+        not in ("0", "off", "no", "false")
+
+    def _map_danger_wrong_here(self, tm, x: float, z: float) -> bool:
+        """**这张图此刻的"危险"判据, 在我脚底下这一格就已经对不上现实了** —— 是就回 True。
+
+        判据(与 `navigate` 里那条 `_danger_trust` **同源**, 但**不用等 0.6 秒**):
+          **脚下这一格**地图说是危险格, 而游戏**没在重生我** ⇒ 它对不上现实。
+        ☠ 为什么敢在 `face` 这种**高频**调用里做: 它**只读一帧**(`state()` 吃 TTL 缓存),
+          **不按键、不 sleep** —— 导航那条要等 0.6 秒是因为它下一步**真的要走进去**;
+          这里只是决定"要不要拒绝转身", 证据在脚下, 不需要等。
+        ⚠ 拿不到地形/状态 ⇒ `False`(**保守: 信地图**)。
+        ⚠ **这一条只在"厨师正站在一个地图说是危险的格子上"时才可能为真** ——
+          正常地图上他站在实地上, 恒 False ⇒ 老行为一字不变。
+        """
+        if tm is None or not getattr(tm, "ok", False):
+            return False
+        try:
+            if not tm.is_danger_world(x, z):
+                return False              # 脚下这格地图说安全 ⇒ 没有"对不上"的证据
+            st = self.state()
+            if not st:
+                return False
+            return not self.is_respawning(st)
+        except Exception:                                     # noqa: BLE001
+            return False                  # 判不了 ⇒ 保守(信地图, 不转身)
+
     # ---------------- 交互 ----------------
     def face(self, tx: float, tz: float, hold: float = 0.10) -> bool:
         """朝目标方向轻点一下方向键, 把厨师**转过去**(顺带贴近一点)。
@@ -1458,8 +1487,27 @@ class Engine:
             nx = x + dx / dist * look
             nz = z + dz / dist * look
             if tm.is_danger_world(nx, nz):
-                self.log("[朝向] 目标方向是危险格, 不转身")
-                return False
+                # ☠☠ **"信游戏"退路**(2026-09-17; 规则 2: 拿不准就问游戏) ——
+                #   和 `navigate` 里那条 `_danger_trust` **是同一个病、同一条判据**。
+                #   `is_danger_world` 是**只看格子的 2D 判据**(不看高度), 而 KillPlane 是
+                #   3D 体积 ⇒ 重生点/台面边缘/水位图很容易被投影成"危险"。
+                #   ☠ 实测(`s_rapids_3_5`, 2026-09-17): 地图一度报
+                #     `可走0 障碍36 物理阻挡0 危险75 空洞1425`(48x32=1536 格里 1425 格是空洞)
+                #     ⇒ 这个守卫**成片拦下转身**, 日志里 `[朝向] 目标方向是危险格, 不转身`
+                #     连着刷, **紧跟着**就是 `⚠ 挪了 8 次, 游戏仍说放置目标是 ''(期望
+                #     'FryingStation (1)')` —— 转不了身 ⇒ `placeh` 永远解析不出来
+                #     ⇒ 整个 `cook` 失败。
+                #   ⇒ 判据:**我脚下这一格地图也说是危险格, 而游戏没在重生我**
+                #     ⇒ 这张图此刻的"危险"投影对不上现实 ⇒ 不拿它挡转身。
+                #   ⚠ **安全性靠"只在脚下那格也报危险时才生效"**: 正常地图上厨师站在实地上,
+                #     这条恒不触发 ⇒ 行为**一字不变**; 只有地图**已经在乱报**时才放开。
+                #   ⚠ 真掉下去由**别处**兜住(游戏会重生他, 那不是"转身"的锅) ——
+                #     这里只是不再**预测**, 与导航那条一个道理。
+                if not (self.FACE_TRUST_GAME and self._map_danger_wrong_here(tm, x, z)):
+                    self.log("[朝向] 目标方向是危险格, 不转身")
+                    return False
+                self.log("[朝向] ⚠ 地图说目标方向是危险格, 但**它说脚下这格也危险、"
+                         "而游戏没在重生我** —— 信游戏, 这次照转")
 
         # ☠ **斜方向要两个轴一起按**（2026-09-15 用户指出"**应该是往左上方丢**"）:
         #   面朝方向 = 它**最后一次移动的方向**, 而 `dir_for_step` 只给**单轴** ⇒
