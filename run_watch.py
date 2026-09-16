@@ -223,9 +223,16 @@ AUTO_INPUT = (os.environ.get("NEKO_WATCH_AUTO_INPUT") or "kbd").strip().lower()
 AUTO_KEY_PREFIX = "kbd:" if AUTO_INPUT.startswith("kbd") else "pad:"
 
 
-#: **总开关**(默认 `0` = 关)。开着时: 主界面加入 → 切 Party/Coop → 大厅选主题 → 进图。
+#: **总开关**(默认 `0` = 关)。开着时: **在大厅里选主题 → 进图**。
+#: ☠ 2026-09-17 起**只管这一半** —— 主界面(加入/切 Party)那一半用户明确不要了,
+#:   见 `auto_level.DEFAULT_SEQ`(想加回来那儿有照抄的原默认值)。
 #: 关着时**逐字退回老行为**(只补 P2, 一个菜单键都不按)。
 AUTO = (os.environ.get("NEKO_WATCH_AUTO") or "0") not in ("0", "", "false", "False")
+#: **大厅"第几次进关 ⇒ 按几下右"**(见 `auto_level.PICK_RIGHTS`)。逗号分隔, 例: `1,2,0`。
+#: 表用完之后在 `0..len-1` 里随机挑。空 = 用默认表。
+#: ⚠ 计数是**看护进程内的第几次进关** —— 看护重启就从头算。
+AUTO_PICK = [int(x) for x in (os.environ.get("NEKO_WATCH_AUTO_PICK") or "").replace(";", ",").split(",")
+             if x.strip().lstrip("-").isdigit()] or None
 #: 每个动作之间等多久(秒)。太短游戏还没反应过来就按下一个, 太长又白等。
 AUTO_GAP = float(os.environ.get("NEKO_WATCH_AUTO_GAP") or 1.5)
 #: 同一阶段**整个序列**最多重来几遍。跑完还不变就停手打警告(别把界面按乱)。
@@ -675,16 +682,22 @@ def main() -> int:
     w = Watcher(get_state=get_state, start_engine=start_engine,
                 stop_engine=stop_engine, join_lobby=join_lobby, log=log)
     if AUTO:
-        from auto_level import AutoLevel as _AutoLevel, DEFAULT_SEQ as _DEF_SEQ
+        from auto_level import (AutoLevel as _AutoLevel, DEFAULT_SEQ as _DEF_SEQ,
+                                PICK_RIGHTS as _DEF_PICK)
         # ⚠ `AutoLevel` **自己会归一化**(裸键 → 按 `prefix` 补后端), 所以这里直接喂
         #   默认序列或用户写的序列都行。
         w.auto = _AutoLevel(seq=(AUTO_SEQ or _DEF_SEQ),
                             tries=AUTO_TRIES, gap=AUTO_GAP,
-                            settle=AUTO_SETTLE, prefix=AUTO_KEY_PREFIX, log=log)
+                            settle=AUTO_SETTLE, prefix=AUTO_KEY_PREFIX, log=log,
+                            pick_rights=AUTO_PICK)
         w.auto_do = do_auto
-        log(f"[看护] **全自动进关已开** —— 主界面加入 → 切 Party → 大厅选主题 → 进图")
+        log(f"[看护] **全自动进关已开** —— 大厅选主题 → 进图"
+            f"(⚠ 主界面那一半**没开**: 用户 2026-09-17 \"主菜单进入的部分不要了\")")
         log(f"[看护]   序列 = {AUTO_SEQ or norm_seq(_DEF_SEQ)}"
             f"   裸键走 **{AUTO_INPUT}**(`NEKO_WATCH_AUTO_INPUT`; join 永远走虚拟手柄)")
+        log(f"[看护]   大厅选主题: 第几次进关按几下右 = "
+            f"{AUTO_PICK or list(_DEF_PICK)}(用完在 0..{len(AUTO_PICK or _DEF_PICK) - 1} 里随机)"
+            f"   `NEKO_WATCH_AUTO_PICK`")
         log(f"[看护]   每步 {AUTO_GAP:.1f}s, 走完一遍等 {AUTO_SETTLE:.0f}s, "
             f"每阶段最多重来 {AUTO_TRIES} 遍")
         log(f"[看护]   ⚠ 阶段判据只有 scene/inRound(读不到'选中哪个标签页'), "

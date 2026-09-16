@@ -124,7 +124,29 @@ NEKO_WATCH_AUTO_SEQ=screen=join,D,D,SPACE;lobby=SPACE,SPACE;wrong=ESC,DOWN,DOWN,
 | 变量 | 默认 | 干什么 |
 |---|---|---|
 | `NEKO_WATCH_AUTO` | `0` | **总开关**。`1` = 开。关着时**逐字退回老行为**（只补 P2，一个菜单键都不按） |
-| `NEKO_WATCH_AUTO_SEQ` | 只管 `lobby` | **换序列**（不用改代码）：`lobby=A,A` |
+| `NEKO_WATCH_AUTO_SEQ` | 只管 `lobby` | **换序列**（不用改代码）：`lobby=A,A`。⚠ 写死序列就**失去了"第几次"那套**（见下） |
+| `NEKO_WATCH_AUTO_PICK` | `1,2,0` | 大厅**第几次进关 ⇒ 按几下右**（逗号分隔）。用完在 `0..N-1` 里**随机** |
+
+### 大厅选主题：`pick`（2026-09-17）
+
+用户实机给的：**第一次右 1 下、第二次右 2 下、第三次不按右，之后随机**。
+
+```
+[进关] 🎯 第 1 次进关 ⇒ 大厅右移 **1** 下(主题 1) + 确认
+[进关] ▶ lobby: kbd:RIGHT   (第 1/2 步)
+[进关] ▶ lobby: kbd:SPACE   (第 2/2 步)
+```
+
+它是**动态动作 `pick`**（与 `join`/`wait` 并列的"不是按键的动作"）—— 写死的 key 表
+**表达不了"第几次"**。默认序列因此是 `{lobby: ["pick"]}`，`pick` 在**进入大厅那一瞬**
+展开成 `RIGHT × N + SPACE`。
+
+- **计数口径**：**看护进程内的第几次进关**（`AutoLevel.entries`，进对局时 +1）。
+  ⚠ 看护重启就从头算 —— 脚本读不到游戏里"已经打过几关"。
+- ⚠ 大厅光标选的是**主题**，主题内具体哪张图由游戏自己随机挑
+  （`StartLevel() → PickTheme() → PickLevel()`，判据 `AvailableInLobby && Theme==选中主题`）。
+  所以"右 N 下"是选**第 N 个主题**，"随机"那一段是在**三个主题里随机挑一个**。
+- 换表：`NEKO_WATCH_AUTO_PICK=0,3`（不用改代码）。
 | `NEKO_WATCH_AUTO_GAP` | `1.5` | 每个动作之间等多久（秒） |
 | `NEKO_WATCH_AUTO_TRIES` | `3` | 同一阶段最多重来几遍；跑完还不变就**停手打警告** |
 | `NEKO_WATCH_AUTO_PAD` | `1` | 用哪个虚拟手柄（`0`/`1`） |
@@ -138,7 +160,7 @@ NEKO_WATCH_AUTO_SEQ=screen=join,D,D,SPACE;lobby=SPACE,SPACE;wrong=ESC,DOWN,DOWN,
 
 | `scene` | 阶段 | 默认动作 |
 |---|---|---|
-| `Lobbies` | Coop 大厅 | ✅ **`SPACE, SPACE`** —— 选主题（`PickLevel` **随机挑图**）→ 厨师选择那一屏再确认 |
+| `Lobbies` | Coop 大厅 | ✅ **`pick`** —— 按"第几次进关"右移 N 下选主题 → 确认 |
 | `StartScreen` | 主界面 | ⛔ **默认不配动作**（打一行 `⚠ 阶段 screen 没有配任何动作` 就等着） |
 | 其它 + `mode≠Party` | 走错分支 | ⛔ **默认不配动作**（同上；只打一行显眼的 `⚠ 走错分支了`） |
 | 其它 | 加载/过场 | **一个键都不按**（乱按只会帮倒忙） |

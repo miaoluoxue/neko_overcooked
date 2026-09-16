@@ -43,6 +43,7 @@
 
 from __future__ import annotations
 
+import random
 import time
 
 #: 阶段名(见模块头那张表)。
@@ -54,6 +55,11 @@ STAGE_SCREEN = "screen"        # `scene == "StartScreen"` ⇒ 主界面
 #: 这个时候判断 `mode != party`, 执行返回"*。⇒ 先按退路回主菜单, 再重来。
 STAGE_WRONG = "wrong"
 STAGE_OTHER = "other"          # 加载/过场/别的场景… ⇒ **别乱按**
+
+#: 特殊动作: **按"第几次进关"选主题**(展开成 `RIGHT × N + SPACE`, 见 `PICK_RIGHTS`)。
+#: ⚠ 它**不是按键** ⇒ 归 `PLAIN_ACTS`(不补 `pad:`/`kbd:` 前缀), 而且
+#:   **调用方永远收不到它** —— 状态机在"进入阶段那一瞬"就把它展开成真键了。
+PICK = "pick"
 
 #: 主界面场景名。依据 `overcooked_decomp/ClientLobbyFlowController.cs:201`
 #: `ServerMessenger.LoadLevel("StartScreen", GameState.MainMenu, …)`。
@@ -93,12 +99,33 @@ MODE_PARTY = "Party"
 #:       `PlayerInputLookup.cs:612-616`: 前端移动输入是 `MovementX = StickX + DPadX`,
 #:       **只有摇杆和十字键, 没有肩键**。
 #: ⚠ **用户 2026-09-17: "那用键盘, 键盘有效"** ⇒ `NEKO_WATCH_AUTO_INPUT` 默认 `kbd`。
+#:   · 大厅(Lobbies): **`pick`** —— "按第几次进关"决定按几下右(见 `PICK_RIGHTS`)。
+#:     ⚠ 原来是写死的 `["SPACE", "SPACE"]`, 而它在实机里**没跑通**
+#:       (`[进关] ⚠ lobby 阶段按了 2 遍还是没动`), 而且写死的序列**表达不了
+#:       "第几次"** ⇒ 改成这个动态动作。
 DEFAULT_SEQ = {
-    STAGE_LOBBY: ["SPACE", "SPACE"],
+    STAGE_LOBBY: [PICK],
 }
 
 #: 不是按键的动作 —— `norm_seq` 不给它们补前缀。
-PLAIN_ACTS = ("join", "wait")
+#: `pick` = **"按第几次进关"选主题**(见 `PICK_RIGHTS`): 它会被展开成
+#: `RIGHT × N + SPACE`, 所以**调用方永远不会收到 `pick` 这个动作**。
+PLAIN_ACTS = ("join", "wait", PICK)
+
+#: **大厅光标: 第几次进关 ⇒ 按几下右**(用户 2026-09-17 实机给的)。
+#:
+#:   · 第 1 次 → 右 **1** 下
+#:   · 第 2 次 → 右 **2** 下
+#:   · 第 3 次 → **不按右**(光标本来就在最左)
+#:   · 第 4 次起 → **在 0/1/2 里随机**(用户原话: "随后开始随机")
+#:
+#: ⚠ 大厅光标选的是**主题**, 主题内具体哪张图由游戏自己随机挑
+#:   (`ServerLobbyFlowController` 的 `StartLevel() → PickTheme() → PickLevel()`,
+#:   判据 `AvailableInLobby && Theme==选中主题`)。⇒ "右 N 下"是**选第 N 个主题**,
+#:   不是选第 N 张图。"随机"那一段是**在三个主题里随机挑一个**。
+#: ⚠ 计数是**看护进程内的第几次进关**(`AutoLevel._entries`), 看护重启就从头算 ——
+#:   脚本读不到游戏里"已经打过几关"。
+PICK_RIGHTS = (1, 2, 0)
 
 
 def norm_seq(seq, prefix: str = "pad:"):
@@ -106,7 +133,7 @@ def norm_seq(seq, prefix: str = "pad:"):
 
     纯函数。规则与 `parse_seq` **同一份**(`parse_seq` 解析完直接调它) ——
     "同一件事两处各写一份"本仓栽过两次, 所以补前缀这件事只有一个实现。
-      · `join` / `wait` 原样(它们不是按键);
+      · `PLAIN_ACTS`(`join` / `wait` / `pick`)**原样**(它们不是按键);
       · 已经带 `:` 的(如 `kbd:SPACE`)**不覆盖** —— 允许在一个序列里混用两种后端;
       · 其余一律补 `prefix`。
     """
@@ -181,7 +208,8 @@ class AutoLevel:
     """进关状态机。**I/O 全部注入** —— `do(动作)` 由调用方实现, 本类只决定"该做什么"。"""
 
     def __init__(self, seq=None, tries: int = 3, gap: float = 1.5,
-                 settle: float = 8.0, prefix: str = "pad:", log=print):
+                 settle: float = 8.0, prefix: str = "pad:", log=print,
+                 pick_rights=None, rng=None):
         #: ☠ **在这里归一化, 不指望调用方记得** —— 序列可以写成裸键(见 `DEFAULT_SEQ`),
         #:   由 `prefix` 落定走哪条输入。`norm_seq` 幂等(带 `:` 的不动), 所以传进来
         #:   已经归一化过的也安全。
@@ -200,7 +228,19 @@ class AutoLevel:
         #:   那个决定"多久看一眼状态", 这个决定"按完之后给游戏多少时间反应"。
         self.settle = float(settle)
         self.log = log
+        #: ☠ **留着 `prefix`** —— `pick` 展开出来的 `RIGHT`/`SPACE` 要跟序列里其余键
+        #:   走**同一条输入后端**(见 `_expand`)。
+        self.prefix = prefix
+        #: 大厅"第几次进关 ⇒ 按几下右"的表(见 `PICK_RIGHTS`)。可注入 ⇒ 离线可验。
+        self.pick_rights = tuple(pick_rights) if pick_rights else PICK_RIGHTS
+        #: 表用完之后在 `range(len(pick_rights))` 里随机取 —— 用户要的"随后开始随机"。
+        #: ⚠ **注入 `rng`**(同 `scoring.transform` 的纪律): 探针要给确定的数。
+        self.rng = rng or random.Random()
+        #: **进关成功了几次**(看护进程内) —— `pick` 就靠它。
+        #: ⚠ 看护重启就从头算: 脚本读不到游戏里"已经打过几关"。
+        self.entries = 0
         self._stage = ""
+        self._steps: list = []
         self._i = 0
         self._round = 0
         self._at = 0.0
@@ -209,11 +249,43 @@ class AutoLevel:
         self._warned = False
 
     # ---- 内部 ----
+    def _pick_n(self) -> int:
+        """这一趟大厅**按几下右** —— 看"第几次进关"(`self.entries`)。"""
+        i = self.entries
+        if i < len(self.pick_rights):
+            return int(self.pick_rights[i])
+        return self.rng.randrange(len(self.pick_rights))
+
+    def _expand(self, s: str) -> list:
+        """把这一阶段的键表**展开**成真键 —— 目前只有 `pick` 是动态的。
+
+        ☠ **在"进入阶段那一瞬"展开**(而不是每拍算一次): "第几次进关"在一整趟里
+          是**定值**, 而且展开成普通键表之后, 下面那套 `_i`/`_round`/`settle`
+          **一行都不用改** —— 那套是实机调出来的, 别去动它。
+        ⚠ 展开出来的键用 `self.prefix`, 与序列里其余键**同一条输入后端**
+          (`NEKO_WATCH_AUTO_INPUT` 默认 `kbd` ⇒ `kbd:RIGHT` / `kbd:SPACE`)。
+        """
+        out: list = []
+        for a in (self.seq.get(s) or []):
+            if a != PICK:
+                out.append(a)
+                continue
+            n = self._pick_n()
+            out.extend(["%sRIGHT" % self.prefix] * n)
+            out.append("%sSPACE" % self.prefix)
+            self.log(f"[进关] 🎯 第 {self.entries + 1} 次进关 ⇒ 大厅右移 **{n}** 下"
+                     f"(主题 {n}) + 确认"
+                     + ("   ← 表用完了, 这一个是**随机**挑的"
+                        if self.entries >= len(self.pick_rights) else ""))
+        return out
+
     def _enter(self, s: str) -> None:
         self._stage, self._i, self._round, self._warned = s, 0, 0, False
         self._at = 0.0                      # 立刻做第一步, 不等
         self._settle_until = 0.0
         self._waited_logged = False
+        # ☠ **键表在进阶段这一瞬落定**(`pick` 是动态的) —— 见 `_expand`。
+        self._steps = self._expand(s)
 
     # ---- 主入口 ----
     def tick(self, st: dict, do, now: float = None) -> None:
@@ -225,6 +297,12 @@ class AutoLevel:
             if self._stage != s:
                 self.log("[进关] ✓ 已经在对局里 —— 停手(剩下的交给引擎)")
                 self._enter(s)
+                # ☠ **进关成功一次** —— `pick` 的"第几次进关按几下右"就靠它。
+                #   守卫是上面那个"阶段**变了**": 同一局里每轮都读到 `inround`,
+                #   只有**第一次**算数(下一拍 `_stage` 已经等于 `s`)。
+                # ⚠ 开局就停在对局里会**多算一次** —— 那种开局本来也不该用自动进关
+                #   (人已经在局里了), 不值得为它加一个"看过大厅才算数"的状态。
+                self.entries += 1
             return
 
         if s == STAGE_OTHER:
@@ -257,7 +335,9 @@ class AutoLevel:
         if now < self._at:
             return
 
-        steps = self.seq.get(s) or []
+        # ☠ **用 `_enter` 落定的那一份**(不是现场查 `self.seq`) —— `pick` 已经在
+        #   进阶段时展开成真键了, 这里再查一次拿到的会是没展开的那份。
+        steps = self._steps
         if not steps:
             if not self._warned:
                 self._warned = True
