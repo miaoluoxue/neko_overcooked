@@ -1576,6 +1576,22 @@ class Engine:
         c = self.chef(st or {})
         return (c.get("pick") or "", c.get("use") or "")
 
+    def handle_target(self, st: dict) -> str:
+        """**游戏真正会把拾取消息发给谁** —— `m_iHandlePickup` 所在的物体。
+
+        ☠ 它和 `interaction_targets` 的 `pick` **不是同一个字段**, 别当成同一个:
+          `pick` = `m_TheOriginalHandlePickup`(那个**物体**),
+          这里 = `m_iHandlePickup`(那个**接口实例**) —— 而 `Update_Carry` 用的是**后者**
+          (`SceneScanner.ReadInteraction` 那段注释 + `InteractDirect.cs:95-121`)。
+        同族的箱子**排成一列**时两者可能落在**不同的那一只**上: 于是"游戏说会作用到
+        `… (5)`"成立、按下去却从**隔壁**掏出另一份料(`s_moonfestival_1_2` 整单报废)。
+        ⇒ 判据把它**一并接受**(多一个能对上的名字), 并在日志里单独打出来。
+
+        ⚠ 老 dll 没这个字段 ⇒ 返回 `''`, 调用方只看 `pick` —— **逐字老行为**。
+        """
+        c = self.chef(st or {})
+        return (c.get("pickh") or "").strip()
+
     def placement_target(self, st: dict) -> str:
         """游戏自己认为这个厨师现在按下会**放到哪个物体** (`m_iHandlePlacement` 所在物体名)。
 
@@ -2426,7 +2442,75 @@ class Engine:
             self.log("[步骤] ↻ 换到 (%.1f,%.1f) 再问: 游戏仍说 %r ✗" % (sx, sz, ph))
         return False
 
-    def _aim_ok(self, st: dict, want: str) -> bool:
+    #: **名字只对上"宽松档"时, 还认不认**(2026-09-17)。
+    #:
+    #: `0` = 逐字退回老行为(只比名字, 宽松档照单全收) —— 本仓"一键回退"的惯例。
+    #: 要它是因为 `s_moonfestival_1_2`: 7 个分发箱**同名只差 `(N)`**、排成一列间距一格,
+    #: 厨师站到离目标 **1.98 格**的地方(曼哈顿 2, 游戏自己的半径 1.0 根本够不着),
+    #: 游戏报了一个名字、`_name_is` 的宽松档判"就是它" ⇒ 按下去从隔壁掏出错料 ⇒
+    #: 放回去 ⇒ 重试三次**同一个位置同一个错** ⇒ 整单放弃。
+    AIM_AT_CHEF = (os.environ.get("NEKO_AIM_AT") or "1").strip().lower() \
+        not in ("0", "off", "no", "false")
+
+    def _near_chef(self, x, z, st, tm) -> bool:
+        """这个坐标所在格**挨着**厨师站的格吗(曼哈顿格距 ≤ 1)? 判不了就说"挨着"。
+
+        判据**来自游戏自己的交互几何**, 不是我们编的阈值(`_aim_ok` 的 docstring 那段):
+          `InteractWithItemHelper.IsColliderInArc` 要求到**碰撞体表面**的距离 < 1.0 格。
+          格子步长 1.2 ⇒ 站在格心时, **正交相邻**那格的台面表面 ≈ 0.6 格(够得着);
+          正交两格 = 2.4、斜角一格 = 1.7 ⇒ 表面 ≥ 1.1 格(**够不着**)。
+          ⇒ "够得着" ⟺ **曼哈顿格距 ≤ 1**。而 `(2.7,-8.3)` → `(1.2,-9.6)` 正好是 2 ——
+            游戏却说能抓, 那只说明**它报的不是我们要去的那个台面**。
+
+        ☠ 判不了(`tm` 没起来 / 不知道自己在哪)⇒ **返回 True**: 这道闸只在**验得了**的
+          时候验, 验不了就退回宽松档(逐字老行为)。
+        """
+        if tm is None or not getattr(tm, "ok", False):
+            return True
+        px, pz, _ = self.pos(st or {})
+        if px is None:
+            return True
+        try:
+            ci, cj = tm.cell_of(px, pz)
+            i, j = tm.cell_of(x, z)
+        except Exception:                                          # noqa: BLE001
+            return True
+        return abs(i - ci) + abs(j - cj) <= 1
+
+    def _aim_plausible(self, nm: str, at, st: dict, km, tm) -> bool:
+        """名字**只对上宽松档**时的追加闸 —— 两问都要过:
+
+          ② **游戏报的那个物体**挨着我吗? (`nm` 在图上有台面对得上时, 取最近的那个)
+             —— 报的是**别的台面** ⇒ 按下去作用到它, 不认。
+          ③ **我要去的那个台面**(`at`)挨着我吗?
+             —— ☠ 这一问是关键: 实测那次厨师站在**离目标 1.98 格**的地方,
+                而游戏照样报了个名字(报的是**别人**)。宽松档认了名字, ②③ 把
+                "**我根本还没走到它旁边**"这件事拦下来。
+
+        为什么两问都要(各自的盲区不同):
+          · 只问 ② —— 同族台面排一排时, 报的那个往往**确实**就在我旁边(它就是隔壁),
+            问不问都过 ⇒ 拦不住 `s_moonfestival_1_2`;
+          · 只问 ③ —— 名字我们没建模(对不上任何台面)时 ② 本来就跳过, ③ 是唯一兜底;
+            但"我已经挨着目标、游戏却报隔壁"这种只能靠 ②。
+        ⚠ **逐字相同的名字不走这条路**(调用方先判 `nm == want`): 精确到实例号时身份本来就
+          是确定的, 那条路是实机跑熟的 —— 这道闸**只收紧宽松档**, 一个字都不动它。
+        ⚠ 查不到同名台面 ⇒ ② 这一问**跳过**(没依据), ③ 照问。
+        """
+        if not self.AIM_AT_CHEF:
+            return True
+        if km is not None and getattr(tm, "ok", False):
+            hits = [s for s in km.stations.values() if getattr(s, "name", "") == nm]
+            if hits:
+                px, pz, _ = self.pos(st or {})
+                if px is not None:
+                    near = min(hits, key=lambda s: (s.x - px) ** 2 + (s.z - pz) ** 2)
+                    if not self._near_chef(near.x, near.z, st, tm):
+                        return False
+        if at is not None and not self._near_chef(at[0], at[1], st, tm):
+            return False
+        return True
+
+    def _aim_ok(self, st: dict, want: str, at=None, km=None, tm=None) -> bool:
         """**用游戏自己的判定**确认"现在按交互键能作用到目标 want"。
 
         为什么不能靠比距离(实测教训):
@@ -2437,11 +2521,44 @@ class Engine:
           (InteractWithItemHelper.cs:153-163): 到**碰撞体表面**的距离 < 1.0
           且朝向前 180°。台面有体积, 拿"格子中心距离"比根本没有可比性。
           所以直接比对游戏报的 pick/use 名字 —— 用 _name_is(带编号时精确比)。
+
+        ☠☠ **两档**(2026-09-17): 这道判据自己就是**分档**的, 而两档的可信度**不一样**:
+          ① **逐字相同**(`nm == want`, 连实例号都一样) ⇒ **直接认**。身份是确定的。
+          ② 走 `_name_is` 的**宽松档**才认出来的 ⇒ 再过一遍 `_aim_plausible`
+             ("报的那个 + 我要去的那个, 都得在我够得着的范围里")。因为宽松档的存在
+             理由只是"名字认不准", 而台面**排一排**的关卡里, 它会把隔壁那个也判成"就是它"
+             (实测 `s_moonfestival_1_2`, 见 `AIM_AT_CHEF`)。
+
+        `at` = 这一步要去的那个台面的坐标(**给了才问第 ②-b 问**);
+        `km` 不给 ⇒ 第 ②-a 问(游戏报的那个物体)没依据可查, 跳过;
+        `tm` 不给 ⇒ 两条都判不了 ⇒ **全放行**。
+        ⇒ 老调用点一个都不用改, 要验的地方把这三个参数递进来就行(逐字退回老行为)。
         """
         pick, use = self.interaction_targets(st)
         if not want:
             return bool(pick or use)
-        return self._name_is(pick, want) or self._name_is(use, want)
+        # `handle_target` = 游戏**真正**会把拾取消息发给谁(`m_iHandlePickup`) —— 见那边
+        # 的注释: 它和 `pick` 可以是**不同的那一只**, 所以两个都要试。
+        for nm in (pick, self.handle_target(st), use):
+            if not nm or not self._name_is(nm, want):
+                continue
+            if nm == want:
+                # ☠ **逐字相同也要留一句证词**: 名字精确到实例号, 身份是确定的, 所以
+                #   **照旧认**(老行为一个字不动)。但若连它都不在我够得着的范围里, 那说明
+                #   "游戏说会作用到 X" 与游戏自己的几何(表面 < 1.0)自相矛盾 ——
+                #   实测 `s_moonfestival_1_2` 的另一半嫌疑就在这里(`pick` 和
+                #   `m_iHandlePickup` 指了**两只不同的箱子**, 见 `handle_target`)。
+                #   这一行只为**定案**用, 不拦(拦了会把跑熟的路一起拦掉)。
+                if at is not None and not self._near_chef(at[0], at[1], st, tm):
+                    self.log("[瞄准] ⚠ 游戏报的 %r **逐字就是它**, 可它不在我够得着的地方"
+                             "—— 游戏自己的半径(表面<1.0)解释不了, 这条要留证据" % nm)
+                return True
+            if self._aim_plausible(nm, at, st, km, tm):
+                return True
+            self.log("[瞄准] ⚠ 游戏报的是 %r —— 名字**宽松档**对得上 %r, 但它/我离要去的 "
+                     "(%s) 够不着(多半是同族台面排一排) ⇒ 不算, 换个站位格再问"
+                     % (nm, want, ("%.1f,%.1f" % at) if at else "?"))
+        return False
 
     def _land_near(self, km, tm, tx: float, tz: float, cands, want: str,
                    near: float, reach) -> bool:
@@ -2489,7 +2606,7 @@ class Engine:
                     continue
                 landed += 1
                 df = ((tx - ax) ** 2 + (tz - az) ** 2) ** 0.5
-                if self._aim_ok(st2, want):
+                if self._aim_ok(st2, want, at=(tx, tz), km=km, tm=tm):
                     self.log("[接近] 小物件落位 (%.1f,%.1f) 距 %.2f 格"
                              "(候选格心在 %.2f 格), 游戏说可作用 ✓"
                              % (ax, az, df, d))
@@ -2563,12 +2680,17 @@ class Engine:
                         continue
                     df = ((tx - px) ** 2 + (tz - pz) ** 2) ** 0.5
                     pick, use = self.interaction_targets(st2)
-                    if (not want) or self._aim_ok(st2, want):
-                        self.log("[接近] (%.1f,%.1f) 距 %.2f 格, 游戏说可作用: 抓取=%r ✓"
-                                 % (px, pz, df, pick))
+                    # ☠ `pickh` 单独打出来 —— `pick` 和它可以**不是同一只**
+                    #   (见 `handle_target`): 判"抓错料"时这一栏是定案证据。
+                    _pk = self.handle_target(st2)
+                    _pk = ("  抓取处理=%r" % _pk) if (_pk and _pk != pick) else ""
+                    if (not want) or self._aim_ok(st2, want, at=(tx, tz), km=km, tm=tm):
+                        self.log("[接近] (%.1f,%.1f) 距 %.2f 格, 游戏说可作用: 抓取=%r%s ✓"
+                                 "(要的是 %r)"
+                                 % (px, pz, df, pick, _pk, want))
                         return True
-                    self.log("[接近] (%.1f,%.1f) 距 %.2f 格, 游戏说: 抓取=%r ✗ 不是它"
-                             % (px, pz, df, pick))
+                    self.log("[接近] (%.1f,%.1f) 距 %.2f 格, 游戏说: 抓取=%r%s ✗ 不是它"
+                             "(要的是 %r)" % (px, pz, df, pick, _pk, want))
 
                 # ---- 就地微调: 不换站位, 只朝目标小步挪 + 转身, 每步问一次游戏 ----
                 # 这是"范围交互"的正解: 不必走到某个精确点, 只要进入范围且朝向对。
@@ -2579,7 +2701,7 @@ class Engine:
                         px, pz, _ = self.pos(st3) if st3 else (None, None, "")
                         if px is None:
                             break
-                        if self._aim_ok(st3, want):
+                        if self._aim_ok(st3, want, at=(tx, tz), km=km, tm=tm):
                             self.log("[接近] 微调 %d 次后到位 (%.1f,%.1f) ✓" % (k, px, pz))
                             return True
                         dx, dz = tx - px, tz - pz
@@ -2605,12 +2727,13 @@ class Engine:
                     #   而当时厨师正被风推着走。
                     ok_aim, off = self.checkpoint(tm, tx, tz, tol=2.0)
                     st4 = self.state(force=True)
-                    if self._aim_ok(st4, want):
+                    if self._aim_ok(st4, want, at=(tx, tz), km=km, tm=tm):
                         self.log(f"[接近] 停手重问游戏: 现在能作用了 ✓ (差 {off:.2f} 格)")
                         return True
                     pick, use = self.interaction_targets(st4)
                     self.log("[接近] ✗ 微调后游戏仍说作用不到目标"
-                             "(抓取=%r 工位=%r, 停手重问仍不行, 差 %.2f 格)" % (pick, use, off))
+                             "(抓取=%r 工位=%r, 要的是 %r, 停手重问仍不行, 差 %.2f 格)"
+                             % (pick, use, want, off))
 
         # 兜底: 地形不可用 / 找不到能站的格子 —— 退回老办法
         if attempt <= 0:
@@ -2622,7 +2745,7 @@ class Engine:
             # 抓取键，把错的东西拿到手再放回去。
             if ok and want:
                 st_now = self.state(force=True)
-                ok = self._aim_ok(st_now, want)
+                ok = self._aim_ok(st_now, want, at=(tx, tz), km=km, tm=tm)
             return ok
         import math
         ang = attempt * 2.39996
@@ -2633,7 +2756,7 @@ class Engine:
             self.face(tx, tz)
         if ok and want:
             st_now = self.state(force=True)
-            ok = self._aim_ok(st_now, want)
+            ok = self._aim_ok(st_now, want, at=(tx, tz), km=km, tm=tm)
         return ok
 
     def _find_item_station(self, km: KitchenMap, target: str,
