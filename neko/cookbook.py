@@ -497,6 +497,17 @@ class DishFlow:
     name: str
     plate: str = ""        # 订单要求的容器(OrderDefinitionNode.m_platingStep)
     ops: list = field(default_factory=list)
+    #: **这张单在订单栏上的槽位键**(`team.OrderBoard.key_of(o)` = `#524212:Sushi_Fish`)。
+    #:
+    #: ☠☠ 为什么必须有(2026-09-17 按步协作): 订单栏上**同一道菜会同时挂好几张**
+    #:   (实测 `Sushi_Fish` 一次挂 5 张), 而 `DishFlow` 原来**只有菜名** ⇒ 所有"按名字判"
+    #:   的地方都把 N 张单当成同一张: `_order_live`("这单还在不在")、`_pots_live["flow"]`、
+    #:   `publish_plan` 的计划键(同名多单**共用一份计划**)。
+    #:   ⇒ 步级占位(`step_key(槽位键, 步号)`)也要它 —— 没有槽位键就定不出"这是第几步"。
+    #: ⚠ **必须是带默认值的字段**, 且放在 `name` 之后(`name` 无默认值 ⇒ `@dataclass`
+    #:   的字段顺序不能乱); 空串 = "还不知道/单人模式" ⇒ 所有按槽位判的地方都要容忍它。
+    #: ⚠ 由 `Engine._order_pool` 在 `derive` 之后填(见那一步的注释), **`derive` 自己不知道**。
+    slot: str = ""
 
     def __str__(self) -> str:
         head = f"【{self.name}】" + (f" 容器={self.plate}" if self.plate else " 容器=无")

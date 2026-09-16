@@ -81,6 +81,25 @@ WASH_URGENCY_MAX = 40.0
 #: 每个脏盘贡献几分(封顶在 `WASH_URGENCY_MAX`)。
 WASH_URGENCY_PER_PLATE = 8.0
 
+#: **订单快到期了最多加几分**(`order_urgency`, 2026-09-17 按步协作那件事)。
+#:
+#: **60 的量纲依据**(算给下一个调参的人看, 别凭手感): 60 = `assemble` 的步骤价 ⇒
+#:   · 能让"**快没时间的那张单**"的 `fetch`(20+60=80) 压过"**新单**的 `assemble`"(60)
+#:     —— 用户要的"最高收益的那一步"就该在残局里偏向后一张单;
+#:   · 但**永远压不过 `deliver`(100)** —— 送餐是唯一真正结算分数的动作, 不该被"抢单"
+#:     抢走别人手上那盘已经拼好的菜。
+#: ⚠ **本模块是纯函数模块**(文件头那条纪律): 这里只放**字面量**, 不读 `os.environ`。
+#:   可调的那两份由**引擎**读(`NEKO_ORDER_URGENCY` / `NEKO_ORDER_URG_FLOOR`)并**传进来**
+#:   (`order_urgency(t, cap=…, floor=…)`) —— 和 `burn_urgency_alert` 收 `alert` 同一个形状。
+#:   `0` = 关掉时钟分(退回"不看订单倒计时"的老行为)。
+ORDER_URGENCY_MAX = 60.0
+
+#: **死区**: `t >= 这个值` 时时钟分**恰好 0**。
+#: ⇒ **开局(所有单都是新单)的行为与改前逐字相同** —— 改动被关进残局里,
+#:   这也让"行为不对时"可以靠它二分定位。`NEKO_ORDER_URG_FLOOR=1.0` = 完全关掉
+#:   (和 `NEKO_ORDER_URGENCY=0` 等效, 但更直观)。
+ORDER_URGENCY_FLOOR = 0.35
+
 #: **"手上这份先做完"的加成分**。用户 2026-09-15 讲的机制:
 #:   > "比如 SushiRice, 想要放在盘子上需要**先煮熟**" —— 生米**永远**上不了盘,
 #:   > 它唯一的出路就是进锅; 而腾出手又只能靠"放进盘子"或"丢地上"。
@@ -192,8 +211,39 @@ def burn_urgency_alert(ratio: float, alert: float) -> float:
     return BURN_URGENCY_MAX * min(1.0, (float(ratio) - float(alert)) / span)
 
 
+def order_urgency(t, cap: float = None, floor: float = None) -> float:
+    """**订单快到期了该加多少分**(2026-09-17 按步协作: 两个厨师按"最高收益的那一步"分工)。
+
+    `t` = 订单栏那一格**现成的**剩余比例(1.0 = 刚出现, 0 = 到期; `_all_flows` 就带着它)。
+
+    形状照抄本仓另外两条紧迫度(`burn_urgency` / `wash_urgency`): **死区 + 连续上涨 + 封顶**,
+    **没有硬闸门** —— 到了残局它就自然压过别的候选, 不需要"if t < 0.2 then 优先"那种规则。
+      · `t >= floor` ⇒ **恰好 0.0** —— 时间还早, 一个字都不加 ⇒ **开局与改前逐字相同**;
+      · `t = floor` ⇒ 0;  `t = 0` ⇒ `cap`;  中间线性。
+
+    ☠ 别用 `1/t` 或裸 `(1-t)`: 前者在 `t→0` 时无界(小 t 主导一切, 评分表变得读不懂),
+      后者在 `t=0.9` 就已经在改排序(残局才该生效的事泄漏到开局)。
+    ☠ `cap`/`floor` 的量纲依据在 `ORDER_URGENCY_MAX` / `ORDER_URGENCY_FLOOR` 的注释里。
+    ⚠ 它是**位置无关**的(和 `urgency` 一样) ⇒ **队友那份也必须加同样的值**,
+      否则 `choose` 拿"我含时钟分"和"队友不含"比, 让位判定失真。
+    """
+    c = ORDER_URGENCY_MAX if cap is None else float(cap)
+    f = ORDER_URGENCY_FLOOR if floor is None else float(floor)
+    try:
+        v = float(t)
+    except (TypeError, ValueError):
+        return 0.0
+    if v != v:                       # NaN
+        return 0.0
+    v = min(1.0, max(0.0, v))        # clamp: 读到的怪值不许把它变成负分/爆分
+    span = max(1e-6, f)
+    if v >= f:
+        return 0.0
+    return c * min(1.0, (f - v) / span)
+
+
 def score(action: str, dist: float | None, follow: float = 0.0,
-          urgency: float = 0.0, advance: float = 0.0) -> float:
+          urgency: float = 0.0, advance: float = 0.0, clock: float = 0.0) -> float:
     """给一个候选动作打分。`dist is None` = 到不了 ⇒ 直接出局(`-inf`)。
 
     dist    —— 厨师到"台面旁可站格子"的**格距**(不是欧氏距离: 要绕墙走)
@@ -202,10 +252,18 @@ def score(action: str, dist: float | None, follow: float = 0.0,
                否则"我 vs 队友"就不是在比同一件事了。
     advance —— **"这一步用的是我手上正拿着的那份东西"** 的加成分
                (`HAND_ADVANCE_BONUS`)。**谁拿着算谁的** ⇒ 队友那份要按**队友手上**的算。
+    clock   —— **订单倒计时的加成分**(`order_urgency`, 2026-09-17 按步协作)。
+               ☠ **故意另开一个参数、不并进 `urgency`**, 两个理由:
+                 ① 日志的 `紧急` 列要能分辨"**锅快糊了**"还是"**单快到期了**" —— 而日志
+                    正是那件事的验收标准(看不出来的话, 分数变了也查不出是哪个加的);
+                 ② 它和 `urgency` 一样是**位置无关**的 ⇒ 必须**同时加到"队友那份"**上。
+               ⚠ 也**不许并进 `sig`**(`sigs` 要喂给 `transform` 的 sabotage 记忆 —— 改 `sig`
+                 等于改捣蛋鬼的行为)。
     """
     if dist is None:
         return NEG_INF
-    return step_value(action) - W_DIST * dist - W_FOLLOW * follow + urgency + advance
+    return (step_value(action) - W_DIST * dist - W_FOLLOW * follow
+            + urgency + advance + clock)
 
 
 # ---------------------------------------------------------------- 状态变换

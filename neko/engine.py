@@ -64,6 +64,9 @@ PACK_TRY_COOLDOWN = float(os.environ.get("NEKO_PACK_COOLDOWN") or 8.0)
 
 from pathing import dir_for_step
 from cookbook import Knowledge, derive, Op, DishFlow
+#: 订单在黑板上的**身份**(槽位键)只有一份实现 —— `_order_key` 现在是它的转发,
+#: 见那里。`team.py` 不 import engine ⇒ 模块级 import 不会成环。
+from team import OrderBoard
 import lookahead                       # 提前备料: 由订单算"该备多少"(纯函数, 可离线钉死)
 import scoring
 
@@ -297,7 +300,71 @@ STEP_COOLDOWN = float(os.environ.get("NEKO_STEP_COOLDOWN") or 20.0)
 #: 所以这个上限平时**不生效**; 它是**兜底** —— 认领一旦泄漏(订单从栏上消失、
 #: 或 `run()` 里那条 `continue` 跳过释放), 上限能保证另一个厨师**还有单可领**。
 #: `NEKO_CLAIM_MAX` 可调。
-CLAIM_MAX = int(float(os.environ.get("NEKO_CLAIM_MAX") or 2))
+#:
+#: ☠☠ **2026-09-17 按步协作: 整个删掉了** —— 订单归属没有了, 自然也没有"最多领几张"。
+#:   取而代之的是 **`NEKO_COOP_ORDERS`**(候选池最多拼几张单), 见下面那一族开关。
+#:   老配置里留着 `set NEKO_CLAIM_MAX=2` 会被**忽略**(无害, 不用去改)。
+
+# ---------------------------------------------------------------- 按步协作(2026-09-17)
+#
+# 用户: "**可能不需要按订单分配，双脚本的好处是行为完全可控，可以两个脚本做订单的一部分，
+#        这就需要规划层计算最高收益了**"
+#
+# 下面这几个开关**全部在 `NEKO_CHORES` 之外**(它是"杂活"的总闸, 不该顺手把协作也关掉)。
+# 行为不对时按"最外层的那个先关"二分定位: COOP → COOP_ORDERS → CLOCK → STEPS → PLATE → RES。
+#
+#: **总开关**。`0` ⇒ 逐字退回"一人一单 + 池只有一张单 + 不看订单倒计时 + 不占位 + 不绑盘"。
+#:
+#: ☠☠ **默认开**(2026-09-17) —— 但它依赖两件**已经接好**的事, 别单独回退:
+#:   ① **步级占位**(`team.OrderBoard.claim_step`, 在 `_rank_candidates` 里"选中之后、
+#:      执行之前"占, 四处结局都释放): 两个厨师用**同一套评分、同一份 `flow.ops`**
+#:      ⇒ 最高收益那一步**必然算出同一步**, 没有占位就是**重复取同一份料**;
+#:   ② **`run()` 里那条池兜底**: `plan()` 现在只挑"这一轮先打哪张单", 而干活的是
+#:      `execute()` 里的池 ⇒ **领不到单 ≠ 没活干**(老代码在那里 `continue` ⇒ 有活却站着)。
+#:   ⚠ 回退顺序(二分定位): 先 `NEKO_COOP=0`(逐字回到"一人一单 + 单池"); 只在怀疑"跨单"
+#:     是病根时才 `NEKO_COOP_ORDERS=1`; 怀疑占位时才 `NEKO_COOP_STEPS=0`。
+#: 离线探针不受影响(它们直接调被判据, 不经过这个开关)。
+COOP = (os.environ.get("NEKO_COOP") or "on").strip().lower() \
+    not in ("0", "off", "no", "false", "none")
+#: **候选池最多拼几张单**。池会膨胀(5 张单 × 15 步 = 75 个候选/轮) ⇒ 这是**真刹车**,
+#: 不是死代码。默认 3(够"两单并行 + 一张备着")。`NEKO_COOP_ORDERS` 可调。
+COOP_ORDERS = int(float(os.environ.get("NEKO_COOP_ORDERS") or 3))
+#: **订单倒计时的时钟分**(见 `scoring.order_urgency`)。`0` = 关(不看倒计时)。
+COOP_CLOCK = COOP and (os.environ.get("NEKO_COOP_CLOCK") or "1").strip().lower() \
+    not in ("0", "off", "no", "false", "none")
+#: 读给 `scoring.order_urgency` 的两个数(**scoring 是纯函数模块, 它自己不读环境**)。
+ORDER_URGENCY_CAP = float(os.environ.get("NEKO_ORDER_URGENCY") or 60.0)
+ORDER_URGENCY_FLOOR = float(os.environ.get("NEKO_ORDER_URG_FLOOR") or 0.35)
+#: **步级占位**(去重的地基)。关掉 = 两个厨师可能同时去做同一步(重复取料) ⇒ 只在排查用。
+COOP_STEPS = (os.environ.get("NEKO_COOP_STEPS") or "1").strip().lower() \
+    not in ("0", "off", "no", "false", "none")
+#: 一步占多久(秒)。**下界** = 一步最长可能的耗时(煮 12s、一趟 20 格 ≈ 6s);
+#: **上界**压在 `HANDOFF_TTL`(45) **之下** —— 那是"**交给别人做**"(对方要重走一趟),
+#: 这里是"**我正在做**"(队友只需在我死后接手) ⇒ 两者不该同级。`NEKO_STEP_TTL` 可调。
+STEP_CLAIM_TTL = float(os.environ.get("NEKO_STEP_TTL") or 30.0)
+#: **切菜板占多久**(秒)。取值和 `BRANCH_TTL`(25) 同量级: 一回切菜实测 ~4.5 秒,
+#: 加上走过去/被挤开, 25 秒足够"我这一趟用完了"; 太长会把板锁给队友看。
+BOARD_CLAIM_TTL = float(os.environ.get("NEKO_BOARD_TTL") or 25.0)
+#: **"走过去拿那件单件空盘"占多久**(秒) —— 就是这一趟。
+#: ☠ 和将来的 `NEKO_PLATE_TTL`(**盘子转移协议 T2 的"闲置多久算没人要"**, 第 5 步)
+#:   是**两件事**, 别混: 这个是"我在路上", 那个是"我不管它了"。
+#: 短 TTL **代替显式释放** —— 单件盘的占位只需覆盖"走过去"那一段(见 `_empty_plate_source`)。
+PLATE_CLAIM_TTL = float(os.environ.get("NEKO_PLATE_CLAIM_TTL") or 8.0)
+#: **盘子↔订单的绑定与转移**(第 5 步)。关掉 = 盘子**无主** —— 退回"谁先端到算谁的",
+#: 也就是 `_dish_matches` 只按集合判(同菜两单会**互相认领同一盘**)。
+COOP_PLATE = COOP and (os.environ.get("NEKO_COOP_PLATE") or "1").strip().lower() \
+    not in ("0", "off", "no", "false", "none")
+#: **转移协议 T2: 那盘多久没人碰 = 没人要了, 别人可以接手**(秒)。`NEKO_PLATE_TTL` 可调。
+#:
+#: 取值 **20 = `STEP_COOLDOWN`(冷板凳)的时长**, 这不是巧合: 一个人"离开这盘"的
+#:   **最快路径就是被 `bench_step` 赶走**, 而冷板凳正好 20 秒 ⇒
+#:   **"他被冷板凳赶走的那一刻, 这盘正好开放"**。
+#: ☠ 和 `PLATE_CLAIM_TTL`(8s) **是两件事**, 别混: 那个是"**我在路上**, 别抢";
+#:   这个是"**我不管它了**, 你可以接"。两者混用会让"走过去拿一趟"就被判成弃盘。
+#: ☠ 数据来源是**最后一次写入**(`touch_plate` 的心跳)⇒ 不引中心节点、不引心跳线程。
+PLATE_IDLE_TTL = float(os.environ.get("NEKO_PLATE_TTL") or 20.0)
+#: **三处资源共享的保护**(切菜板/盘子/台面)总开关。关掉 = 退回"靠软避让 + 物理竞态"。
+COOP_RES = (os.environ.get("NEKO_COOP_RES") or "1").strip().lower()     not in ("0", "off", "no", "false", "none")
 
 #: **"这一支刚试过、不行" 记多久**(秒)。`NEKO_BRANCH_TTL` 可调, `0` = 不记。
 #:
@@ -540,6 +607,12 @@ class Engine:
         self._no_ext_told = False
         #: **冷板凳**: `{"fetch Flour": 到什么时候为止}` —— 反复失败的那一步先别选它。
         self._step_bench = {}
+        #: **执行期"当前在做哪张单"** —— `(flow, 槽位键)`, 由 `_execute_scored` 在
+        #: **选中那一步之后**写(见 `_exec_ctx`)。☠ 为什么必须有: `self.assemble_spot`
+        #: 是**单值**, 而 `op_assemble` / `_top_up_plate` / `_ensure_plate` 的签名里
+        #: **都拿不到 `flow`** —— 也不该为了它去改那 25 个消费点。
+        self._cur_flow = None
+        self._cur_slot = ""
         #: **预置记账**: `norm(材料名) -> (x, z, 什么时候预置的)` —— 见 `PREPOSE_TTL`。
         #: "我把某份料丢/放在哪了"。丢出去手上就空了, 所以 `cook/chop/mix/assemble`
         #: 得先靠这张表知道"它躺在附近, 先去捡回来"(见 `_pickup_preposed`)。
@@ -845,9 +918,12 @@ class Engine:
         try:
             self.know = Knowledge.from_json(self.bridge.get_knowledge())
             self.scene = scene
-            # ☠ **重拉之后必须作废"按订单名缓存"的那份 flows** —— 它是拿**旧**知识表
-            #   derive 出来的, 而 `_all_flows` 的 key 只看订单名 ⇒ 不主动清, 就会
+            # ☠ **重拉之后必须作废缓存的那份 flows** —— 它是拿**旧**知识表
+            #   derive 出来的, 而缓存的 key 只看"订单身份 + t 分档" ⇒ 不主动清, 就会
             #   一直用着"缺 chop 的那一条"(缓存命中, 悄悄绕过刚修好的重拉)。
+            #   ⚠ 2026-09-17: 缓存搬到了 `_order_pool`, **两套 key 都要清**
+            #     (`_all_flows` 现在是它的投影 ⇒ 清一份就够, 但老 key 留着防回退)。
+            self._pool_key, self._pool_val = None, None
             self._flows_key, self._flows_val = None, None
             self.log(f"[引擎] 食材知识表已加载: {len(self.know.items)} 项 (场景 {scene})"
                      + ("  ← **重拉**" if force else ""))
@@ -1551,7 +1627,7 @@ class Engine:
 
     # ---------------- 组装台面 ----------------
     def pick_assemble_spot(self, km: KitchenMap, x: float, z: float,
-                           claim: bool = True) -> Station | None:
+                           claim: bool = True, slot: str = "", flow=None) -> Station | None:
         """挑摆盘位。**优先挑已经有盘子的台面** —— 那样材料放上去就直接进盘,
         不必先跑去拿盘子。双人时通过黑板保证两人不用同一个。
 
@@ -1563,6 +1639,10 @@ class Engine:
 
         `claim=False` —— **只读模式**: 算出来但不写 `_assemble_sid`、不在黑板上占位。
         评分层给候选打分时要**替队友**也算一遍目标, 那种调用绝不能以我的 cid 占走台面。
+
+        `slot` / `flow` —— **本单**的槽位键与菜谱(2026-09-17 第 5 步)。有它们时按
+        **R1 三层**(我的槽位 / 空且能拼 / 其它)排候选, 并顺手做**W1 绑定**;
+        没有则逐字退回老行为(只按"有没有盘子"挑)。
         """
         _raw = [s for s in (km.of("counter") or km.of("board"))
                 if not s.spawn and s.kind != "CookingStation"]
@@ -1589,6 +1669,36 @@ class Engine:
             allc = _free
         with_plate = [s for s in allc if self._has_plate(s)]
 
+        # ☠☠ **R1 第一层: 本单已经绑着的那盘**(2026-09-17 第 5 步)。
+        #   它比下面那条"守旧早退"更硬 —— 守的是**习惯**(我上次用的那个台面),
+        #   这个守的是**事实**(那盘菜/半成品就是本单的) ⇒ 必须排在它**前面**。
+        #   ⚠ 只在"那块台面**现在还真的在候选里**、并且**上面还真的有盘子**"时才认:
+        #     以**现场**为准, 不以 `_plates` 里的记录为准 —— 记录会陈旧(盘被端走/
+        #     被送餐消耗掉), 而陈旧记录会让这里每轮白认一块空台面。
+        #     ⇒ 现场对不上就**顺手清掉那条陈旧记录**(下一个人别再被它骗)。
+        #   ⚠ `claim=False`(评分层替队友算)**不认也不清** —— 一个字节都不写。
+        if claim and COOP_PLATE and self.board is not None and slot:
+            _sid = self.board.slot_station(str(slot), self.cid)
+            if _sid:
+                # ⚠ **按 id 到 `km.stations` 里取, 不走上面的 `allc`** —— `allc` 已经被
+                #   `_mate_near`(软避让)**和** `_branch_ok` 筛过一遍, 拿它判会**误判**:
+                #   "队友正好站在我那块台面旁边"会被当成"这块台面没了" ⇒ **错误解绑**,
+                #   本单当场丢掉自己的盘。绑定只认**现场事实**(台面在不在 / 上面有没有盘子),
+                #   软避让与它无关。
+                _mine_st = (getattr(km, "stations", None) or {}).get(_sid)
+                if _mine_st is not None and self._has_plate(_mine_st) \
+                        and self._branch_ok(PLACE_SENTINEL, _sid):
+                    self._assemble_sid = _mine_st.id
+                    return _mine_st
+                # ☠ **只在"现场真的对不上"时清记录**(台面没了 / 上面没盘子了)。
+                #   ⚠ 被 `_branch_ok` 划掉的那种**不清**: 台面和盘子都还在, 只是这 25 秒
+                #     我这边走不通 —— 划掉它不该顺手把"这盘是本单的"也一起丢掉。
+                if _mine_st is None or not self._has_plate(_mine_st):
+                    try:
+                        self.board.unbind_plate(_sid)
+                    except Exception:                            # noqa: BLE001
+                        pass
+
         # 先认上一次用的那个 —— 按 id 到**新鲜的 km** 里取, 保证 `.on` 不是陈旧快照
         #
         # ⚠ 但"台面上有盘子"是**更高优先级**, 不能无条件守旧:
@@ -1601,8 +1711,22 @@ class Engine:
             if prev is not None:
                 # ⚠ **队友正在用那个台面时不许"守旧"** —— 整局粘住 + 人类占用 = 卡死
                 #   (用户实机: "这个盘子被我用了, 脚本就会卡住")。让他一下, 去挑别的。
-                if not self._mate_near(prev, _mate) and (self._has_plate(prev) or not with_plate):
-                    return prev
+                # ☠☠ **那盘已经是别的单的时也不许守旧**(2026-09-17 第 5 步): 上面 R1
+                #   第一层已经认过"本单那盘"了, 走到这儿说明 `prev` **不是**本单的
+                #   ⇒ 抱着它等于**占着别人的盘子不放**(而 R1 三层正是要把它让出去)。
+                _pb_prev = self._plate_bound(prev)
+                if not self._mate_near(prev, _mate) and (self._has_plate(prev) or not with_plate) \
+                        and not (_pb_prev and slot and _pb_prev != str(slot)):
+                    # ☠☠ **守旧之前必须过一遍黑板**(2026-09-17 按步协作) —— 原来这里
+                    #   **直接 `return prev`**: 两个厨师的 `_assemble_sid` 一旦相同,
+                    #   他们就共用一块台面, 而 `_spots` 里两人的值都是同一个 id
+                    #   ⇒ **黑板完全不知道这件事** ⇒ `_dish_foreign` / `_skip_already_on_spot`
+                    #   那一族判据全部失明(它们都假设"一块台面只归一个人")。
+                    #   ⚠ `claim=False`(评分层替队友算)那条路**不占位** —— 同 `stove_owner` 的纪律。
+                    if not claim or self.board is None \
+                            or self.board.claim_spot(prev.id, self.cid):
+                        return prev
+                    self.log(f"[分工] 摆盘位 {prev.id} 队友正在用 —— 我换一个台面")
             elif claim:
                 self._assemble_sid = ""    # 台面没了(换关/被拆) → 重新挑
 
@@ -1613,6 +1737,27 @@ class Engine:
         #   在 execute() 开头就会调这里, 且**没有 try 兜着**。
         #   兜底取 `allc` 正是上面注释本来的意思: "全场一个带盘子的台面都没有 → 也只能认它"。
         cands = with_plate or allc
+        # ☠☠ **R1 第二/三层 + 转移协议 T1~T4**(2026-09-17 第 5 步): 有 `flow` 时把
+        #   "有盘子的那些台面"**按能不能给本单用分等**, 只把**最好那一等**交给
+        #   `board.pick_spot`(它仍负责"尽量不与他人重复"那一层)。
+        #   ☠ **不是排序取第一个**: "谁能占"由黑板决定(T4), 而 `pick_spot` 里还有
+        #     "守自己原来那块 / 全被占时挤一块"的老逻辑 —— 那一层别在这儿重复实现。
+        #   ⚠ 只对 `with_plate` 分等: `allc - with_plate`(没盘子的台面)本来就没有
+        #     "归属"可言, 而且它们只在 `with_plate` 为空时才被用到(见上一行的 `or`)。
+        if with_plate and COOP_PLATE and flow is not None:
+            # ⚠ **整段包 try** —— 这一步是"锦上添花"的排序, 炸了不该把整轮挑位带走
+            #   (返回 None 是"整局卡死"的命门, 见上面的兜底注释)。
+            try:
+                _tiers = [(self._spot_tier(s, flow, slot), s) for s in with_plate]
+            except Exception:                                    # noqa: BLE001
+                _tiers = []
+            if _tiers:
+                _best = min(t for t, _s in _tiers)
+                if _best >= 8:
+                    self.log(f"[盘子] ⚠ 场上 {len(with_plate)} 块带盘子的台面"
+                             f"**没有一块是给本单的**(最好的那块: "
+                             f"{'有本单不要的料' if _best == 8 else '别的单的盘'}) —— 只能去挤")
+                cands = [_s for t, _s in _tiers if t == _best]
         if self.board is not None:
             spot = self.board.pick_spot(cands, self.cid, (x, z)) if claim else \
                 min(cands, key=lambda s: (s.x - x) ** 2 + (s.z - z) ** 2)
@@ -1622,6 +1767,28 @@ class Engine:
             spot = min(cands, key=lambda s: (s.x - ax) ** 2 + (s.z - az) ** 2)
         if spot is not None and claim:
             self._assemble_sid = spot.id
+            # ☠☠ **W1: 挑中的这块台面 / 上面那盘 = 本单的**(2026-09-17 第 5 步)。
+            #   只在**真有盘子**时绑(`_bind_plate_for` 自查) —— 台面上没盘子时这盘还
+            #   不存在, 绑了只会留一条"指着一块空台面"的记录, 让 R1 第一层白认。
+            #   ⚠ 别的单那盘要**先过 T1~T3** 才写得进去(内部走 `_can_take_over` + T4)。
+            #   ⚠ 接手那条日志里的两个数**必须在绑之前读** —— `bind_plate` 会把
+            #     `at` 刷成"现在", 读完再打就成了"原主 0 秒没碰"(正好说反)。
+            if slot:
+                _to = self._can_take_over(spot, flow)
+                _old, _idle = None, 0.0
+                if _to:
+                    try:
+                        _old = self.board.plate_owner(spot.id)
+                        _idle = self.board.plate_idle(spot.id)
+                    except Exception:                            # noqa: BLE001
+                        pass
+                if self._bind_plate_for(spot, flow, slot, takeover=_to):
+                    if _to:
+                        self.log(f"[盘子] {spot.id} 那盘 → **我接手**(原主 P{_old} 已 "
+                                 f"{_idle:.0f} 秒没碰, 超过 NEKO_PLATE_TTL="
+                                 f"{PLATE_IDLE_TTL:.0f}s) —— 半成品接着拼")
+                    else:
+                        self.log(f"[盘子] {spot.id} 那盘 → 本单({slot})")
         return spot
 
     # ---------------- 键位归属（权威依据） ----------------
@@ -4058,7 +4225,8 @@ class Engine:
         has = [h for h in (s.onhas or []) if h]
         return "%s%s" % (on, ("〔%s〕" % ",".join(has)) if has else "") or "(空)"
 
-    def _pick_board(self, km, x: float, z: float, target: str = ""):
+    def _pick_board(self, km, x: float, z: float, target: str = "",
+                    claim: bool = True):
         """挑一块**"这块料放得上去"**的切菜板(离厨师最近的优先)。
 
         ☠ 原来两处都写 `km.nearest("board", …)` —— **只看最近那块**。它被别人的东西占着时
@@ -4093,11 +4261,24 @@ class Engine:
                 if fallback_key is None or key < fallback_key:
                     fallback, fallback_key = s, key
                 continue
+            # ☠☠ **黑板占位**(2026-09-17 按步协作): 切菜板原来是**唯一零保护**的共享资源
+            #   —— 只有上面的 `_mate_near` 软避让(它答的是"**他正站在旁边**"),
+            #   而两个人**同时选中同一块板、同时走过去**这件事它拦不住 ⇒ 白跑一趟 + 一块
+            #   板被两人轮流占。这里用**同一张任务占位表**(资源键 `("__res__",…)`,
+            #   与步键天然不撞车 —— 见 `team.OrderBook.claim_step` 的键空间约定)。
+            #   ⚠ **诚实记一笔**: "两人同时走过去"这个**物理竞态仍在**(探测不出"他正走过来"),
+            #     本处只做到"先到先得 + 尽力错开"; 兜底仍是 `op_chop` 里那句
+            #     "板上是别的料 ⇒ 别白切 ⇒ branch dead"。**别把它当成已解决**。
+            if claim and not self._claim_res("board", s.id, BOARD_CLAIM_TTL):
+                if fallback_key is None or key < fallback_key:
+                    fallback, fallback_key = s, key
+                continue
             if best_key is None or key < best_key:
                 best, best_key = s, key
         # ☠ **全被队友占着时退回兜底** —— 否则"唯一一块板有人正在用"会变成
         #   `chop` 不可达 ⇒ 整条链卡死, **比排队更糟**(规则 5)。
         #   和 `_branch_ok` 那个"全划掉就退回不过滤"是同一个道理。
+        #   ⚠ `claim=False`(评分层替队友算)那条路**不占位**(同 `stove_owner` 的纪律)。
         return best if best is not None else fallback
 
     def op_chop(self, km, x, z, op: Op, st: dict) -> bool:
@@ -4126,11 +4307,13 @@ class Engine:
         if not self.navigate_smart(km, board.x, board.z, tight=0.8):
             self._last_fail_kind = KIND_BRANCH
             self.mark_branch_dead(op.target, board.id, "走不到旁边")
+            self._release_res("board", board.id)   # ☠ 这一支走不通 ⇒ 放板, 让队友来试
             return False
         self.face(board.x, board.z)
         if not self._align_for_place(board):     # 见 _align_for_place: 挨得近会判到旁边台子
             self._last_fail_kind = KIND_BRANCH
             self.mark_branch_dead(op.target, board.id, "对不齐台面")
+            self._release_res("board", board.id)   # ☠ 这一支走不通 ⇒ 放板, 让队友来试
             return False
         if held:
             self.interact("pickup", verify_hold_change=False)   # 先放上板
@@ -4150,6 +4333,7 @@ class Engine:
                      f"别白切(先把它处理掉/换个板)")
             self._last_fail_kind = KIND_BRANCH
             self.mark_branch_dead(op.target, board.id, f"板上是 {base}")
+            self._release_res("board", board.id)   # ☠ 这一支走不通 ⇒ 放板, 让队友来试
             return False
         self.log(f"[步骤] 需切 {max_chops} 刀" + (f" (板上: {base})" if base else ""))
 
@@ -4186,6 +4370,7 @@ class Engine:
                          f"`use` 作用不到它 —— 这块板是空的, 这一趟**没活可干**(不白按)")
                 self._last_fail_kind = KIND_BRANCH
                 self.mark_branch_dead(op.target, board.id, "板是空的")
+                self._release_res("board", board.id)   # ☠ 这一支走不通 ⇒ 放板, 让队友来试
                 return False
 
         landed = 0
@@ -4200,6 +4385,7 @@ class Engine:
             cur = self._board_item(board.id)
             if base and cur and cur != base:
                 self.log(f"[步骤] 切好了({i+1} 刀): {base} → {cur}")
+                self._release_res("board", board.id)      # 切完了 ⇒ 板让出来
                 done = True
                 break
             if not base and landed and i + 1 >= max_chops:
@@ -4254,6 +4440,7 @@ class Engine:
                          f"(它是好的, 别让它背 25 秒冷板凳)")
             else:
                 self.mark_branch_dead(op.target, board.id, "切不动")
+                self._release_res("board", board.id)   # ☠ 这一支走不通 ⇒ 放板, 让队友来试
             return False
         # ⚠ **收尾那一下必须是「拿起」, 不能是「放下」** —— `verify_hold_change` 的判据是
         #   "持有物变了没有", 而**放下也会让它变** ⇒ 原来对着空板按一下就把手里的料
@@ -4637,6 +4824,16 @@ class Engine:
             if (s.id or "").startswith("dirty_plates"):
                 continue
             if s.empty_plate_names():
+                # ☠☠ **单件空盘要占位, 盘子堆不占**(2026-09-17 按步协作, 第 6c 步):
+                #   一块台面上那**一件**盘只能给一个人 ⇒ 两人同时选中它就白跑一趟;
+                #   而 `km.of("plates")`(上面那个循环)**是堆** —— 一堆 5 个本来就该
+                #   供两人各拿一个, 占了等于把 5 个的池子变成 1 个(那是**减少**产能)。
+                #   ⚠ 这里**不写显式释放**: 占位只需要覆盖"**走过去拿**"那一段,
+                #     用短 TTL(`PLATE_CLAIM_TTL=8s`)当释放机制 —— 漏放的代价是
+                #     那盘 8 秒没人能用, 可接受; 而"每处 pickup 都要记得释放"那种写法
+                #     一旦漏一处就是 25~30 秒的锁(切菜板那边我显式接了 6 处, 那是值得的)。
+                if not self._claim_res("plate", s.id, PLATE_CLAIM_TTL):
+                    continue
                 cand.append((1, (s.x - x) ** 2 + (s.z - z) ** 2, s))
         if not cand:
             return None
@@ -5133,10 +5330,22 @@ class Engine:
         _ck0 = self._cooking_now(km, stove)
         if self._pot_put(km, stove, pot, op, _ck0, plate_type, flow):
             _ent = self._pots_live().get(stove.id) or {}
-            if _ent and not self._pot_due(_ent):
+            # ☠☠ **`tend`(回来取)那一趟不许再 defer**(2026-09-16 实机打回来的):
+            #   `_tends` 本来就是**提前量**候选(`due - NEKO_COOK_LEAD` 就出发) ——
+            #   人已经到了锅边, 这时候"再走开"是**纯亏**: 每轮一趟来回, 还顺手把盘子
+            #   换个台面(日志指纹: `已放进 hob0(需 12s, 5s 后熟)` → `4s` → `2s` → `1s`
+            #   反复, 每轮都夹一次 `盘子先放在 counterN`)。
+            #   ⇒ `tend` 就**在锅边等那几秒**(下面第 4 步的等待循环), 到点取走。
+            #   ⚠ 非 `tend`(菜谱自己那一步)的 defer 语义不变: 它**不该**在锅边等 ——
+            #     它是在"还没到该动身的时候"被评分选中的, 该走开去干别的。
+            if _ent and not self._pot_due(_ent) and not getattr(op, "tend", False):
                 # ☠ **走开之前先把盘子放好**(用户 2026-09-16 的口径) —— 手空着才能真去干活,
                 #   而回来那趟要多跑一趟拿盘子, 焦窗只有 `need` 秒。
-                if want_pot:
+                # ☠☠ **盘子只放一次**(2026-09-16 实机打回来的): 每一趟 defer 都去放一次,
+                #   于是"拿起来 → 换个台面放下 → 再拿起来"一轮两趟白跑 ——
+                #   日志指纹: `盘子先放在 counter10` / `盘子先放在 counter8` / `盘子先放在 counter10`
+                #   反复横跳。`plate_at` 有值就说明**已经放好了**, 回来那趟直接去取。
+                if want_pot and not _ent.get("plate_at"):
                     self._pot_park_plate(km, stove, op, _ent, x, z)
                 self.log(f"[煮] 已放进 {stove.id}(需 {_ent['need']:.0f}s, "
                          f"{_ent['due'] - time.time():.0f}s 后熟, 硬上限 "
@@ -5452,7 +5661,8 @@ class Engine:
                     (c.get("pick") or "(空)")))
         return False
 
-    def _ensure_plate(self, km: KitchenMap, x: float, z: float, spot: Station) -> bool:
+    def _ensure_plate(self, km: KitchenMap, x: float, z: float, spot: Station,
+                      slot: str = "", flow=None) -> bool:
         """摆盘位上一个盘子都没有时, 才真去拿一个放上来(正常情况台面上本来就有)。
 
         ⚠ **来源有三处, 别只数两处**(2026-09-15): 原来是"台面上放着的" + "干净盘子堆",
@@ -5464,13 +5674,23 @@ class Engine:
         """
         from collections import OrderedDict as _OD
         cands = _OD()
+        # ☠☠ **前两处是"单件", 要占位; 第三处是"堆", 不占**(2026-09-17 第 6c 步)。
+        #   一件盘只能给一个人; 而一堆 5 个本来就该供两人各拿一个。
+        #   ⚠ 插入顺序**必须保持 ①台面上 → ②地上 → ③盘子堆**(下面是按顺序取的),
+        #     所以这里拆成两段写, 而不是顺手合成一个生成器。
         for s in (self._find_item_station(km, "Plate", x, z),
                   self._find_ground_item(km, "Plate", x, z,
-                                         tm=self.terrain(), reach=None),
-                  min(km.of("plates") or [], key=lambda s: (s.x - x) ** 2 + (s.z - z) ** 2,
-                      default=None)):
-            if s is not None:
-                cands[getattr(s, "id", id(s))] = s
+                                         tm=self.terrain(), reach=None)):
+            if s is None:
+                continue
+            if not self._claim_res("plate", getattr(s, "id", ""), PLATE_CLAIM_TTL):
+                self.log("[分工] 那件单件空盘队友正在去拿 —— 我换别的来源")
+                continue
+            cands[getattr(s, "id", id(s))] = s
+        _stack = min(km.of("plates") or [], key=lambda s: (s.x - x) ** 2 + (s.z - z) ** 2,
+                     default=None)
+        if _stack is not None:
+            cands[getattr(_stack, "id", id(_stack))] = _stack
         if not cands:
             self.log("[步骤] 全场找不到盘子(台面上/地上/盘子堆都没有)")
             return False
@@ -5482,7 +5702,22 @@ class Engine:
             return False
         if not self.navigate_smart(km, spot.x, spot.z, tight=0.6):
             return False
-        return self.interact("pickup", verify_hold_change=True)
+        ok = self.interact("pickup", verify_hold_change=True)
+        # ☠☠ **W2: 补来的这只盘必须重绑**(2026-09-17 第 5 步)。
+        #   本函数**只在台面上一个盘子都没有时**才走到这儿 ⇒ 台面上现在这只盘子
+        #   是**我刚刚放上去的新的**, 而 `_plates` 里那条记录(如果有)**指向的是上一只**
+        #   (被端走/被送餐消耗掉了) —— 那是陈旧数据。
+        #   ☠ 不重绑的后果: 只在开局绑过一次的话, **补来的盘是无主的** ⇒
+        #     队友按 T1~T3 就能把它接手走, 而本单**连一块摆盘位都没有了**。
+        #   ⇒ 这里 `takeover=True` 是**对的**: 覆盖的不是"别人正在用的那盘",
+        #     而是一条**指着一只已经不在的盘子**的记录。
+        #   ⚠ `slot` 为空(单人/不知道属于哪张单)⇒ 不绑, 逐字退回老行为。
+        if ok and COOP_PLATE and self.board is not None and slot:
+            try:
+                self.board.bind_plate(spot.id, str(slot), self.cid, takeover=True)
+            except Exception:                                    # noqa: BLE001
+                pass
+        return ok
 
     def op_press(self, km, st, op: Op = None) -> bool:
         """按一个**此刻可按**的机关按钮。
@@ -5671,7 +5906,8 @@ class Engine:
             # 判据用 `_plate_contents_on`(插件读的 `onhas`), 和"并盘成功没有"用的是同一个
             # 来源 —— 不猜、不按名字猜阶段。
             want = self._norm(op.target or "")
-            spot0 = self._spot_now(km) or self.pick_assemble_spot(km, x, z)
+            _ef, _es = self._exec_ctx()
+            spot0 = self._spot_now(km) or self.pick_assemble_spot(km, x, z, slot=_es, flow=_ef)
             contents = self._plate_contents_on(spot0) if spot0 is not None else set()
             if want and spot0 is not None and self._has_plate(spot0) and want in contents:
                 self.log(f"[步骤] 组装: 手上空, 但 {spot0.id} 那盘里已有 {op.target!r} → 跳过")
@@ -5697,7 +5933,8 @@ class Engine:
                 return False
         spot = self.assemble_spot
         if spot is None:
-            spot = self.pick_assemble_spot(km, x, z)
+            _ef, _es = self._exec_ctx()
+            spot = self.pick_assemble_spot(km, x, z, slot=_es, flow=_ef)
             if spot is None:
                 self.log("[步骤] 找不到摆盘位")
                 return False
@@ -5778,6 +6015,10 @@ class Engine:
             after = self._plate_contents_on(spot2)
             if after != before:
                 self.log(f"[步骤] ✓ 手上的菜并进了 {spot.id} 那盘({sorted(before)} → {sorted(after)})")
+                # ☠☠ **W3: 料真进了那盘 ⇒ 打一次心跳**(2026-09-17 第 5 步)。
+                #   位置**必须**在这儿, 不能挪到"按了放置键"那里: 那一下可能被游戏拒,
+                #   打了心跳就等于**替一个没发生的动作续期**(见 `_plate_heartbeat`)。
+                self._plate_heartbeat(spot.id)
                 if self._is_plate(held2):
                     # 手上现在只剩一个空盘: 端着它去拿下一个材料会到处乱放, 先放空台面
                     self._put_down_plate(km2, cx, cz)
@@ -5819,6 +6060,9 @@ class Engine:
                 if held2 != held_before and after != before:
                     self.log(f"[步骤] ✓ {held} 进了 {spot.id} 那盘"
                              f"({sorted(before)} → {sorted(after)})")
+                    # ☠☠ **W3: "我还在做这盘"的心跳** —— 转移协议 T2 的**唯一**数据源。
+                    #   (同上面那处并盘: 只在**料真的进了盘**之后打。)
+                    self._plate_heartbeat(spot.id)
                     # ☠ **再把"原样"打一行** —— 上面那行是**并集 + set**, 会把
                     #   "两份 rice"和"两个盘子"两种情况一起抹平(见 `_onhas_raw`)。
                     #   拼盘这一步正是重数/多盘**第一次出现**的地方, 就在这里记。
@@ -5995,6 +6239,13 @@ class Engine:
                              f"不是我们交的(多半是队友交的), 不冒领")
                     return False
                 self.log(f"[步骤] ✓ 已交付 {op.target}(盘子已出手)")
+                # ☠☠ **W4: 交付成功 ⇒ 解绑**(2026-09-17 第 5 步)。那盘已经被游戏**销毁**了
+                #   (`ClientPlateStation.DeliverPlate` → `DeliverySequence` → `Destroy`),
+                #   记录留着只会让 R1 第一层一直认着一块**空台面**。
+                #   ⚠ 放在**这一条**里(盘子已出手)而不是函数开头: 中途 `return False` 的
+                #     那些路(交互没命中/游戏判菜不合格)**盘子还可能回到台面上**, 解绑了
+                #     反而让本单丢掉自己的摆盘位。
+                self._unbind_plate_of(flow)
                 return True
         # ☠☠ **失败必须能分辨是"没放上去"还是"游戏不收这盘菜"**。
         #   2026-09-16 那一局两次 `serve_any` 都死在这一行, 而日志只写"订单仍在" ——
@@ -6066,7 +6317,10 @@ class Engine:
         if spot is None or self._has_plate(spot):
             return
         self.log(f"[步骤] 摆盘位 {spot.id} 还缺盘子 —— 趁手空补一个")
-        if not self._ensure_plate(km, *self.pos(st)[:2], spot):
+        # ☠ 传**当前在推的那张单**(`_execute_scored` 选中那一步时写的)—— 补来的盘要
+        #   绑给**它**(W2), 不是绑给"这一轮先打的那张单"。`_exec_ctx` 空 ⇒ 退回老行为。
+        _flow, _slot = self._exec_ctx()
+        if not self._ensure_plate(km, *self.pos(st)[:2], spot, slot=_slot, flow=_flow):
             # ☠ **补不上就换台面, 别在这儿反复补** —— 用户实测原话:
             #   "**还有盘子, 这个盘子被我用了, 脚本就会卡住**"。
             #   盘子被人类端走/正拿在手上时, `_ensure_plate` 的三个来源(台面上/地上/盘子堆)
@@ -6106,13 +6360,21 @@ class Engine:
         km = self.map(st) if st else None
         if km is None:
             return False
+        # ☠☠ **执行期的"当前单"从这里起就定下来**(2026-09-17 第 5 步): 本函数由
+        #   `execute()` 在**开头**(手还空着那会儿)调一次, 之后 `_execute_scored`
+        #   每选中一步会再按**那一步所属的单**覆写一次。`op_assemble` / `_top_up_plate`
+        #   / `_ensure_plate` 的签名里都拿不到 `flow` ⇒ 只能靠这一对实例字段
+        #   (见 `_exec_ctx`)。⚠ 它同时是 W2/W3 的"这盘属于哪张单"的来源。
+        self._cur_flow = flow
+        self._cur_slot = str(getattr(flow, "slot", "") or "")
         _, _, held = self.pos(st)
         if held:
             # ⚠ 手上有东西就补不了盘子(见 docstring), 但**摆盘位还是得挑出来** ——
             #   否则这一整轮 assemble 又是不可达(上面的命门)。`_top_up_plate` 会在
             #   每个 op 边界趁手空时补上。
             if self.assemble_spot is None:
-                sp = self.pick_assemble_spot(km, *self.pos(st)[:2])
+                sp = self.pick_assemble_spot(km, *self.pos(st)[:2],
+                                             slot=self._cur_slot, flow=flow)
                 if sp is not None:
                     self.assemble_spot = sp
             return True
@@ -6139,7 +6401,8 @@ class Engine:
                 self.mark_branch_dead(PLACE_SENTINEL, _cur.id, "那盘是别的单的菜")
                 self.assemble_spot = None
                 self._assemble_sid = ""
-        spot = self.pick_assemble_spot(km, *self.pos(st)[:2])
+        spot = self.pick_assemble_spot(km, *self.pos(st)[:2],
+                                       slot=self._cur_slot, flow=flow)
         if spot is None:
             return False
         self.assemble_spot = spot
@@ -6148,7 +6411,8 @@ class Engine:
         if not flow.plate:
             return True                 # 这道菜不要求盘子 ⇒ 不补(摆盘位**已经记下了**)
         self.log(f"[步骤] 开局: 摆盘位 {spot.id} 上没有盘子, 先补一个")
-        if not self._ensure_plate(km, *self.pos(st)[:2], spot):
+        if not self._ensure_plate(km, *self.pos(st)[:2], spot,
+                                  slot=self._cur_slot, flow=flow):
             # 同 `_top_up_plate`: 补不上盘子 ⇒ 这个台面现在对我们没用, 换一个。
             # (两处判据**必须一致** —— 一处换一处不换会来回抖。)
             self.mark_branch_dead(PLACE_SENTINEL, spot.id, "补不上盘子")
@@ -6518,7 +6782,35 @@ class Engine:
             st = self.state() or st
         return self._deliver_plate(km, x, z, op, st, flow)
 
-    def _skip_already_on_spot(self, ops: list) -> list:
+    def _spot_for(self, flow, km=None):
+        """**本单的摆盘位** —— `flow.slot` 绑着哪块台面就回哪块; 没有绑定 ⇒ 退回
+        `self.assemble_spot`(老行为, 单人/还没绑定时走这条)。
+
+        ☠☠ 为什么要它(2026-09-17 按步协作, 计划里的 D3): `self.assemble_spot` 是**单值**、
+          整局粘住一个台面 —— 一个厨师同时推进两张单时, "本单的摆盘位"就不再唯一。
+          它下面挂着 **25 个消费点**(`_prepare_plate`/`_top_up_plate`/`_ensure_plate`/
+          `_skip_already_on_spot` …), 全部改成 per-flow 是不现实的。
+          ⇒ **最小正确解**: 评估期用 per-flow 的位(本函数), 执行期在选中那一步之后
+            把 `self.assemble_spot` 设成被选中那一步的位(见 `_execute_scored`)——
+            于是那 25 个消费点**全都在执行期之后, 一行不改**。
+        ⚠ 只读, 不写任何状态(评分层会拿它替队友算)。
+        ⚠ `km` 可传(调用方手上已经有新鲜地图时别让它再拉一次状态)。
+        """
+        if km is None:
+            km = self.map(self.state() or {})
+        sid = None
+        if self.board is not None and km is not None:
+            try:
+                sid = self.board.slot_station(getattr(flow, "slot", "") or "", self.cid)
+            except Exception:                                      # noqa: BLE001
+                sid = None
+        if sid:
+            st = (getattr(km, "stations", None) or {}).get(sid)
+            if st is not None:
+                return st
+        return self._spot_now(km) if km is not None else self.assemble_spot
+
+    def _skip_already_on_spot(self, flow, ops: list) -> list:
         """组装台面上已经有某个材料了 → 把它那一组(fetch/chop/cook/mix/assemble)整组跳过。
 
         `derive()` 是**纯静态**的: 每次都从订单定义从头推一遍, 完全不看台面上已经放了
@@ -6550,7 +6842,10 @@ class Engine:
             (`_ready_plates` 已经在算 `req <= have <= req|opt`, 那才是集合级、跨订单安全的)。
             在那之前, 下面那行日志把"台面上到底有什么 / 本单要什么"打全, 让实机能分辨复用还是污染。
         """
-        spot = self.assemble_spot
+        # ☠☠ **2026-09-17 起"本单的摆盘位"按归属查**(`_spot_for`), 不再用整局粘住的那个
+        #   单值 `self.assemble_spot` —— 一个厨师同时推进两张单时, 后者会张冠李戴
+        #   (拿 A 单的盘子去判 B 单该不该跳 ⇒ 正是上面那段"交错链路风险"里的误跳)。
+        spot = self._spot_for(flow)
         if spot is None or not ops:
             return ops
 
@@ -6579,10 +6874,19 @@ class Engine:
             if op.action != "assemble":
                 continue
             mat = self._norm(op.target)
-            if mat and mat in have:
+            # ☠☠ **判据换成 `_step_group_ok`**(2026-09-17): 老写法是 `mat in have` ——
+            #   **只看名字、不看归属**。新版先问"这盘属于哪张单", 再用同一个集合级事实
+            #   (`_dish_matches`)判 —— 这正是上面那段 ☠ 注释自己写下的方向。
+            #   ⚠ 老行为的**两个方向都保住**: 已有本组料 ⇒ 跳过(治"重复取料");
+            #     别的单的盘 ⇒ 不跳(治"误跳")。
+            # ☠ 走 `_plate_bound`: 它同时管 `NEKO_COOP_PLATE` 开关与异常兜底
+            #   (关掉时一律回 `""` ⇒ `_step_group_ok` 退回"只按集合判"的老行为)。
+            _bound = self._plate_bound(spot)
+            _keep, _why = self._step_group_ok(flow, have, op.target, _bound)
+            if not _keep:
                 _extra = sorted(have - set(want_req) - set(want_opt))
-                self.log(f"[步骤] 台面 {spot.id} 上已有 {op.target} —— "
-                         f"跳过这 {len(group)} 步({group[0].action} {group[0].target} 起)"
+                self.log(f"[步骤] 台面 {spot.id} 跳过这 {len(group)} 步"
+                         f"({group[0].action} {group[0].target} 起) —— {_why}"
                          + (f" | ⚠ 台面上还有本单不要的: {_extra}(可能是别的订单的残料)"
                             if _extra else "")
                          + f" | 台面全部: {sorted(have)} | 本单要: {want_req}")
@@ -6689,7 +6993,7 @@ class Engine:
             # ⚠ **和 `op_chop` 用同一个 `_pick_board`** —— 不能一个挑"最近那块"、
             #   另一个挑"收得下的那块": 判据一旦漂开, 就会出现"评分算的是这块板、
             #   执行跑去了那块板"(这项目已经栽过好几次)。
-            b = self._pick_board(km, x, z, op.target)
+            b = self._pick_board(km, x, z, op.target, claim=False)   # 评分: 不占位
             return ((b.x, b.z), b.id) if b else (None, "没有能用的切菜板(都被占着?)")
         if a == "mix":
             # ⚠ **搅拌台不是切菜板**: 去的是 `MixingStation`(`sem == "mix"`)。
@@ -6763,7 +7067,7 @@ class Engine:
 
     def _op_actionable(self, km, st, op, x: float, z: float, held: str,
                        strict: bool = True, idx: int = -1, ops=None, pending=None,
-                       flow=None, steps=None):
+                       flow=None, steps=None, flow_of=None):
         """到了那儿**有活可干**吗 —— 返回 `(能不能做, 原因)`。
 
         可达性说的是"我到得了", 这里说的是"到了以后干得了" —— **两件事**。
@@ -6839,6 +7143,14 @@ class Engine:
             _near_j = None
             for _j in range(idx - 1, -1, -1):
                 _oj = ops[_j]
+                # ☠☠ **2026-09-17 按步协作: 不许跨订单找前置** —— 池现在是**多张单拼起来的**,
+                #   而"最近的那个同名前置"完全可能落在**上一张单的尾巴**上:
+                #   A 单结尾的 `fetch X` 会拦住 B 单开头的 `chop X` ⇒ B 那一步**永远不可做**。
+                #   (实测过的同类病: "拿到食材后原地折腾, 一直不加工"。)
+                #   ⚠ 老行为**逐字不变**: 不传 `flow_of`(单池)时这个条件恒不成立。
+                if flow_of is not None and _j < len(flow_of) and idx < len(flow_of) \
+                        and flow_of[_j] is not flow_of[idx]:
+                    continue
                 if _oj.action in _need and self._norm(_oj.target) == _tn:
                     _near_j = _j
                     break
@@ -6974,7 +7286,7 @@ class Engine:
                 #     所以放在"板上有它 ⇒ 直接切"那条**前面**。
                 return False, (f"手上是 {held!r}, 不是 {op.target} —— 上板前那一下会把它"
                                f"放到板上, 板子就废了; 先腾手再来切")
-            b = self._pick_board(km, x, z, op.target)
+            b = self._pick_board(km, x, z, op.target, claim=False)   # 评分: 不占位
             # ☠ **板上有东西 ≠ 板上有"要切的这个"**。原来这里只判 `b.on` 非空, 于是
             #   `chop Chocolate` 在"板上躺着别人切剩的 ChoppedDriedFruit"时照样成立
             #   ⇒ 白走过去、白按十几刀、最后"板上物品没有变化"再失败 ——
@@ -7150,7 +7462,8 @@ class Engine:
             return True
 
     def _rank_candidates(self, km, st, ops, pending: list, n_recipe=None, used=None,
-                         flow=None, steps=None):
+                         flow=None, steps=None, flow_of=None, t_of=None, slot_of=None,
+                         step_of=None):
         """给候选 op 打分 → 按状态变换 → 降序。同时把整张表打进日志。
 
         一次决策只跑 **2 次 BFS**(我一份、队友一份), 然后每个候选查表 ——
@@ -7217,9 +7530,14 @@ class Engine:
         def evaluate(strict: bool, idx_list=None):
             out = {}
             for i in (pending if idx_list is None else idx_list):
+                # ☠☠ **`flow` 的语义变了**(按步协作, D2): 从"本单"变成"**这一个候选所属的单**"
+                #   —— 池跨订单之后, 每个候选的菜谱/依赖/货源都可能是别的单的。
+                #   ⇒ 这里传 `flow_of[i]`; 老调用方(不传 `flow_of`)逐字不变。
                 out[i] = self._feasible(km, st, ops[i], i, cx, cz, held, tm, my_reach,
-                                        ops, pending, flow, mate=mate, strict=strict,
-                                        steps=steps)
+                                        ops, pending,
+                                        (flow_of[i] if flow_of else flow),
+                                        mate=mate, strict=strict,
+                                        steps=steps, flow_of=flow_of)
             return out
 
         info = evaluate(True)
@@ -7286,9 +7604,17 @@ class Engine:
             r["dist"], r["follow"] = d, follow
             # 紧迫度(目前只有"锅快糊了"非 0): `scoring.burn_urgency` 算好的加成分。
             # 推进(手上这份先做完): 见 `_advance_bonus` —— 用**我手上**的那份算。
+            # **订单倒计时的时钟分**(2026-09-17 按步协作): `t` 是**这个候选所属那张单**的
+            # 剩余比例 ⇒ 快到期的那张单的**便宜步骤**也能压过新单的贵步骤。
+            # ☠ 提前已经算过: `t >= FLOOR` 时它**恰好 0** ⇒ 开局行为与改前逐字相同。
+            _clock = 0.0
+            if COOP_CLOCK and t_of is not None and i < len(t_of):
+                _clock = scoring.order_urgency(t_of[i], cap=ORDER_URGENCY_CAP,
+                                               floor=ORDER_URGENCY_FLOOR)
             raw.append(scoring.score(r["op"].action, d, follow,
                                      urgency=getattr(r["op"], "urgency", 0.0),
-                                     advance=self._advance_bonus(r["op"], held)))
+                                     advance=self._advance_bonus(r["op"], held),
+                                     clock=_clock))
             # **计划给的"就是这一步"奖励** —— 见 `_plan_bonus`。
             # ☠ **只加不减**, 且 `NEKO_PLAN != "on"` 时恒为 0(老路径一行不生效)。
             #   加在 `raw` 上而不是改 `scoring.score` 的签名 —— `scoring.py` 是**纯函数模块**
@@ -7324,9 +7650,12 @@ class Engine:
                     # 紧迫度是**位置无关**的(锅不会因为谁去看它而少烧一秒) ⇒ 两边都加,
                     # 否则"我 vs 队友"就不是在比同一件事, 让位判定会失真。
                     # ⚠ 但"推进"要按**队友自己手上**的那份算 —— 谁拿着才算谁的。
+                    # ☠ **`clock` 必须也加到这里**(和 `urgency` 同一条纪律: 它**位置无关**)
+                    #   —— 否则 `scoring.choose` 拿"我含时钟分"和"队友不含"比, 让位判定失真。
                     o = scoring.score(r["op"].action, od, r["follow"],
                                       urgency=getattr(r["op"], "urgency", 0.0),
-                                      advance=self._advance_bonus(r["op"], mate[2] if mate else ""))
+                                      advance=self._advance_bonus(r["op"], mate[2] if mate else ""),
+                                      clock=_clock)
             other_raw.append(o)
 
         # 4) 状态 = 对评分向量的变换(coop 原样 / clumsy 加噪声 / sabotage 取负+重复)
@@ -7345,11 +7674,96 @@ class Engine:
         chosen, verdict = scoring.choose(final, other_raw,
                                          mate[3] if mate is not None else None,
                                          yield_on=yield_on)
+        # ☠☠ **步级占位**(2026-09-17 按步协作, 去重的地基): 两个厨师用**同一套评分、
+        #   同一份 `flow.ops`** ⇒ 最高收益那一步**必然算出同一步** ⇒ 必须有人在黑板上
+        #   把"这一步归我做"占住。
+        #   ⚠ **在评分之后、执行之前**, 而且**按 `final`(变换后)降序**逐个试 ——
+        #     第一名被队友占了就顺势拿第二名(`scoring.choose` 的"让位"是**人类队友**语义,
+        #     这里另起一个词 `错开`, 好让实机 grep 得到"两人在错开"这件事)。
+        #   ⚠ 只占**菜谱步**(`j < n_recipe`): 杂活不销号、每轮重新生成, 占它没有意义。
+        #   ⚠ 全被占 ⇒ **仍然照原样去做**(规则 5: 宁可重复也别让人站着), 但要喊一声。
+        # ⚠ `getattr`: 离线桩里的 Engine 子类**不调 `__init__`**(本仓惯例), 直接摸
+        #   `self.board` 会把它们炸掉(`_splitkitchen_probe` 就栽在这)。
+        _bd = getattr(self, "board", None)
+        if (COOP_STEPS and _bd is not None and chosen is not None
+                and slot_of is not None and step_of is not None):
+            _ord = sorted([n for n in range(len(pending)) if final[n] > scoring.NEG_INF],
+                          key=lambda n: final[n], reverse=True)
+            _got = None
+            for _n in _ord:
+                _j = pending[_n]
+                if _j >= n_recipe or _j >= len(slot_of) or _j >= len(step_of):
+                    continue                       # 杂活/越界 ⇒ 不占
+                _k = _bd.step_key(slot_of[_j], step_of[_j])
+                if _bd.claim_step(_k, self.cid, STEP_CLAIM_TTL):
+                    _got = (_n, _k)
+                    break
+                verdict[_n] = "错开(队友刚占了这一步)"
+                if _n == chosen:
+                    self.log(f"[分工] {ops[_j].action} {ops[_j].target} "
+                             f"({slot_of[_j]} 第{step_of[_j]}步) 队友在做 —— 我改选下一个")
+            if _got is None:
+                self.log("[分工] ⚠ 全池的步位都被占 —— 规则 5: 宁可重复也别让人站着")
+            else:
+                chosen = _got[0]
+                self._claimed_step = _got[1]       # 释放时用它(见 `_release_step_claim`)
         self._log_score_table(pending, info, raw, final, other_raw, chosen, mate, verdict,
                               reach_n=len(my_reach), reach_total=self._walk_total(tm))
         if chosen is None:
             return None
         return pending[chosen], final[chosen]
+
+    def _claim_res(self, kind: str, rid: str, ttl: float) -> bool:
+        """**资源占位**(台面/板/盘子) —— `team.OrderBoard.claim_step` 的一层薄封装。
+
+        ☠ **任务占位 ≠ 资源占位**: 一张单的一步要**同时**拿到两层才算真开跑
+          (占了一块板 ≠ 锁死一整步; 反过来也一样)。两层**不合并** —— 合并了就会
+          "占了一块板就锁死一整步"。
+        ⚠ 键空间必须**正交**: 资源键 `("__res__", kind, rid)`, 任务键 `(槽位, 步号)`
+          ⇒ 两组在字典里天然不撞车, 而**实现只有一份**(`claim_step`) —— 本仓规矩 1。
+        ⚠ `claim=False`(评分层替队友算)那条路**不许调它**(同 `stove_owner` 的纪律)。
+        """
+        bd = getattr(self, "board", None)
+        if bd is None or not COOP_RES:
+            return True                      # 单人/关掉 ⇒ 一律放行(老行为)
+        try:
+            return bd.claim_step(("__res__", kind, rid), self.cid, ttl)
+        except Exception:                                        # noqa: BLE001
+            return True                      # 黑板抽风 ⇒ 放行, 别把路堵死
+
+    def _release_res(self, kind: str, rid: str) -> None:
+        """放掉一处资源占位。**只放自己的**(`release_step` 的纪律)。"""
+        bd = getattr(self, "board", None)
+        if bd is None:
+            return
+        try:
+            bd.release_step(("__res__", kind, rid), self.cid)
+        except Exception:                                        # noqa: BLE001
+            pass
+
+    def _release_step_claim(self, why: str = "") -> None:
+        """**放掉我占着的那一步**(步级占位, 2026-09-17)。
+
+        ☠☠ 漏放的后果**不是"少省一点"**, 而是**队友在这 `STEP_CLAIM_TTL`(30 秒)里
+          连试都不能试** —— 那正是"接手"的反面, 也是这条路唯一的危险面。
+        四种结局的处置(见 `_rank_candidates` 的占位写点):
+          · **做成了**            ⇒ 放(下一条鱼是**另一个步号**, 不受影响);
+          · **这一支不行**        ⇒ **立刻放**(让队友用别的台面把同一步做成);
+          · **上冷板凳**          ⇒ 放("我不做了");
+          · **⏸ 先去干别的**      ⇒ **也放** —— 队友能接手更好: 他走到锅边会走**台账**
+            那条路(`_pot_get`), 不会重复放料。
+        """
+        k = getattr(self, "_claimed_step", None)
+        if k is not None:
+            self._claimed_step = None
+            bd = getattr(self, "board", None)
+            if bd is not None:
+                try:
+                    bd.release_step(k, self.cid)
+                except Exception:                                # noqa: BLE001
+                    pass
+        if why:
+            self.log(f"[分工] 放掉占位({why})")
 
     def apply_commands(self) -> None:
         """读一次外部命令文件并执行(`neko/control.py`)—— `run()` 每轮调一次。
@@ -7690,7 +8104,9 @@ class Engine:
         self.log(f"[评分] 决策点 {len(pending)} 个候选{rn}{m}")
         self.log(scoring.table(rows))
 
-    def _execute_scored(self, flow: DishFlow, ops: list, retries: int, total: int) -> bool:
+    def _execute_scored(self, flow: DishFlow, ops: list, retries: int, total: int,
+                        flow_of: list = None, slot_of: list = None,
+                        t_of: list = None, step_of: list = None) -> bool:
         """**阶段一 + 阶段二**: 用四项评分挑"下一步做哪个", 而不是按下标顺序走。
 
         `do_op` 与所有 `op_*` **一行不动** —— 换掉的只是"选哪个"。
@@ -7849,7 +8265,8 @@ class Engine:
                 #   ⚠ 传的是**外层那个 `pending`**(成功才销号), 不是 `_fresh`。
                 picked = self._rank_candidates(km, st, pool, pool_pending,
                                                n_recipe=n_recipe, used=used, flow=flow,
-                                               steps=pending)
+                                               steps=pending, flow_of=flow_of, t_of=t_of,
+                                               slot_of=slot_of, step_of=step_of)
                 # ★★ **硬上限**(用户 2026-09-16 点名要的**唯一一处硬规则**):
                 #    台账里有锅过了 `late`(焦线往回留了 `COOK_RETURN_MARGIN`) ⇒
                 #    **不管评分选出什么**, 这一轮先回去把它取出来。
@@ -7958,6 +8375,16 @@ class Engine:
                                      f"静止{_m[3]:.1f}s{'(人)' if _m[4] else '(bot)'}")
                     self.log(f"[引擎] 现在没有任何可做的动作(菜谱全够不着/没料, 也没有杂活) "
                              f"—— 先等 {IDLE_WAIT:.0f} 秒再看({_mate_txt})")
+                    # ☠☠ **③ 有单、菜谱也推得出、但一步都做不了** —— 去归属之后**最该
+                    #   看得见的那一句**(见 `_no_order_why` 的三句分级)。它的全部价值在于
+                    #   把**这两件事分开**:
+                    #     · "**池子被队友占满了**" ⇒ 协作那一侧出了问题(步级占位没释放?
+                    #       两人算出同一步?) —— **是 bug**;
+                    #     · "**占位表里一步都不在队友名下**" ⇒ 真的做不了(料够不着/没设备),
+                    #       **是世界的现状**。
+                    #   处置完全相反, 而它们在日志里本来长得一模一样。
+                    #   ⚠ 只在这个窗口的**第一圈**打(20 秒一次), 不刷屏。
+                    self.log(f"[引擎]    {self._no_order_why()}")
                     self.log(f"[引擎]    多半是食材在够不着的那半边, **该人类队友拿**; "
                              f"等满还是一场空才判失败。`NEKO_IDLE_WAIT=0` 可关掉这个等待")
                     if _n_handed:
@@ -8004,6 +8431,29 @@ class Engine:
                 used[k] = used.get(k, 0) + 1
             else:
                 pending = [p for p in pending if p != i]
+                # ☠☠ **D3 + 执行期的"当前单"**(2026-09-17 第 5 步): `self.assemble_spot`
+                #   是**单值**、整局粘一块台面 —— 一个厨师同时推进**两张单**时, "本单的
+                #   摆盘位"就不再唯一, 而 `op_assemble`/`_top_up_plate`/`_ensure_plate`
+                #   **都拿不到 `flow`**(签名里没有, 也不该为它改那 25 个消费点)。
+                #   ⇒ 在**选中那一步之后、`do_op` 之前**把"那一步属于哪张单 / 哪块摆盘位"
+                #     记下来; 于是那些消费点**全都在执行期之后, 一行不改**。
+                #   ⚠ 只对**菜谱步**做 —— 杂活没有单, 流程上也不该动摆盘位。
+                #   ⚠ 同一块台面也**写回新鲜快照**(按 id 比, 不按对象身份 —— `km` 每次
+                #     都是新造的, `is` 永远为真, 那样会每步刷一行日志)。
+                _f = (flow_of[i] if (flow_of is not None and i < len(flow_of)) else flow)
+                self._cur_flow = _f
+                self._cur_slot = (str(slot_of[i] or "")
+                                  if (slot_of is not None and i < len(slot_of))
+                                  else str(getattr(_f, "slot", "") or ""))
+                try:
+                    _sp = self._spot_for(_f, km)
+                except Exception:                                  # noqa: BLE001
+                    _sp = None
+                if _sp is not None:
+                    if getattr(_sp, "id", "") != getattr(self.assemble_spot, "id", ""):
+                        self.log(f"[盘子] 这一步属于 {getattr(_f, 'name', '?')}"
+                                 f"({self._cur_slot or '无槽位'}) —— 摆盘位切到 {_sp.id}")
+                    self.assemble_spot = _sp
 
             # 订单没了就别再做它的杂活 —— 洗一次盘子能烧 20 秒, 而这一单已经不用做了。
             if is_chore and not self._order_live(flow.name):
@@ -8049,6 +8499,7 @@ class Engine:
                 finally:
                     self.kb.release_all()
                 if done:
+                    self._release_step_claim("做成了")
                     break
                 # ☠ **"摔死"不重试**: 一趟导航摔死到上限(`MAX_RESPAWNS`)说明路本身走不通,
                 #   再走两遍只是把 6 秒/次的重生等三遍(实机: 一路刷了 9 次重生)。
@@ -8063,12 +8514,16 @@ class Engine:
                 if self._last_fail_kind == KIND_BRANCH:
                     self.log(f"[引擎] ⚠ 第 {i+1} 步是**这一支不行**({op.action} {op.target})"
                              f" —— 不原地重试, 换支重选")
+                    # ☠ **立刻放占位** —— 这一支我走不通了, 队友用**别的台面**还能做成;
+                    #   不放的话他在 30 秒里连试都不能试。
+                    self._release_step_claim("这一支不行")
                     break
                 # ☠☠ **"放完就走"那一趟**: 没做成, 但**也没失败**(见 `KIND_DEFER`)。
                 #   原地重试毫无意义(它就是"还没到点"), 直接去做别的。
                 if self._last_fail_kind == KIND_DEFER:
                     self.log(f"[引擎] ⏸ {op.action} {op.target} **还没到回来的时候**"
                              f" —— 不重试, 先去做别的")
+                    self._release_step_claim("先去干别的")   # 队友能接手更好(他会走台账)
                     break
                 self.log(f"[引擎] 第 {i+1} 步失败, 重试 {attempt+1}/{retries}")
             if not done:
@@ -8119,6 +8574,9 @@ class Engine:
                     continue
                 self._last_fail_step = f"{op.action} {op.target}"
                 self.log(f"[引擎] ✗ 放弃: {op.action} {op.target} (评分 {scoring.fmt(fin)})")
+                # ☠ **整单放弃 ⇒ 也要放占位** —— 否则这单的每一步会被我锁 30 秒,
+                #   而我已经放弃了它(队友想接手都进不来)。
+                self._release_step_claim("整单放弃")
                 return False
             self.log(f"[引擎] ✓ {op.action} {op.target} (评分 {scoring.fmt(fin)})")
             # ☠ **加工做完了 ⇒ 同名的 `fetch` 立刻销号**(见 `_subsumes_fetch` 的注释:
@@ -8147,6 +8605,23 @@ class Engine:
             if self._flow_completed_by(op, flow):
                 self.log(f"[引擎] ★ {flow.name} 已经交掉了 —— 这一单收工")
                 return True
+            # ☠☠ **`tend`(回来取菜)做成了 ⇒ 菜谱里那一步 `cook X` 也要销号**
+            #   (2026-09-16 实机打回来的整单报废): "取菜"其实是**杂活** `_tends` 干的,
+            #   而菜谱那一步 `cook X` 一直躺在 `pending` 里 —— 台账被 `_pot_done` 清掉之后
+            #   它就**重新变成可做**(我那道反向闸门只看台账), 于是脚本又去"把米放进锅",
+            #   手里却端着刚取出来的那盘 ⇒ `站位不对` ×3 ⇒ `✗ 放弃: cook X` ⇒ **整单报废**。
+            #   日志指纹: `✓ cook SushiRice` 之后跟着 `去 hob0 煮 SushiRice` + `手上没东西可煮`。
+            #   ⇒ 和上面 `_flow_completed_by` 同一个形状: **杂活替菜谱做掉的那一步, 当场销号**。
+            #   ⚠ 判据只此一份: `(action, target)` 对上, 且**只销菜谱段**(`< n_recipe`)。
+            if is_chore and getattr(op, "tend", False):
+                _drop = [j for j in pending
+                         if j < n_recipe and pool[j].action == op.action
+                         and self._norm(pool[j].target) == self._norm(op.target)]
+                if _drop:
+                    pending = [j for j in pending if j not in _drop]
+                    self.log(f"[引擎] ✓ 取菜那一趟替菜谱做掉了 —— "
+                             f"菜谱里的 {op.action} {op.target} 一并销号"
+                             f"(剩 {len(pending)} 步)")
             # 杂活不 `remember`: 捣蛋鬼的"重复奖励"会让它反复做同一件杂活,
             # 而洗一次盘子能烧 20 秒 —— 哲学上正确, 计时上很贵(见 modes 的注释)。
             if self.mode_state is not None and not is_chore:
@@ -8494,30 +8969,78 @@ class Engine:
           日志证据: `空转: 2→3→4→5 张单都被队友认领了 ['Sushi_Fish', …]`。
         `id` 来自订单栏那一格的 widget 实例 id(`OrderCapture.cs`), 稳定、不重号。
         ⚠ 老 dll 没 `id` ⇒ 退回名字 —— **行为与加这个之前逐字相同**。
+
+        ☠☠ **2026-09-17: 改成 `team.OrderBoard.key_of` 的转发** —— 原来这里是**第二份实现**,
+          而且**两份产出的字符串不一样**(这里 `524212`, 那边 `#524212:Sushi_Fish`)。
+          两处一旦不一致, "这盘属于哪张单"(`_step_group_ok` 拿 `flow.slot` 跟盘子绑定比)
+          就会**永远比不中** —— 而那种错在日志里看不出来。
+          ⇒ 判据只留一份(本仓规矩 1), 这里只是转发。
         """
-        return str(o.get("id") or o.get("name") or "")
+        return OrderBoard.key_of(o)
 
     def _no_order_why(self) -> str:
-        """**一张单都做不了** —— 用一句人话说清为什么。空串 = 其实有单(不该走到这儿)。
+        """**现在为什么没活干** —— 用一句人话说清。**三句分级**(2026-09-17 重写)。
 
         ☠ 为什么必须有: `run()` 那条 `if planned is None: continue` 原来是**静默**的,
           于是"空转"和"卡住"在日志里长得一模一样 —— 实测 2026-09-16 我被骗了一轮,
           去查焦点和寻路, 方向全错。**没活干也是一种状态, 要说得出来。**
+
+        ☠☠ **去归属之后必须重写**: 老版本的第 ③ 句是"N 张单都被**队友认领了**" ——
+          而认领闸门整个删掉了(见 `plan()`), 那句话现在**几乎不可能为真**,
+          留着它会让下一局的人以为"是分工把活分完了", 方向全错。
+          真正要分清的是**另外两件事**(它们本来长得一模一样, 处置却相反):
+            · **池子被队友占满了** ⇒ 协作那一侧出了问题(步级占位没释放? 两人算出同一步?)
+              —— **是 bug**, 去看 `NEKO_COOP_STEPS`;
+            · **占位表里一步都不在队友名下** ⇒ 真的做不了(料够不着 / 没设备 / 走不到)
+              —— **是世界的现状**, 该去看地图与可行性。
+          判据就是**问黑板**: 把池里每一步的 `step_owner` 数一遍。
+
+        三句:
+          ① `订单栏是空的`;
+          ② `有单(...)但推不出菜谱`;
+          ③ `有单(...)、菜谱也推得出、但一步都做不了` —— 附每张单的步数 + 占位归属。
+        ⚠ ② 与 ③ 在 `run()` 那条路上**都到不了**(那里池是空的, 见 11141 的池兜底);
+          ③ 的实际出口是 `_execute_scored` 的"一个候选都没有"那里(见那一行调用)。
         """
         orders = self.live_orders()
         if not orders:
-            return "订单栏是空的"
+            return "① 订单栏是空的"
         names = [o.get("name") or "?" for o in orders]
-        if self.board is None:
-            # 单人: 有单就一定能领 ⇒ 走到这儿只可能是"菜谱推不出来"
-            return f"有单({names})但推不出菜谱"
-        # ⚠ **按槽位判, 不按名字** —— 同名多单时"按名字判"会把 5 张说成 1 张
-        #   (见 `team.key_of` 的账)。这里数的是"还有几格不是我在做"。
-        taken = [n for o, n in zip(orders, names)
-                 if self.board.owner_of(self.board.key_of(o)) not in (None, self.cid)]
+        if self.board is None or not COOP:
+            # 单人 / COOP=0: 有单就一定能领 ⇒ 走到这儿只可能是"菜谱推不出来"
+            return f"② 有单({names})但推不出菜谱"
+        try:
+            pool = self._order_pool(self.state() or {})
+        except Exception as e:                                   # noqa: BLE001
+            return f"② 有单({names})但订单池构建失败: {e!r}"
+        if not pool:
+            return f"② 有单({names})但推不出菜谱(订单池是空的)"
+        # ---- ③ ----
+        parts, taken, total = [], 0, 0
+        for slot, name, _t, flow in pool[:COOP_ORDERS]:
+            _ops = list(getattr(flow, "ops", []) or [])
+            total += len(_ops)
+            parts.append(f"{name}({slot}) {len(_ops)} 步" if _ops
+                         else f"{name}({slot}) **推不出菜谱**")
+            for _n, _op in enumerate(_ops):
+                try:
+                    _o = self.board.step_owner(self.board.step_key(slot, _n))
+                except Exception:                                # noqa: BLE001
+                    _o = None
+                if _o is not None and _o != self.cid:
+                    taken += 1
         if taken:
-            return f"{len(taken)} 张单都被队友认领了 {taken}"
-        return f"有单({names})但认领后仍推不出来(detail 缺?)"
+            # ☠ 这一支是 **bug 那一侧**: 我一步都做不了, 而池里的步**不少**在队友名下。
+            #   最可能的两种: ① 占位泄漏(他没放掉, 见 `NEKO_STEP_TTL`); ② 两人真的算出
+            #   同一步然后**双双被对方的占位挡住**(那要看 `[分工] 错开` 那几行)。
+            _tail = (f"; ★ 池里 **{taken}/{total} 步的占位在队友名下** "
+                     f"⇒ 不是'做不了', 是**分工把池子占满了**(是 bug 那一侧: "
+                     f"去看 `[分工]` 那几行; 要对照就 `set NEKO_COOP_STEPS=0`")
+        else:
+            _tail = (f"; 占位表里**一步都不在队友名下** ⇒ **是真的做不了**"
+                     f"(料够不着/没设备/走不到), 不是分工的问题")
+        return (f"③ 有单({names})、菜谱也推得出, 但**一步都做不了** —— "
+                + " | ".join(parts) + _tail)
 
     def _idle_chore(self, km, st) -> bool:
         """**一张单都领不到时, 去干一件杂活** —— 救锅最优先。
@@ -8676,12 +9199,55 @@ class Engine:
             _cxw, _czw, _ = self.pos(_stw)
             if _cxw is not None:
                 self._wear_backpack(_kmw, _cxw, _czw)
-        ops = self._skip_already_on_spot(flow.ops)
+        ops = self._skip_already_on_spot(flow, flow.ops)
         total = len(ops)
+        # ☠☠ **按步协作: 候选池跨订单**(2026-09-17, 用户: "可以两个脚本做订单的一部分")。
+        #   池 = 订单栏上**最紧急的几张单**的步骤拼起来(每张单各自先过一遍
+        #   `_skip_already_on_spot`)。`COOP=0` 或单人 ⇒ **逐字退回"只有这一张单"**。
+        #   ⚠ 三条平行表与 `ops` **等长**, 杂活段的值为 `None`/`""`/`0.0`
+        #     (`_execute_scored` 里把杂活拼在尾部 ⇒ 那段的下标天然 >= n_recipe)。
+        #   ⚠ 池**只在这里拼**(`_execute_scored` 拿到的 `ops` 已经是拼好的) ⇒
+        #     "要不要跨单"只有一个决定点。
+        flow_of = slot_of = t_of = step_of = None
+        if COOP and self.board is not None:
+            try:
+                _pool = self._order_pool(self.state() or {})
+            except Exception as e:                                 # noqa: BLE001
+                self.log(f"[分工] 订单池构建失败: {e!r}")
+                _pool = []
+            if len(_pool) > 1:
+                _all, flow_of, slot_of, t_of, step_of = [], [], [], [], []
+                for _slot, _name, _t, _f in _pool[:COOP_ORDERS]:
+                    # 本单那一批上面已经过了 `_skip_already_on_spot`, 别重算(同一份判据)
+                    _o = ops if _f is flow else self._skip_already_on_spot(_f, _f.ops)
+                    # ☠☠ **步号 = 菜谱内下标(`flow.ops` 里的位置), 不是过滤后的下标**。
+                    #   为什么: `_skip_already_on_spot` 会**整组滤掉**已经拼好的料 ⇒ 过滤后的
+                    #   下标会**移位**; 而步级占位是**跨决策点**的("这一步归我做"),
+                    #   键一移位就会**指到另一步**(占位表于是失效或误挡)。
+                    #   ⇒ 用 `is` 找回它在 `flow.ops` 里的位置(那才是稳定的身份)。
+                    #   ⚠ 不能用 `list.index(op)`: `Op` 是 dataclass(值相等) ⇒ 同一张单里
+                    #     两个一模一样的 `fetch X` 会返回**同一个**下标 ⇒ 又把两份料合进
+                    #     一个步位了(`step_key` 注释里那条账)。
+                    _idx = [i for i, _x in enumerate(_f.ops)
+                            if any(_x is _k for _k in _o)]
+                    for _n, _op in enumerate(_o):
+                        _all.append(_op)
+                        flow_of.append(_f)
+                        slot_of.append(_slot)
+                        t_of.append(_t)
+                        step_of.append(_idx[_n] if _n < len(_idx) else _n)
+                ops = _all
+                total = len(ops)
+                self.log(f"[订单] 池里 {len(_pool[:COOP_ORDERS])} 张单 / {total} 步"
+                         f"(跨单组 {len(_pool[:COOP_ORDERS]) - 1})"
+                         + (f"; 另有 {len(_pool) - len(_pool[:COOP_ORDERS])} 张没进池"
+                            if len(_pool) > COOP_ORDERS else ""))
         # **评分接管"选哪个"**(交接包 §4)。`SCORE_DRIVES_MODE=0` 时下面的旧循环逐字不变 ——
         # 真机验证期留一条"一键退回旧行为"的路(`set NEKO_SCORE=0`), 没有离线测试就只有它兜底。
         if SCORE_DRIVES_MODE:
-            return self._execute_scored(flow, ops, retries, total)
+            return self._execute_scored(flow, ops, retries, total,
+                                        flow_of=flow_of, slot_of=slot_of, t_of=t_of,
+                                        step_of=step_of if flow_of else None)
         for i, op in enumerate(ops):
             done = False
             # 摆盘位缺盘子就趁手空补上 —— 见 _top_up_plate() 的注释(一整轮 9 次失败都是它)
@@ -8885,6 +9451,47 @@ class Engine:
             (opt if getattr(o, "optional", False) else req).add(n)
         return req, opt
 
+    def _step_group_ok(self, flow, have: set, mat: str, bound_slot=None):
+        """**这一组步骤现在该做吗** —— `_skip_already_on_spot` 的新判据(2026-09-17 按步协作)。
+
+        老判据("**这个名字在不在台面上**")是**按材料名、跨订单**的, 它自己的注释
+        (`_skip_already_on_spot` 里那段 ☠)已经写了方向: 换成"**这一盘是否已经匹配本单**"。
+        为什么现在必须换: 去归属之后两个厨师会**共用台面**, 而下一张单开跑时 `have` 里
+        混着**上一张单的残料** —— 只按名字判就会**误跳**别人的那一步(实测"同一份海带取了 7 遍"
+        的反面: 该做的不做)。
+
+        输入: `flow` = 本单; `have` = **那盘**里的归一化材料集(调用方就地读 `_plate_contents_on`);
+              `mat` = 这一组的材料名(**一组 = 一条链 = 一个材料**, 见 `_chain_ops`);
+              `bound_slot` = 那块台面上那盘的槽位绑定(见 `team.bind_plate`; `None`/`""` = 无主半成品)。
+
+        返回 `(该做吗, why)`: `(True, "")` = 该做; `(False, 原因)` = **跳过**这一组。
+
+        ☠☠ **判据一层都不重写**: 集合级的事实仍然全部由 `_dish_sets` + `_dish_matches`
+          (`AssumeTypeMatch` 的直译)回答 —— 这里只加**外面那一层"这盘属于哪张单"**。
+        ⚠ 槽位键拿 `flow.slot`(2026-09-17 新加的字段, 空串 = 还不知道/单人模式)
+          ⇒ 空串时**退回老行为**(只按集合判), 不制造新的失败点。
+        """
+        req, opt = self._dish_sets(flow)
+        if not req or not have:
+            return True, ""                      # 盘是空的 / 推不出菜谱 ⇒ 什么都不跳
+        _mine = getattr(flow, "slot", "") or ""
+        _bound = str(bound_slot or "")
+        if _bound and _mine and _bound != _mine:
+            # ③ 这盘是**别的单**的 ⇒ **一律不跳**(各自做各自的)。
+            #    ⚠ 同菜两单的 req/opt **完全相同** ⇒ 这里分不出是"巧合同名"还是"同一道菜的另一张"
+            #      ⇒ 把原因交回调用方, 由它决定要不要打那行 `⚠ 同菜两单`(它才拿得到订单栏)。
+            return True, f"这盘归属 {_bound}, 不是本单的"
+        if self._dish_matches(have, req, opt):
+            # 整盘就是本单要的菜 ⇒ **整单的 assemble 组全跳**(只剩 deliver)。
+            return False, "这盘已经是本单拼好的菜"
+        if self._norm(mat) in have:
+            # 本组要的那份**已经在这盘里了** ⇒ 跳(这就是老判据要治的"重复取料")。
+            # ⚠ 判据保住老行为: 老写法是 `mat in have`, 这里同义, 只是**先过了归属那一层**。
+            return False, f"{mat} 已经在这盘里了(重复取料)"
+        if len(have | {self._norm(mat)}) and (have | {self._norm(mat)}) <= (req | opt):
+            return True, ""                      # 属于本单 ⇒ 该做
+        return False, f"{mat} 加进去会串进别的菜(盘里={sorted(have)}, 本单要={sorted(req)})"
+
     @staticmethod
     def _dish_matches(have: set, req: set, opt: set) -> bool:
         """这一盘是不是本单拼好的那道菜(**判据只此一份**)。
@@ -8907,7 +9514,7 @@ class Engine:
         return None
 
     def _feasible(self, km, st, op, i, cx, cz, held, tm, reach, ops, pending, flow,
-                  mate=None, strict: bool = True, steps=None) -> dict:
+                  mate=None, strict: bool = True, steps=None, flow_of=None) -> dict:
         """**这一步现在可行吗** —— 一次算齐"去哪儿 / 做不做得了 / 为什么不行 / 站哪个格"。
 
         这是"**可信验证**"的**唯一入口**。用户 2026-09-15 定的形状:
@@ -8938,9 +9545,13 @@ class Engine:
         ⚠ 只**读**世界, 不动任何状态(和 `_op_target_for_score` 同一个约束)。
         """
         target, label = self._op_target_for_score(km, st, op, cx, cz, tm=tm, reach=reach)
+        # ⚠ `flow_of` **只在有值时传**(按步协作): 老调用方/离线桩的子类可能还没有这个
+        #   形参(`_splitkitchen_probe` 就自己覆写了 `_op_actionable`)——
+        #   不传 ⇒ 那条路**逐字退回老行为**, 也不会把桩炸掉。
+        _extra = {"flow_of": flow_of} if flow_of is not None else {}
         ok, why = self._op_actionable(km, st, op, cx, cz, held, strict=strict,
                                       idx=i, ops=ops, pending=pending, flow=flow,
-                                      steps=steps)
+                                      steps=steps, **_extra)
         if target is None and not why:
             # ☠ `_op_target_for_score` 的**"为什么解析不到目标"**就装在 `label` 里
             #   (如 "够不着: 计划货源@12.0,-6.0, 也没有别的够得着的货源")。
@@ -8979,6 +9590,177 @@ class Engine:
         if not req:
             return set()
         return set(have) - (req | opt)
+
+    # ---------------- 盘子 ↔ 订单: 绑定与转移(2026-09-17 第 5 步) ----------------
+    #
+    # ☠☠ **它的语义是"这盘菜是哪张单的需求"(一个客观事实), 不是"谁负责"(分工)。**
+    #   用户说的"完全去掉订单归属"指的是**分工** —— 不包括这一条。没有它,
+    #   **同一道菜的两张单(req/opt 完全相同)会互相认领同一盘**, 而 `_dish_matches`
+    #   (集合判据)对此**天然无能为力**: 那盘菜对两张单都"匹配"。
+    #   ⇒ 订单身份是**另一维**, 加在 `_dish_matches` **外面** —— 那个函数一行不改。
+    # ⚠ 黑板里**只存意图与归属**(`{slot, cid, at, stamp}`), **不存"盘里装了什么"** ——
+    #   内容每次从 `km` 现读(`_plate_contents_on`)。抄进黑板 = 造第二份真相
+    #   = "行为像黑盒"的成因(同 `_spot_now` 那条纪律)。
+    def _exec_ctx(self):
+        """**执行期**当前那一步属于哪张单 —— `(flow, 槽位键)`。
+
+        ☠ 为什么要有它(`_execute_scored` 里写、这里读): `self.assemble_spot` 是**单值**,
+          而 `op_assemble` / `_top_up_plate` / `_ensure_plate` 的签名里**都拿不到 `flow`**
+          —— 也不该为了它去改那一堆消费点。⇒ 在**选中那一步之后**把"那一步的单"记下来。
+        ⚠ 一律**惰性读**(`getattr`): 离线桩的 Engine 子类**不调 `__init__`**(本仓惯例),
+          直接摸 `self._cur_flow` 会把它们炸掉。空 = 不知道(单人/杂活) ⇒ 调用方退回老行为。
+        """
+        return getattr(self, "_cur_flow", None), str(getattr(self, "_cur_slot", "") or "")
+
+    def _plate_bound(self, s) -> str:
+        """**只读**: 那块台面上那盘绑给哪个槽位(没绑/黑板不可用/开关关掉 → `""`)。"""
+        bd = getattr(self, "board", None)
+        if bd is None or not COOP_PLATE or s is None:
+            return ""
+        try:
+            return str(bd.plate_slot(getattr(s, "id", "") or "") or "")
+        except Exception:                                        # noqa: BLE001
+            return ""
+
+    def _dish_for_order(self, have: set, flow, bound_slot=None) -> bool:
+        """**这一盘是【本单】要的那道菜吗** —— `_dish_matches` **外面**再加一层归属。
+
+        ☠☠ `_dish_matches`/`_dish_sets`/`_dish_foreign` **一行不改**: 它们是
+          `AssumeTypeMatch` 的直译, 集合级的事实、跨订单安全。这里加的只是
+          "**这盘属于哪张单**" —— 因为**同一道菜的两张单 req/opt 完全相同**,
+          集合判据**分不出**是哪张单的 ⇒ 今天两个厨师可能**互相认领同一盘**(真 bug)。
+        ⚠ `bound_slot` 空 / `flow.slot` 空(单人、还没绑定)⇒ **只看集合**(逐字老行为)。
+        """
+        req, opt = self._dish_sets(flow)
+        if not self._dish_matches(have, req, opt):
+            return False
+        _b = str(bound_slot or "")
+        _mine = str(getattr(flow, "slot", "") or "")
+        return not (_b and _mine and _b != _mine)
+
+    def _can_take_over(self, s, flow) -> bool:
+        """**能不能接手别人那盘半成品** —— 转移协议 T1~T3(**T4 写成功**由调用方做)。
+
+        ☠☠ **三条全要**, 少一条就是"看着别人的盘子好就抢走":
+          · **T1 半成品** —— 已经是本单的成品菜不算(`_dish_matches` 为真) ⇒ 不转移,
+            直接走 `serve_any`(谁都能交, 不必抢);
+          · **T2 原主确实不管它了** —— 没主, 或者 `PLATE_IDLE_TTL` 里**一次都没碰过**。
+            数据来源是**最后一次写入**(`touch_plate` 的心跳)⇒ 不引中心节点/心跳线程;
+          · **T3 能拼上我** —— 那盘的料必须**全部**落在本单 `req|opt` 里。
+            ☠ **这是必需而不是保险**: 我不知道原主还打算放什么(不共享意图),
+              只能按"能拼上我"筛 —— 筛错就是把别人的菜做废。
+        ⚠ 返回 True **不等于**拿到手: 还要 `bind_plate(..., takeover=True)` 写成功(T4),
+          谁先写谁得, 输的那个换台面。
+        """
+        bd = getattr(self, "board", None)
+        if s is None or flow is None or bd is None or not COOP_PLATE:
+            return False
+        _mine = str(getattr(flow, "slot", "") or "")
+        if not _mine:
+            return False                     # 不知道自己属于哪张单 ⇒ 谈不上"接手别人的"
+        try:
+            _bs = str(bd.plate_slot(s.id) or "")
+            if not _bs or _bs == _mine:
+                return False                 # 无主 / 本来就是我的 ⇒ 不是"接手"
+            have = self._plate_contents_on(s)
+            req, opt = self._dish_sets(flow)
+            if self._dish_matches(have, req, opt):
+                return False                 # T1: 已经是道拼好的菜了 ⇒ 不转移
+            if bd.plate_owner(s.id) is not None and bd.plate_idle(s.id) <= PLATE_IDLE_TTL:
+                return False                 # T2: 原主刚还在弄
+        except Exception:                                        # noqa: BLE001
+            return False
+        return not self._dish_foreign(have, flow)                # T3
+
+    def _spot_tier(self, s, flow, slot: str) -> int:
+        """**这块台面给本单用排第几等**(越小越好) —— `pick_assemble_spot` 的 R1 分三层。
+
+        R1 三层(计划 §5): **我的槽位 / 空且能拼 / 其它**。落到数上:
+          `0` 空盘(放什么进什么, 最好) · `1` 本单的半成品(接着拼) ·
+          `2` 能**接手**的队友半成品(T1~T3 全过) ·
+          `8` 这盘里有**本单不要的料**(把新料倒进去 = 串菜) · `9` **别的单的**盘。
+        ⚠ `8`/`9` **不剔除**: 全池只剩它们时仍然要挑一个(规则 5: 宁可去挤也别没有),
+          它们只是排在 0/1/2 后面。
+        ⚠ `flow is None` / `slot` 为空 ⇒ 退回"只看有没有盘子"(老行为)。
+        """
+        have = self._plate_contents_on(s)
+        bd = self._plate_bound(s)
+        _slot = str(slot or "")
+        if (not bd) or (bd == _slot and _slot):
+            if not have:
+                return 0
+            if flow is None or not self._dish_foreign(have, flow):
+                return 1
+            return 8
+        return 2 if self._can_take_over(s, flow) else 9
+
+    def _bind_plate_for(self, s, flow, slot, takeover: bool = None) -> bool:
+        """**W1**: 把"这块台面上那盘"绑给本单。只有**真有盘子**时才绑。
+
+        ☠ `claim=False`(评分层替队友算)那条路**一个字节都不许写** ——
+          同 `stove_owner`/`pick_assemble_spot` 的纪律, 由调用方保证(本函数不自查)。
+        ☠ `takeover=None` ⇒ 自己判(`_can_take_over`)。传 True 只有一种场合:
+          **刚刚往这块台面上放了只新盘子**(W2, `_ensure_plate`) —— 那时旧的绑定
+          指着的是**上一只盘**, 是陈旧数据, 覆盖它不算抢。
+        """
+        bd = getattr(self, "board", None)
+        if bd is None or not COOP_PLATE or s is None:
+            return False
+        # ☠☠ **台面上没有盘子就不绑** —— 那盘还不存在。绑了只会在 `_plates` 里留一条
+        #   **指着一块空台面**的记录, 而 R1 第一层("本单绑着的那盘")会认它 ⇒ 每轮白挑。
+        #   ⚠ 与 W2(`_ensure_plate` 里那只**刚放上去的**新盘)不冲突 —— 那一处不走本函数
+        #     (它直接 `bind_plate(..., takeover=True)`, 因为它**知道**盘子刚放好)。
+        if not self._has_plate(s):
+            return False
+        if takeover is None:
+            takeover = self._can_take_over(s, flow)
+        try:
+            return bool(bd.bind_plate(s.id, str(slot or ""), self.cid, takeover=takeover))
+        except Exception:                                        # noqa: BLE001
+            return False
+
+    def _plate_heartbeat(self, sid: str) -> None:
+        """**W3: "我还在做这盘"的一次心跳** —— 转移协议 T2 的**唯一**数据源。
+
+        ☠☠ 只在**料真的进了那盘**时才打(两处 `✓ ... 进了 ... 那盘`)。
+          放在"对着台面按了一下放置键"那里是**错的**: 那一下可能被游戏拒
+          (`placeCanHandle=false`, 见 `op_assemble` 收尾那段), 打了心跳等于
+          **替一个没发生的动作续期** ⇒ 队友永远等不到接手窗口。
+        ⚠ 那盘**已经是别人的** ⇒ 一个字节都不碰: 碰了就等于"原主还在做",
+          反而把 T2 的窗口无限推后(`touch_plate` 会刷新 `at`)。
+        """
+        bd = getattr(self, "board", None)
+        if bd is None or not COOP_PLATE or not sid:
+            return
+        _flow, slot = self._exec_ctx()
+        try:
+            cur = str(bd.plate_slot(sid) or "")
+            if cur and slot and cur != slot:
+                return
+            if not cur and slot:
+                bd.bind_plate(sid, slot, self.cid)
+            bd.touch_plate(sid, self.cid, slot or None)
+        except Exception:                                        # noqa: BLE001
+            pass
+
+    def _unbind_plate_of(self, flow) -> None:
+        """**W4**: 本单那盘已经出手(交付成功/不要了) ⇒ 解绑。
+
+        ☠ 不解绑的后果不是"多点内存": `slot_station` 会一直指着一块**空台面**,
+          而 R1 第一层("本单绑着的那盘")会认它 ⇒ 每轮白跑一趟/白挑一次。
+        ☠ 清的是**整个槽位名下的全部台面**(`unbind_slot`), 不是"查到的那一条" ——
+          换台面/补盘会短暂留下第二条, 只解一条的话另一条会一直躺着。
+        """
+        bd = getattr(self, "board", None)
+        if bd is None or not COOP_PLATE or flow is None:
+            return
+        _slot = str(getattr(flow, "slot", "") or "")
+        if not _slot:
+            return
+        try:
+            bd.unbind_slot(_slot, self.cid)
+        except Exception:                                        # noqa: BLE001
+            pass
 
     def _spot_now(self, km):
         """**摆盘位的当前快照** —— 按 id 到新鲜 `km` 里重取, 并顺手更新 `self.assemble_spot`。
@@ -9061,8 +9843,24 @@ class Engine:
                 continue
             if not self._has_plate(s):
                 continue
-            if self._dish_matches(self._plate_contents_on(s), req, opt):
-                out.append(s)
+            have = self._plate_contents_on(s)
+            if not self._dish_matches(have, req, opt):
+                continue
+            # ☠☠ **R3: 找到一盘之后**再问一句"这盘是哪张单的"(2026-09-17 第 5 步)。
+            #   这是**真 bug 的修复, 不只是新功能**: **同一道菜的两张单 req/opt 完全相同**
+            #   ⇒ 上面那条集合判据对**两张单都成立** ⇒ 两个厨师今天可能**互相端走同一盘**
+            #   (一个人交了, 另一个白跑一趟; 更糟的是**另一张单的菜被吃掉**)。
+            #   ⚠ 判据**不新写**: 集合级的事实仍由 `_dish_matches` 回答, 这里只加
+            #     "`bound_slot` 存在且 ≠ 本单" 那一层(见 `_dish_for_order`)。
+            #   ⚠ 这一处是**唯一**的关卡: `_spot_still_ready` / `op_deliver` / `serve_any`
+            #     全都经过它("找到一盘"只有这一个入口)⇒ 不必在 `_deliver_plate` 里再判一次
+            #     (那时盘子已经在手上, 归属信息已经丢了)。
+            _bound = self._plate_bound(s)
+            if not self._dish_for_order(have, flow, _bound):
+                self.log(f"[盘子] ⚠ {s.id} 那盘是**别的单的**({_bound}) —— "
+                         f"不是本单({getattr(flow, 'slot', '') or '?'})要的, 不端")
+                continue
+            out.append(s)
         return out
 
     #: **"这一环的台面我走起来太远 ⇒ 不如把料丢给队友"** 的门槛(格/步)。
@@ -9350,23 +10148,27 @@ class Engine:
                 break
         return out
 
-    def _all_flows(self, st) -> list:
-        """订单栏上**每一张**单的 `DishFlow` → `[(flow, t)]`, 按 `t` 升序。
+    def _order_pool(self, st) -> list:
+        """订单栏 → `[(槽位键, 菜名, t, flow)]`, 按 `t` 升序。**唯一的订单池入口**。
 
         为什么能拿到"不是当前那单"的菜谱: `state.details` 报的是**整关菜谱池**
         (`StateCollector.cs:364-385`), 不是只有当前单 ⇒ 任意一张挂单都推得出来。
         (`Engine.plan()` 早就在做同一条链, 只是它只挑最紧急那一单。)
 
-        ⚠ `derive` 不便宜, 而这是每 0.5 秒的循环 ⇒ **按"订单名集合"缓存**
-          (`t` 每帧都在变、不进 key; 它只影响排序)。
+        ⚠ `derive` 不便宜, 而这是每 0.5 秒的循环 ⇒ **缓存**(`_all_flows` 共用这一份,
+          它是本函数的投影 —— 两处**同一次 derive**, 不重复算)。
+        ☠☠ **缓存的 key 必须带槽位键 + `t` 的分档**(2026-09-17 按步协作):
+          · 老 key 只有**订单名集合** ⇒ 同名多单**共用一份缓存**(语义上早过期了);
+          · `t` 每帧都在变, 但它现在**进了评分**(`order_urgency`)⇒ 分档(`int(t*10)`)
+            进 key, 让"时钟分变档了就重建"; 不分档则每帧都重建(白烧 `derive`)。
         """
         try:
             orders = self.live_orders()
         except Exception:                                          # noqa: BLE001
             return []
-        key = tuple((o.get("name") or "") for o in orders)
-        if getattr(self, "_flows_key", None) == key:
-            return getattr(self, "_flows_val", [])
+        key = tuple((self._order_key(o), int(float(o.get("t", 1.0)) * 10)) for o in orders)
+        if getattr(self, "_pool_key", None) == key:
+            return getattr(self, "_pool_val", [])
         out = []
         for o in orders:
             name = o.get("name") or ""
@@ -9374,13 +10176,27 @@ class Engine:
                 continue
             try:
                 detail = self.find_detail(st, name)
-                if detail:
-                    out.append((self._derive_with_retry(detail, st), float(o.get("t", 1.0))))
+                if not detail:
+                    continue
+                f = self._derive_with_retry(detail, st)
+                # ☠ **槽位键必须填进 flow** —— 步级占位(`step_key(槽位键, 步号)`)与
+                #   "这盘属于哪张单"(`_step_group_ok`)全靠它。`derive` 自己不知道订单栏。
+                f.slot = self._order_key(o)
+                out.append((f.slot, name, float(o.get("t", 1.0)), f))
             except Exception:                                      # noqa: BLE001
                 continue
-        out.sort(key=lambda ft: ft[1])
-        self._flows_key, self._flows_val = key, out
+        out.sort(key=lambda e: e[2])
+        self._pool_key, self._pool_val = key, out
         return out
+
+    def _all_flows(self, st) -> list:
+        """订单栏上**每一张**单的 `DishFlow` → `[(flow, t)]`, 按 `t` 升序。
+
+        ⚠ 2026-09-17 起它是 **`_order_pool` 的投影**(形状与语义**逐字不变**) ——
+          所以"要不要跨单"这件事**只有一个地方决定**(`_order_pool`), 而这里只是把
+          槽位键那一列丢掉。老调用方(备料份数、诊断)一行不用改。
+        """
+        return [(e[3], e[2]) for e in self._order_pool(st)]
 
     def _inventory(self, km, st) -> dict:
         """**场上现在每种材料有几份** `{归一化名: 份数}` —— 只读聚合, 一次算好。
@@ -9552,8 +10368,14 @@ class Engine:
         **判据只此一处**: 能往下推就省掉来回跑备料台的那两趟。
         """
         inv = self._inventory(km, st)
-        for f in (self._all_flows(st) or []):
-            if self._prep_progress(f, mat, km, inv) in ("chop", "mix"):
+        # ☠☠ **`_all_flows` 返回的是 `(flow, t)` 元组, 不是 flow** —— 上一轮这里写成
+        #   `for f in ...` 把整个元组当 `flow` 传进 `_prep_progress`, 于是
+        #   `getattr(flow, "ops", None)` 取到 `None` ⇒ 永远返回 `""` ⇒ **恒为 False**。
+        #   后果: "备料链能往下推就留在手上"这条**从来没生效过** —— 每备一环都白跑一趟
+        #   备料台(取了→存→再取→再切→再存), 而日志里看不出异常。
+        #   ⚠ 同一类账本仓记过好几次了: `_all_flows` 的**返回值形状**是元组, 别按 flow 用。
+        for _f, _t in (self._all_flows(st) or []):
+            if self._prep_progress(_f, mat, km, inv) in ("chop", "mix"):
                 return True
         return False
 
@@ -10197,67 +11019,31 @@ class Engine:
         return ""
 
     def plan(self, st: dict) -> tuple | None:
-        """根据状态规划"现在该做哪道菜", 返回 (订单名, 剩余比例, DishFlow) 或 None。
+        """**这一轮先打哪张单** —— 返回 `(订单名, 剩余比例, DishFlow)` 或 `None`。
 
-        取当前挂在订单栏上、剩余时间最少的那张订单 —— 订单是顺序出现的,
-        不需要预测, 读它就行。
+        ☠☠ 2026-09-17 **按步协作: 它不再回答"哪张单归我"** —— 订单归属整个去掉了。
+          两个厨师用**同一套评分、同一份 `flow.ops`**, 靠**步级占位**错开
+          (`team.OrderBoard.claim_step` + `_rank_candidates` 里"选中之后、执行之前"那个
+          占位写点)。用户原话: "**可能不需要按订单分配**…**可以两个脚本做订单的一部分**"。
+
+        现在它只干两件事(都很轻):
+          · 从 `_order_pool`(按 `t` 升序)里挑**最紧急的那张单** —— 打印横幅用;
+          · 记下它的槽位键(`self._claimed`), 给 `run()` 收尾时释放/清计划用。
+        ⚠ 真正干活的是 `execute()` 里的**池**(`COOP` 打开时最多 `COOP_ORDERS` 张单拼起来)
+          ⇒ "这一轮『打着』哪张单"和"我要做哪些步"**是两件事**:
+          **领不到单 ≠ 没活干**(`run()` 里那条池兜底就是为它写的)。
+        ⚠ `self._claimed` **降级**了: 只记"展示的那张单", **不再参与任何闸门**。
+        ⚠ 原来还有"每轮先放掉上一张认领"(`board.release_order`)—— 认领没了, 那段一并删了。
         """
         if self.know is None and not self.ensure_knowledge(st):
             return None
-        orders = self.live_orders()
-        # ☠☠ **先把上一张放掉** —— 认领的寿命 = **"我在做它的时间"**。
-        #
-        # 原来是"在 `run()` 的末尾释放", 而那条路上有**两个 `continue`**
-        # (主流程卡住改做杂活 / 连续失败 3 次上冷板凳) ⇒ 都会**跳过释放**;
-        # 更狠的是**订单从订单栏上消失时**(被别人交了/过期), 这里根本看不见它,
-        # 那个认领就**永远留着**。
-        #
-        # ☠ 认领的**键**现在是"订单栏上的槽位 id"(`team.key_of`), 不再是菜名 ——
-        #   于是"同名新单顶着旧认领⇒队友永远领不到"那条病**已经治了**
-        #   (实测 2026-09-16: 5 张同名的 `Sushi_Fish` 曾经只占一个槽, P2 空转 43 秒)。
-        #
-        # ⚠ **但"每轮先放掉"这条规则仍然要留** —— 它管的是另一件事:
-        #   上一步失败 / 被队友交掉 / 这一单过期之后, 那个槽位不该还记在我名下。
-        #   (`release_order` 只在自己是主时才真删, 蹭不掉队友的认领。)
-        if self.board is not None and self._claimed:
-            # ⚠ 只在**它还在订单栏上**时才放 —— 已经没了的单放不放都一样,
-            #   但 `drop_plan` 顺手清掉, 免得下一张**同名新单**顶着旧计划。
-            self.board.release_order(self._claimed, self.cid)
+        pool = self._order_pool(st)
+        if not pool:
             self._claimed = ""
-        # ☠☠ **上限要数"订单栏上实时的归属", 不是"这一轮我领了几张"。**
-        #   后者在 `plan()` 里**永远只会涨到 1**(一轮只领一张) ⇒ `>= CLAIM_MAX`
-        #   恒不成立 ⇒ 那是个**死代码上限**, 兜不住任何泄漏。
-        #   (我第一版就是那么写的, 写完自己复查才看出来。)
-        _held = 0
-        if self.board is not None:
-            for o in orders:
-                if self.board.owner_of(self.board.key_of(o)) == self.cid:
-                    _held += 1
-        for o in orders:
-            name = o["name"]
-            # 双人: **一个槽位**只由一个厨师认领, 否则两人做同一道菜会互相打架
-            # ☠ 键 = `key_of(o)`(槽位 id), **不是 `name`** —— 账见 `team.key_of`:
-            #   按名字认领时 5 张同名单只占一格, 队友整局领不到单。
-            if self.board is not None:
-                _key = self.board.key_of(o)
-                if self.board.owner_of(_key) != self.cid:
-                    # ☠ **别把单都揽了** —— 手上已经有 `CLAIM_MAX` 张就不再抢新的,
-                    #   把机会留给队友。用户 2026-09-16:
-                    #     "N 张单都被队友这种就不应该发生啊, **给队友了做不完怎么办**"
-                    if _held >= CLAIM_MAX:
-                        continue
-                    if not self.board.claim_order(_key, self.cid):
-                        continue
-                    _held += 1
-                self._claimed = _key
-            detail = self.find_detail(st, name)
-            if not detail:
-                if self.board is not None:
-                    self.board.release_order(self.board.key_of(o), self.cid)
-                    self._claimed = ""
-                continue
-            return name, float(o.get("t", 1.0)), self._derive_with_retry(detail, st)
-        return None
+            return None
+        slot, name, t, flow = pool[0]
+        self._claimed = slot
+        return name, t, flow
 
     # ---------------- 主循环 ----------------
     def _persona_name(self) -> str:
@@ -10427,6 +11213,18 @@ class Engine:
                     continue          # 灭了火 → 这一轮重新规划(世界变了)
 
             planned = self.plan(st)
+            # ☠☠ **按步协作的桥**(2026-09-17): `plan()` 现在只回答"**这一轮先打哪张单**"
+            #   (它是从订单池里挑最紧急的那张), 而**干活的是 `execute()` 里的池**
+            #   (`COOP` 打开时池跨订单)。
+            #   ⇒ 一个厨师**领不到单 ≠ 没活干** —— 队友认领了一张, 但池里还有别的单的步骤
+            #     可做。老代码在这里 `continue`(去打杂活/发呆) ⇒ **有活却站着**。
+            #   ⚠ 只有 `COOP` 打开时才这么走 —— 关掉它 = 逐字退回老路径。
+            if planned is None and COOP:
+                _pool0 = self._order_pool(st)
+                if _pool0:
+                    planned = (_pool0[0][1], _pool0[0][2], _pool0[0][3])
+                    self.log(f"[分工] 我一张单都没认领, 但池里有 {len(_pool0)} 张单"
+                             f" —— 从 {planned[0]} 入手(按步协作)")
             if planned is None:
                 # ☠☠ **这里原来一个字的日志都没有** —— 于是"空转"和"卡住/死了"在日志里
                 #   **长得一模一样**。实测 2026-09-16(双脚本第一次跑):
