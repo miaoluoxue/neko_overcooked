@@ -52,6 +52,8 @@ worn(d, pack)  ← 让 d 背着它        → 某人 wear(pack)  (背的人可�
 
 from __future__ import annotations
 
+import os                      # ← 只为 `NEKO_PLAN_MAKESPAN` 那个回退开关(调度策略, 不是判据)
+
 from dataclasses import dataclass, field
 
 from cookbook import Op
@@ -66,6 +68,19 @@ MAX_DEPTH = 24
 #: 万一两个厨师都做不了下一步, 那也还是得有人去把料取回来(由执行层去试),
 #: 不能因为"链子断"就判整单无解。
 CHAIN_DEAD_PENALTY = 1e6
+
+#: **派活时看不看"并行"**(2026-09-17, 用户: "两个厨师各做贪心未必是最优解")。
+#:
+#: `1`(默认) —— 目标 = **并行之后最长的那条**(makespan): 把这一步派给谁之后,
+#:   **两个厨师各自的总时间取最大**, 取最小的那个。
+#: `0`       —— 逐字退回老行为: 只看"**这个目标对谁最便宜**"(`min(该厨师的份额代价)`)。
+#:
+#: ☠☠ 为什么老口径不够: 那是**串行求和**, 而两个厨师是**并行**的 ——
+#:   它会把整单排给同一个厨师(只要那个人每一步都稍便宜一点), 而**另一个闲着**。
+#:   实测症状(仓库里记过两次): `★ 我(P2)下一步应为: (没有分给我的步)` —— 计划整单排给了 P1。
+#: ⚠ 这是**调度策略**, 不是可行性判据 —— 所以它敢放在 `planner.py` 里(判据仍然全部注入)。
+PLAN_MAKESPAN = (os.environ.get("NEKO_PLAN_MAKESPAN") or "1").strip().lower() \
+    not in ("0", "off", "no", "false")
 
 #: 可以用来"拆成两半 + 传递"的动作 —— 料能拿在手上的那些。
 #: ⚠ `assemble`/`deliver` **不在**里面: 它们作用的是台面/盘子, 不是"把料传过去"能解决的。
@@ -588,6 +603,9 @@ def _plan_one(flow, world: WorldView, check, log=None, notes_out=None) -> Plan |
             if _i + 1 < len(_ops_all) and _ops_all[_i + 1].target == op.target:
                 _nxt = _ops_all[_i + 1]
             best, best_cost = None, None
+            # ☠☠ **已经派出去的时间**(本单里, 按 `Step.chef` 累加) —— 见 `PLAN_MAKESPAN`。
+            #   没有它, 挑 owner 就是"这个目标对谁最便宜", **完全不管那个人手上排了多少**。
+            _load = {c: sum(s.cost for s in steps if s.chef == c) for c in world.chefs}
             for c in world.chefs:
                 sub = solve_have(ctx, c, op.target)
                 if not sub:
@@ -597,15 +615,23 @@ def _plan_one(flow, world: WorldView, check, log=None, notes_out=None) -> Plan |
                     _okc, _w, _dc = _ok(ctx, _nxt, c, assume_held=op.target)
                     if not _okc:
                         tot += CHAIN_DEAD_PENALTY
-                if best_cost is None or tot < best_cost:
-                    best, best_cost = (c, sub), tot
+                # ☠ `_m` = **把这一步派给 c 之后, 两个厨师各自的总时间取最大**
+                #   (另一个人的排队时间照旧)。派给谁让"最长的那条"最短, 就选谁。
+                #   ⚠ `CHAIN_DEAD_PENALTY` 仍然有效: 它加进 `tot` ⇒ 那个人的 makespan 爆掉 ⇒ 落选。
+                #   ⚠ `steps` 是**正在建的**那份计划, 所以这里的 load 是**实际已派**的, 不是估的。
+                _m = max(_load[c] + tot,
+                         max((v for k, v in _load.items() if k != c), default=0.0)) \
+                    if PLAN_MAKESPAN else tot
+                if best_cost is None or _m < best_cost:
+                    best, best_cost = (c, sub), _m
             if best is None:
                 # ☠ **推不出这个货源 ⇒ 这单现在做不了**。调用方的处置是**退回贪心路径**
                 #   (那才是"绝不停机"), 不是放弃这一单。
                 _say(ctx, f"**推不出** {op.target} 怎么拿到 —— 这一单现在无解")
                 return None
             owner, sub = best
-            _say(ctx, f"{op.target}: 选 P{owner+1}(总代价 {best_cost:.1f})")
+            _say(ctx, f"{op.target}: 选 P{owner+1}"
+                      f"({'并行后最长' if PLAN_MAKESPAN else '该步代价'} {best_cost:.1f})")
             new = push(sub)
             for _s in sub:
                 _apply_effect(_s.op, _s.chef, held_now, world.chefs)
