@@ -139,6 +139,19 @@ PLAN_INTERVAL = float(os.environ.get("NEKO_PLAN_INTERVAL") or 6.0)
 #: 一份计划**能用多久** —— 两者独立: 重算可以有节流, 但用的时候必须判新鲜度。
 PLAN_TTL = float(os.environ.get("NEKO_PLAN_TTL") or 20.0)
 
+#: **计划里那些"假设"要不要真的校验**(2026-09-17)。`0` = 逐字退回老行为
+#: (假设只打印、不校验 —— 这正是加它之前的状态)。
+#:
+#: ☠☠ 要它是因为 `Plan.assumptions` 的 docstring 一直写着「地图/世界更新时
+#:   **只校验这些**(破了就局部修补), 而不是整体重规划」—— 而**从来没有实现**:
+#:   一串散文没法校验, 于是世界变了没人管, 直到某一步**真的失败**才
+#:   `_plan_dirty` 整份作废。两个 20 秒(`PLAN_TTL` 与冷板凳)叠起来 = 一局 150 秒的七分之一。
+#: ⇒ 现在每轮**只校验那份计划自己列出的假设**(十几次比较, 不跑 BFS), 破了就作废 ——
+#:   而且**只作废受影响的那些单**(见 `_plan_dirty` 的 `slots`), 那才是"局部修补"。
+#: ⚠ **它不重算** —— 重算仍是 `_plan_tick` 的活(设 `_plan_force` 让它下一轮跳过节流)。
+PLAN_CHECK = (os.environ.get("NEKO_PLAN_CHECK") or "1").strip().lower() \
+    not in ("0", "off", "no", "false")
+
 #: **"这一步的货源, 引擎自己都说解析不出来"的罚分**(2026-09-17)。
 #:
 #: 由来(实机 `s_balloon_5_2`, 用户: "**菜单的制作链有问题**"):
@@ -10723,6 +10736,12 @@ class Engine:
         """
         if PLAN_MODE not in ("shadow", "on"):
             return
+        # ☠☠ **先校验那份计划的"假设"**(2026-09-17) —— **必须在节流之前**:
+        #   它要**每轮**跑(十几次比较, 不跑 BFS), 而"重算"才是 6 秒一次的那件事。
+        #   世界变了就当场作废(只作废受影响的那几张单, 见 `_plan_dirty`),
+        #   不等到某一步真失败 —— 那已经晚了(冷板凳也是 20 秒)。
+        #   ⚠ 见 `Plan.assumptions` 的 docstring: 这句话从加字段那天起就写着, 一直没实现。
+        self._plan_check(km)
         now = time.time()
         # `_plan_force` = 上一步**真的失败**过(`_plan_dirty`) ⇒ **跳过节流立刻重算**。
         # 否则最坏会拿一份已经知道不行的计划试满 `PLAN_TTL`, 而冷板凳也是 20 秒。
@@ -11047,7 +11066,7 @@ class Engine:
             self.log("[空转] 没有可做的活(救锅/杂活/备料 都是空的) —— **这不是卡住**")
         return False
 
-    def _plan_dirty(self, why: str = "") -> None:
+    def _plan_dirty(self, why: str = "", slots=None) -> None:
         """**世界和我们想的不一样了 ⇒ 把计划作废, 下一轮立刻重算。**
 
         为什么要它(而不是只靠 `PLAN_INTERVAL` 节流 + `PLAN_TTL` 过期):
@@ -11060,10 +11079,44 @@ class Engine:
           —— 那些在 `_plan_tick` 手上(下一轮)。设 `_plan_force` 让那一轮**跳过节流**。
         ⚠ 作废之后 `_plan_next` 返回 `None` ⇒ 执行层**立刻退回原来的评分池**
           (那正是"绝不停机": 计划没了照样能干活)。
+
+        ☠☠ **`slots` —— "只作废这几张单"(局部修补, 2026-09-17)**。
+          给了它、而且它落在计划覆盖的槽位里、是个**真子集**、又**不含空(全局)** ⇒
+          **只把这几张单的步剔掉**, 其余原样留着继续服务(`_plan_next_all` 照常放行
+          它们)。**否则整份作废**(老行为)。判据与理由见 `_plan_check`:
+            · `Plan.assumptions` 的 docstring 要的就是"**局部修补**, 而不是整体重规划";
+            · 但**空槽位 = 全局事实**(摆盘位/正在煮的锅/全场有没有空盘)不属于任何一张单
+              ⇒ 它破了就该**所有单一起停**, 那时猜一张单去剔是**错**的;
+            · 真子集才算"局部" —— 全中就等于整份, 没必要走这条路。
+          ⚠ **不改原对象**: 黑板上那份是**两个厨师共用**的(`get_plan` 直接把它交出去),
+            就地改 `steps` 会连队友那份一起改。所以 `dataclasses.replace` 造一份新的。
         """
-        if getattr(self, "_plan", None) is None:
+        _p = getattr(self, "_plan", None)
+        if _p is None:
             return
-        self._plan = None
+        _want = {str(s or "") for s in (slots or set())}
+        _kept = None
+        if _want and "" not in _want:
+            try:
+                _have = set(_p.slots or ())
+            except Exception:                                    # noqa: BLE001
+                _have = set()
+            _hit = _want & _have
+            if _hit and _hit < _have:
+                _kept = _have - _hit
+        _what = "整份"
+        if _kept is not None:
+            try:
+                import dataclasses as _dc
+                _steps = [s for s in _p.steps
+                          if str(getattr(s, "slot", "") or "") in _kept]
+                _p = _dc.replace(_p, steps=_steps) if _steps else None
+                _what = "只剔掉 %d 张单(留 %d 张)" % (len(_hit), len(_kept))
+            except Exception:                                    # noqa: BLE001
+                _p, _what = None, "整份(局部剔除失败)"
+        else:
+            _p = None
+        self._plan = _p
         self._plan_force = True
         # ☠☠ **黑板上那份也要清**(2026-09-17)。不清的话下一轮 `_plan_tick` 重算完,
         #   `publish_plan` 会因为"那是别人发的、还新鲜"**被拒** ⇒ 读回来的还是**同一份
@@ -11077,7 +11130,110 @@ class Engine:
             except Exception:                                    # noqa: BLE001
                 pass
         if why:
-            self.log(f"[规划] ↻ 计划作废({why}) —— 下一轮立刻重算, 这段时间走评分那条路")
+            self.log(f"[规划] ↻ 计划作废({why}) —— **{_what}** —— 下一轮立刻重算, "
+                     f"这段时间走评分那条路")
+
+    def _item_alive(self, km, name: str) -> bool:
+        """这东西**还在场上**吗 —— 台面 / 地上的料 / 背包(背着的也算)都算 "在"。
+
+        给 `_assumption_ok` 判 `src`/`wear` 用。☠ **宁可判"在"**: 这条判据的代价是
+        "误报破了 ⇒ 白作废一份计划", 而漏报只是维持现状(改前本来就不校验)。
+        所以**任何一处对得上就返回 True**, 名字空也是 True。
+        """
+        if not name:
+            return True
+        if name in (getattr(km, "stations", None) or {}):
+            return True
+        n = self._norm(name)
+        if not n:
+            return True
+        # ☠ **背包单独一遍**: 它**不在** `km.items` 里(`ScanItems` 扫的是
+        #   Pre-Ingredient/Ingredient/CookingUtensil) —— 漏了它, "掏队友背包"
+        #   那一步的 `pin_src` 会被**误报成破了**(而那个 pin 恰恰是最常见的一类)。
+        for p in (km.of("pack") or []):
+            if self._norm(getattr(p, "name", "")) == n:
+                return True
+        for it in (getattr(km, "items", None) or []):
+            if n in (self._norm(getattr(it, "name", "")),
+                     self._norm(getattr(it, "ing", ""))):
+                return True
+        return False
+
+    def _assumption_ok(self, a, km) -> bool:
+        """这条假设**现在**还成立吗。**认不出的 `kind` 一律放行**(不制造新的失败点)。
+
+        依据就是 `planner.Assumption` 上那两个标签(`kind`/`key`) —— 见那边的注释。
+        ☠ 每一条都**刻意宽**: 这条判据的误报代价是"白作废一份计划", 而漏报只是维持
+          改前的行为(那时候**根本不校验**)。认不出 / 没数据 ⇒ **True**。
+        """
+        k = str(getattr(a, "kind", "") or "")
+        key = str(getattr(a, "key", "") or "")
+        if k == "src" or k == "wear":
+            return self._item_alive(km, key)
+        if k == "back":
+            _c, _, _p = key.partition("|")
+            try:
+                _cid = int(_c)
+            except (TypeError, ValueError):
+                return True
+            for ch in (getattr(km, "chefs", None) or []):
+                if int(getattr(ch, "id", -1)) == _cid:
+                    return self._norm(getattr(ch, "back", "") or "") == self._norm(_p)
+            return True                    # 读不到那个厨师 ⇒ 判不了 ⇒ 放行
+        if k == "cooking":
+            return key in self._pots_live()
+        if k == "plate_spot":
+            return key in (getattr(km, "stations", None) or {})
+        if k == "plate_src":
+            # ☠ **只看"那张台面还在不在"**, 不看"上面还有没有空盘" ——
+            #   "盘子被端走"是**执行层每轮都在重新解决**的事(`_ensure_plate`/
+            #   `_top_up_plate`), 在那儿报"破了"会让计划**每被拿一次盘子就作废一次**。
+            _how, _, _sid = key.partition("|")
+            return _sid in (getattr(km, "stations", None) or {})
+        if k == "no_plate":
+            # ☠ **它说的是"一件坏事为真"** —— 空盘出现了是**好消息**, 不是"依赖破了"。
+            return True
+        return True                        # 不认识的 kind(含老调用方塞进来的纯 str)⇒ 放行
+
+    def _plan_check(self, km) -> None:
+        """**世界变了没** —— 只校验这份计划**自己列出的**那些假设(见 `Plan.assumptions`)。
+
+        ☠☠ 这就是 `Plan.assumptions` 的 docstring 一直许着的那件事:「地图/世界更新时
+          **只校验这些**(破了就局部修补), 而不是整体重规划」。在它落地之前, 世界变了
+          **没有任何人管** —— 计划照用 `PLAN_TTL`(20 秒), 直到某一步真的失败才
+          `_plan_dirty`(而那已经晚了: 冷板凳也是 20 秒)。
+
+        ⚠ **每轮都要跑**(所以放在 `_plan_tick` 的**节流之前**): 它只是十几次比较,
+          不建视图、不跑 BFS —— 贵的那件事(重算)仍然是 6 秒一次。
+        ⚠ **校验器抛异常 ⇒ 当它成立**: 一个坏的判据不该把计划打成作废
+          (本仓"别制造新的失败点"的纪律)。
+        """
+        # ⚠ **用模块级的 `PLAN_CHECK`, 不是 `self.PLAN_CHECK`** —— 同 `PLAN_MODE`/`PLAN_TTL`
+        #   (那一族都是模块级常量)。☠ 写成 `self.` 会**把所有离线桩打炸**: 本仓的桩
+        #   (`_planctx_probe` 的 `H`、`_coop_plan_probe` 的 `_E9`)**不调 `__init__`**,
+        #   而 `Engine` 上并没有这个类属性 ⇒ `AttributeError`(实测, 一次两条红)。
+        if not PLAN_CHECK:
+            return
+        p = getattr(self, "_plan", None)
+        if p is None or km is None:
+            return
+        _as = list(getattr(p, "assumptions", None) or [])
+        if not _as:
+            return
+        _bad = []
+        for a in _as:
+            try:
+                if not self._assumption_ok(a, km):
+                    _bad.append(a)
+            except Exception:                                    # noqa: BLE001
+                continue
+        if not _bad:
+            return
+        # ☠ **按槽位归属决定"整份"还是"局部"**: 空槽位 = 全局事实(不属于任何一张单)
+        #   ⇒ 它破了就该**所有单一起停**; 那时只剔一张单是**错的**。判据在 `_plan_dirty`。
+        _slots = {str(getattr(a, "slot", "") or "") for a in _bad}
+        self._plan_dirty("这些假设不成立了: " + " / ".join(str(a) for a in _bad[:3]),
+                         slots=_slots)
 
     def _plan_next(self, ops, pending):
         """**计划说"我"下一步该做什么** —— 没有计划/过期/我的步都做完了 ⇒ `None`。

@@ -220,6 +220,60 @@ class Step:
         return "P%d %s %s" % (self.chef + 1, self.op.action, self.op.target)
 
 
+class Assumption(str):
+    """**一条"这份计划依赖的世界事实"** —— 它**就是**那行日志文本, 另外挂着三个标签。
+
+    为什么是 `str` 的子类(2026-09-17, 让 `Plan.assumptions` **可以被校验**):
+      `Plan.assumptions` 原来只是一串**人话**("货源 counter1 仍然存在且够得着"),
+      而 `Plan.assumptions` 自己的 docstring 写着「地图/世界更新时**只校验这些**
+      (破了就局部修补)」—— **一句散文是没法校验的**, 于是那句话一直只是句口号:
+      世界变了没人管, 直到某一步**真的失败**才 `_plan_dirty` 整份作废。
+
+      ⇒ 把文本**原样**留着(日志/`__str__`/`sorted(set(...))`/`" | ".join(...)`
+        逐字不变, 这才是能把改动说成"加法"的关键), 另外挂上:
+          · `kind` —— 哪一类事实(`src`/`wear`/`back`/`cooking`/`plate_spot`/…);
+          · `key`  —— 具体是**哪一个**(台面 id / 料名 / `"厨师|背包名"`);
+          · `slot` —— 这一条属于**哪张单**(槽位键); **空 = 全局**(归属不明)。
+
+    ☠☠ **`slot` 空是"不知道", 不是"没有归属"** —— 校验时按**最保守**处置(整份作废),
+      而不是猜一张单去作废。全局性的事实(摆盘位/正在煮的锅/全场有没有空盘)天生
+      不属于任何一张单 ⇒ 它们就该是空。见 `Engine._plan_check`。
+
+    ☠ **别把 `kind`/`key` 忘了填** —— 漏填的后果是**静默**的: 校验器认不出这一类,
+      一律放行(那是刻意的兜底, 见 `Engine._assumption_ok`), 于是这条假设**永不报警**。
+      和 `Step.slot` 那条账是同一个形状: 标签漏了不报错, 只是那条路悄悄不生效。
+    """
+
+    __slots__ = ("kind", "key", "slot")
+
+    def __new__(cls, text, kind: str = "", key: str = "", slot: str = ""):
+        o = super().__new__(cls, text)
+        o.kind, o.key, o.slot = kind, key, slot
+        return o
+
+    def __repr__(self) -> str:                 # 调试时看得见标签, 别只印文本
+        return "Assumption(%r, kind=%r, key=%r, slot=%r)" % (
+            str(self), self.kind, self.key, self.slot)
+
+
+def dedup_assumptions(items) -> list:
+    """**排序 + 去重** —— 与老的 `sorted(set(那一串文本))` **逐字等价**。
+
+    ☠ 去重按**文本**(`str.__eq__`/`__hash__` 继承自 `str`) ⇒ 与改前同一套相等性;
+      排序也按文本 ⇒ 日志里那几行的次序一个字节都不变。
+      ⚠ **不能图省事直接 `sorted(set(items))`**: 那样相等的判据会退化成"文本相同**且**
+        标签相同" —— 两张单里同一条全局假设(摆盘位那种)会从"一行"变成"两行"。
+    """
+    seen, out = set(), []
+    for a in items or []:
+        if str(a) in seen:
+            continue
+        seen.add(str(a))
+        out.append(a)
+    out.sort(key=str)
+    return out
+
+
 @dataclass
 class Plan:
     #: ⚠ **展示用**的名字。跨单合并之后它可能是**好几张单**拼起来的
@@ -229,6 +283,13 @@ class Plan:
     #: **这份计划依赖了哪些世界事实** —— "P2 背着出 X 的背包" / "mix1 可达" 这类。
     #: 地图/世界更新时**只校验这些**(破了就局部修补), 而不是整体重规划。
     #: 这是用户那个"动态地图要不要重规划"的答案的一半(另一半是重接地)。
+    #:
+    #: ☠☠ **元素是 `Assumption`(一个 `str` 子类)** —— 它**就是**那行日志文本,
+    #:   另外挂着 `kind`/`key`/`slot`。所以 `sorted`/`set`/`join`/`in`/f-string
+    #:   全按**文本**走, 打印与加这件东西之前**逐字相同**; 而 `Engine._plan_check`
+    #:   拿那三个标签去**真的校验**(2026-09-17 —— 在那之前这句 docstring 是句口号:
+    #:   一串散文没法校验, 于是世界变了没人管, 直到某一步真失败才整份作废)。
+    #: ⚠ 字符串(老调用方/离线桩直接塞进来的)也**收**: 校验时认不出 `kind` 就放行。
     assumptions: list = field(default_factory=list)
     cost: float = 0.0
     notes: list = field(default_factory=list)
@@ -700,19 +761,34 @@ def _plan_one(flow, world: WorldView, check, log=None, notes_out=None) -> Plan |
         return None
 
     # ---- 假设清单: 这份计划依赖了哪些世界事实(§动态地图: 只校验这些) ----
+    # ☠ **每一条都要带 `kind`/`key`/`slot`**(见 `Assumption` 的注释) —— 只写文本的话
+    #   它就只是一句人话, `Engine._plan_check` 校验不了, 这条假设永不报警。
+    # ⚠ 归属(`slot`)按**这一条事实的性质**给, 不是一律 `_slot`:
+    #   · `src`/`wear` 绑在**这一步**上 ⇒ 就是本单(`_slot`);
+    #   · `back` 是"某厨师背着" ⇒ 也是本单推出来的(跨人取料那一步的前提);
+    #   · `cooking` 是**台账级**的("我开的火"), 不属于任何一张单 ⇒ 空(全局);
+    #   · 盘子那几条同理(摆盘位是**整关一块**, 见下面) ⇒ 空。
     for s in steps:
         if s.op.pin_src:
-            assumptions.append(f"货源 {s.op.pin_src} 仍然存在且够得着")
+            assumptions.append(Assumption(
+                f"货源 {s.op.pin_src} 仍然存在且够得着",
+                kind="src", key=s.op.pin_src, slot=_slot))
         if s.op.action == "wear":
-            assumptions.append(f"{s.op.target} 还在场上(没被人捡走)")
+            assumptions.append(Assumption(
+                f"{s.op.target} 还在场上(没被人捡走)",
+                kind="wear", key=s.op.target, slot=_slot))
     for c, p in (world.chef_back or {}).items():
         if p:
-            assumptions.append(f"P{c+1} 一直背着 {p}")
+            assumptions.append(Assumption(
+                f"P{c+1} 一直背着 {p}",
+                kind="back", key="%d|%s" % (c, p), slot=_slot))
     # ☠ **正在煮的那些也记一笔**(2026-09-17): 它们是"**放完就走**"留下的账 ——
     #   计划里没有"回去取"那一步(`_tends` 才有), 所以要让人读日志时看得见
     #   "这份料在灶上、到点可取", 而不是以为计划把它漏了。
     for _sid, _item, _left in (getattr(world, "cooking", None) or []):
-        assumptions.append(f"{_item} 正在 {_sid} 上煮(约 {_left:.0f}s 后熟, 到点回去取)")
+        assumptions.append(Assumption(
+            f"{_item} 正在 {_sid} 上煮(约 {_left:.0f}s 后熟, 到点回去取)",
+            kind="cooking", key=_sid))
 
     # ---- 「去哪拿一只盘子」(2026-09-17, 用户点名的那一条) ----
     # ☠ 计划里**没有**"拿盘子"这一步(`derive()` 的链里就没有) —— 执行层是在
@@ -723,25 +799,36 @@ def _plan_one(flow, world: WorldView, check, log=None, notes_out=None) -> Plan |
     #     · **全场没有可用的空盘** ⇒ 这是一条**真的剪枝理由**, 进 `notes`
     #       (只在"推不出解"时打印) —— 免得它又被伪装成"留给执行层"。
     #   ⚠ `into_bowl` 那些 `assemble` 的落点是**碗**(搅拌台), 与盘子无关 ⇒ 不算。
+    #   ☠ **这几条 `slot` 留空(全局)**: 摆盘位是**整关一块**、`world.plate_*` 也是
+    #     `_plan_ctx` 建视图时**只解析一次**的 ⇒ 它们不属于任何一张单。留空之后
+    #     校验时按最保守处置(整份作废) —— 而"盘子没了"本来就该让所有单停下来重想。
     if any(getattr(s.op, "action", "") in ("assemble", "deliver")
            and not getattr(s.op, "into_bowl", False) for s in steps) \
             and getattr(world, "plate_known", False):
         _ps = getattr(world, "plate_spot", None)
         _pc = getattr(world, "plate_src", None)
         if _ps:
-            assumptions.append(f"摆盘位 {_ps[0]} (规划期只读挑的)")
+            assumptions.append(Assumption(
+                f"摆盘位 {_ps[0]} (规划期只读挑的)",
+                kind="plate_spot", key=_ps[0]))
         if _pc and _pc[0] == "on_spot":
-            assumptions.append(f"那只空盘**已经在** {_pc[1]} 上(材料放上去直接进盘)")
+            assumptions.append(Assumption(
+                f"那只空盘**已经在** {_pc[1]} 上(材料放上去直接进盘)",
+                kind="plate_src", key="on_spot|%s" % _pc[1]))
         elif _pc:
-            assumptions.append(f"空盘从 {_pc[1]} 取({PLATE_HOW.get(_pc[0], _pc[0])})")
+            assumptions.append(Assumption(
+                f"空盘从 {_pc[1]} 取({PLATE_HOW.get(_pc[0], _pc[0])})",
+                kind="plate_src", key="%s|%s" % (_pc[0], _pc[1])))
         else:
             _msg = ("全场**没有可用的空盘**(盘子堆 / 台面上的空盘都没有)"
                     " —— 摆盘那一步要现找, 很可能做不成")
-            assumptions.append("⚠ " + _msg)
+            # ⚠ 这一条**永远算成立**: 它说的是"一件坏事为真" —— 空盘出现了是**好消息**,
+            #   不是"计划依赖的事实破了"。`kind="no_plate"` 的校验器直接返回 True。
+            assumptions.append(Assumption("⚠ " + _msg, kind="no_plate", key=""))
             ctx.notes.append("⚠ 盘子: " + _msg)
 
     return Plan(flow=getattr(flow, "name", ""), steps=steps,
-                assumptions=sorted(set(assumptions)),
+                assumptions=dedup_assumptions(assumptions),
                 # 代价 = 各步"到站位几格"之和(不是步数) —— 步数不反映远近。
                 cost=sum(s.cost for s in steps), notes=list(ctx.notes))
 
@@ -828,5 +915,5 @@ def plan(flows, world: WorldView, check, log=None, notes_out=None) -> Plan | Non
         if log is not None:
             log(f"[规划] {_msg}")
     return Plan(flow=" + ".join(names), steps=steps,
-                assumptions=sorted(set(assumptions)),
+                assumptions=dedup_assumptions(assumptions),
                 cost=sum(s.cost for s in steps), notes=notes)
