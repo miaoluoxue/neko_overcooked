@@ -848,6 +848,152 @@ class Engine:
         except Exception:
             return False
 
+    #: **方向从哪里来**(2026-09-17, 用户: "导航或者地图有很大的问题，需要修复")。
+    #:
+    #: `field`(默认) —— 直线走得通就走直线; **走不通就沿步数表降一步**。
+    #: `compare`     —— 只读对照: 两个方向都算, **只走老路**, 不一致记一行(不动行为)。
+    #: `0`/`line`    —— 逐字退回老行为(永远朝目标直线推) —— 本仓"一键回退"的惯例。
+    #:
+    #: ☠☠ **为什么必须有它 —— 规划器用两把尺子, 控制器只用一把**:
+    #:   规划(`find_path` / `distances_from` / `_stand_cell*`)判"过不过得去"用
+    #:   `walkable`(**格子字符**) + `step_ok`(**相邻格高差 ≤ 0.65**);
+    #:   而 `navigate()` 选方向只看 `dir_for_step(dx,dz)` —— **朝目标的直线**,
+    #:   对地图的唯一用法是"事后拦一下"(`_next_step_dangerous`)。
+    #:   ⇒ 于是图表上"地板存在但迈不过去"的那种格子(`LevelInfo.cs:774` 原话:
+    #:     "平台降下时格子仍是 `.`(能站), **只有高度差出跨步上限(0.65)才判不可走**")
+    #:     **规划器知道过不去、控制器不知道** ⇒ 一路硬顶 ⇒ `stuck` ⇒
+    #:     一格记一条禁行、每条 25 秒, 整局钉在原地。
+    #:   实测两关(两个不同的主因, 同一个洞):
+    #:     · `MovingPlatform4`: `可走160 / 平台35`, 两个厨师的可达格都是 **59/160**
+    #:       —— 规划器早就算出西北那一半过不去(`fetch Bun 不可达(够不着)`),
+    #:       而 P1 整局钉在 `x=12.2`、P2 钉在 `x=14.2`, 刷 `地图说能走, 人撞住了`。
+    #:     · `s_moonfestival_1_2`: 地形 A* 失败 ⇒ 掉到**对地形一无所知**的第三兜底
+    #:       `plan_path`(拿台子列表当障碍) ⇒ 它给出的路点**穿过危险格**
+    #:       (`路径点 (12.0,1.2) 是危险格, 跳过` 连四行 —— 只有它给得出这种东西,
+    #:         `find_path` 只回可走格心、`_native_path_safe` 有一个危险点就整条作废)
+    #:       ⇒ 前向守卫把**整趟**判死 ⇒ 路点在整条走廊上挨个陪葬、厨师一步没动。
+    NAV_MODE = (os.environ.get("NEKO_NAV") or "field").strip().lower()
+    NAV_MODE = {"1": "field", "on": "field", "yes": "field", "true": "field",
+                "off": "0", "no": "0", "false": "0", "line": "0"}.get(NAV_MODE, NAV_MODE)
+
+    def _seg_clear(self, tm, x: float, z: float, tx: float, tz: float,
+                   step: float = 0.4) -> bool:
+        """**这条直线整条都走得通吗** —— 用**和规划器同一套边模型**判。
+
+        为什么需要它: 有了它才敢说"直线优先" —— 直线**真的**走得通时一步都不改,
+        走不通时才去问步数表。没有它就只能二选一("永远直线"或"永远步数表")。
+
+        判据 = 沿线段每 `step` 格采样一个点, 要求:
+          · `walkable`(**格子字符** —— 墙/水/空洞/物理阻挡 `x` 全在这里被排除);
+          · 非 `is_danger`;
+          · 相邻两个采样点的格子之间 `step_ok`(**高差 ≤ 0.65** —— 就是上面那段 ☠ 里
+            控制器一直漏掉的那把尺子)。
+        ⚠ **首尾两点不查 `walkable`**: 起点可能是"被平台推到边上"的不可走格, 而终点
+          常常就是台面本身(障碍格) —— 朝台面推是正常的(站到旁边由 `_stand_cell` 管)。
+          但 `is_danger` 首尾照查。
+        ⚠ 地形不可用 ⇒ 回 `False`(= "直线不敢保证"), 让调用方去问步数表;
+          步数表也答不了时**逐字退回老行为**, 所以这里保守不会把路堵死。
+        """
+        if tm is None or not getattr(tm, "ok", False):
+            return False
+        d = ((tx - x) ** 2 + (tz - z) ** 2) ** 0.5
+        if d <= 1e-6:
+            return True
+        n = int(d / max(0.15, step)) + 1
+        prev = None
+        for k in range(n + 1):
+            t = min(1.0, k / float(n))
+            c = tm.cell_of(x + (tx - x) * t, z + (tz - z) * t)
+            if not tm.inside(*c):
+                return False
+            if tm.is_danger(*c):
+                return False
+            if 0 < k < n and not tm.walkable(*c):
+                return False
+            if prev is not None and c != prev \
+                    and not tm.step_ok(prev[0], prev[1], c[0], c[1]):
+                return False
+            prev = c
+        return True
+
+    def _field_dir(self, tm, km, st: dict, x: float, z: float,
+                   tx: float, tz: float, tedges=None, blocked=None):
+        """**沿步数表朝目标降一步** —— 返回 `(ux, uz, 到那一格的距离)`, 判不了返回 `None`。
+
+        第三个值是给**键盘那一路**用的: 步数表给的只是**下一格**(约 1.2~1.7 格), 不是终点
+        —— 按住时长必须按那一格算, 否则会朝那一格冲出去好几格(模拟量那一路有闭环微调,
+        不靠时长, 但键盘那一路完全靠它)。
+
+        步数表 = `tm.distances_from(目标)`(整张图一次 BFS)。它和规划器**同源**:
+        边规则是 `walkable` + `step_ok`, 所以:
+          · 危险格/空洞格/物理阻挡格(`x`)**天然不在表里**(它们不可走);
+          · 高差超过跨步上限的边**天然不在表里**;
+          ⇒ **表里给出的每一步都是规划器认可的一步** —— 这就是"按可达图移动"。
+        取步: 厨师所在格的 8 邻格里, 挑 `step_ok` 通过、可走、非危险、且**步数更小**的
+        那一格; 斜向额外要求**两条肩格都可走**(不切墙角)。同分取与目标方向点积更大的。
+
+        ⚠ 返回 `None` 的三种情形(**都退回老行为, 不猜**):
+          ① 厨师那一格**不在表里** —— 他被推到不可走区/被孤立, 或目标在**另一个连通块**
+             (实测 `MovingPlatform4`: `我的可达格 59/160`) ⇒ 这时**本来就到不了**,
+             该由上层判"够不着"换目标, 而不是让控制器继续顶;
+          ② 地形不可用;
+          ③ 没有步数更小的邻格(已经在表的最低点)。
+        ⚠ 表按 `(地形版本, 目标格)` 缓存 —— 一趟导航建一次, 不是每个 tick 建一次。
+          地形版本 `tm.ver` 变了(荷叶/按钮/平台/火)自然重算。
+        """
+        if tm is None or not getattr(tm, "ok", False):
+            return None
+        tgt = tm.cell_of(tx, tz)
+        key = (tm.ver, tgt)
+        cached = getattr(self, "_field_cache", None)
+        if cached is None or cached[0] != key:
+            dist = tm.distances_from(tx, tz, at_y=self.chef_y(st),
+                                     extra_edges=tedges or {})
+            cached = (key, dist)
+            self._field_cache = cached
+        dist = cached[1]
+        c = tm.cell_of(x, z)
+        if c not in dist:
+            return None
+        cur = dist[c]
+        best, pick_d, best_dot = None, None, -2.0
+        ux, uz = (tx - x), (tz - z)
+        _un = (ux * ux + uz * uz) ** 0.5 or 1.0
+        for di in (-1, 0, 1):
+            for dj in (-1, 0, 1):
+                if di == 0 and dj == 0:
+                    continue
+                n = (c[0] + di, c[1] + dj)
+                dn = dist.get(n)
+                if dn is None or dn >= cur:
+                    continue                  # 邻格步数没有更小 ⇒ 不是"朝目标的那一步"
+                if not tm.walkable(*n) or tm.is_danger(*n):
+                    continue
+                if blocked and n in blocked:
+                    continue
+                if not tm.step_ok(c[0], c[1], n[0], n[1]):
+                    continue
+                if di and dj:
+                    # 斜向: 两条肩格都得能走, 否则是**切墙角**(贴着一个拐角斜穿过去)
+                    if not (tm.walkable(c[0] + di, c[1]) and tm.walkable(c[0], c[1] + dj)):
+                        continue
+                bx, bz = tm.world_of(*n)
+                _bn = ((bx - x) ** 2 + (bz - z) ** 2) ** 0.5
+                if _bn < 1e-6:
+                    continue
+                dot = ((bx - x) * ux + (bz - z) * uz) / (_bn * _un)
+                # 先比步数(越小越靠近目标), 步数相同再比"谁更朝着目标"
+                if pick_d is None or dn < pick_d or (dn == pick_d and dot > best_dot):
+                    best, pick_d, best_dot = n, dn, dot
+        if best is None:
+            return None
+        bx, bz = tm.world_of(*best)
+        vx, vz = bx - x, bz - z
+        vn = (vx * vx + vz * vz) ** 0.5
+        if vn < 1e-6:
+            return None
+        return (vx / vn, vz / vn, vn)
+
     def chef_speed(self, st: dict) -> float:
         """厨师此刻的**真实推进速度** `R = RunSpeed × MovementScale`(世界单位/秒)。
 
@@ -1315,6 +1461,42 @@ class Engine:
                     self._last_stuck_no_learn = not _rec
                     return False
 
+                # ---- 转向向量: **直线走得通就走直线, 走不通才问步数表** ----
+                # ☠ 为什么在这里(而不是重写方向选择那一段): `dx,dz` 还要喂到达判定/死区/
+                #   翻转检测, 那些**一个字都不能动**。这里只多出一个"该朝哪按"的向量
+                #   `(sx,sz)`, 默认就等于 `(dx,dz)` 的单位向量 ⇒ 直线优先是**恒等路径**。
+                sx, sz = (dx / dist, dz / dist) if dist > 1e-4 else (0.0, 0.0)
+                _on_field = False
+                _field_step = 0.0
+                if self.NAV_MODE != "0" and dist > 1e-4 \
+                        and not self._seg_clear(tm, x, z, tx, tz):
+                    _km_f = self.map(st)
+                    _te_f = self._travel_edges(_km_f, tm) if _km_f is not None else {}
+                    _f = self._field_dir(tm, _km_f, st, x, z, tx, tz,
+                                         tedges=_te_f,
+                                         blocked=self._dynamic_blocks(_km_f, tm))
+                    if _f is None:
+                        # 步数表也答不了 ⇒ **逐字退回老行为**(直线 + 下面那道守卫)。
+                        # 最常见的一种: 目标在**另一个连通块**里(`MovingPlatform4` 实测
+                        # `我的可达格 59/160`) —— 那时本来就到不了, 该由上层判"够不着"
+                        # 换目标, 不是让控制器继续顶。
+                        if not getattr(self, "_field_none_told", False):
+                            self._field_none_told = True
+                            self.log("[导航] ⚠ 直线不通, 而**步数表里没有我这一格**"
+                                     "(被推到不可走区/目标在另一个连通块) —— 退回直线硬推")
+                    elif self.NAV_MODE == "compare":
+                        # 只读对照: **一行行为都不改**, 只把分歧记下来(和 `NEKO_PLAN=shadow` 一个用法)
+                        self.log("[导航] ⇄ 对照: 直线朝 (%.2f,%.2f), 步数表朝 (%.2f,%.2f)"
+                                 " —— 还差 %.2f 格" % (sx, sz, _f[0], _f[1], dist))
+                    else:
+                        sx, sz, _field_step = _f
+                        _on_field = True
+                        if not getattr(self, "_field_told", False):
+                            self._field_told = True
+                            self.log("[导航] ↪ 直线不通(挡墙/水/高差), **走步数表** "
+                                     "(%.2f,%.2f) 还差 %.2f 格 —— 每一步都是规划器认可的"
+                                     % (sx, sz, dist))
+
                 # ☠ **迈步之前先探一下"下一步那格"** —— 这是"直接走进水里"的根因(用户实机指出:
                 #   "**没有按地图的可达图移动，直接去水里了**")。
                 #   为什么原来拦不住:
@@ -1327,9 +1509,26 @@ class Engine:
                 #     ⚠ **只在"当前格安全"时管** —— 有些关卡的危险区判得很宽(整片都被
                 #       KillPlane 投影成危险), 那时人本来就站在"危险"里, 若还拦就等于
                 #       一步都走不了(见 `_danger_trust` 那段的历史教训)。
-                if self._next_step_dangerous(tm, x, z, dx, dz, dist):
+                #
+                # ☠☠ **但"停下"的代价原来是判死整趟**(2026-09-17)。实测 `s_moonfestival_1_2`:
+                #   地形 A* 失败 ⇒ 掉到**对地形一无所知**的第三兜底 `plan_path` ⇒ 它给的路点
+                #   穿过危险格 ⇒ 守卫在**同一个坐标**上把整趟判死几十次, 路点在整条走廊上
+                #   挨个陪葬(`路径点 (14.4,-8.4) 到不了, 继续下一个`…), **厨师一步没动**。
+                #   ⇒ 现在: 直线那一步危险、而**步数表给得出合法的下一步** ⇒ 改走它,
+                #     **不 return False**。步数表用的是和规划器同一套边模型, 它给的步
+                #     天然不踩危险格 —— 那就没必要"不往里迈", 只要**换个方向迈**。
+                # ☠☠ **这一道守卫在"走步数表"时也必须过**(2026-09-17 补 —— 第一版写错了)。
+                #   第一版把它整段跳过(`if not _on_field and ...`), 理由是"步数表给的步天然
+                #   不踩危险格"。**那个理由是错的**: 步数表给的只是**下一格**, 而厨师是
+                #   **连续**移动(模拟量每帧发方向 + 风 + 击退 + 队友推挤) —— 越过那一格之后
+                #   没人再拦, 表现就是用户报的"**一直寻路到空洞格导致死亡**"。
+                #   ⇒ 守卫照查, 只是**查"转向方向"**(不是朝目标的直线):
+                #     步数表给的那一步前方 0.9 格是危险格 ⇒ 就**不迈**, 这一趟到此为止。
+                #   ⚠ 贵在能拦住"越过一格": 探的是**当前朝向的前方**, 与走的是哪条路无关。
+                _gdx, _gdz, _gd = (sx, sz, 1.0) if _on_field else (dx, dz, dist)
+                if self._next_step_dangerous(tm, x, z, _gdx, _gdz, _gd):
                     self.kb.release_all()
-                    _px, _pz = x + dx / dist * 0.9, z + dz / dist * 0.9
+                    _px, _pz = x + _gdx / _gd * 0.9, z + _gdz / _gd * 0.9
                     self.log(f"[导航] ✗ 前方 0.9 格 ({_px:.1f},{_pz:.1f}) 是危险格"
                              f"(水/空洞) —— **不往里迈**, 这一趟到此为止")
                     return False
