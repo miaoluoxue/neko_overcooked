@@ -107,6 +107,35 @@ NEKO_INPUT=keys,virtual                             # 单独一行(那是 --inpu
 | `NEKO_WATCH_PY` | `sys.executable` | 子进程用哪个解释器（要用宿主 `.venv` 时设它） |
 | `NEKO_WATCH_LOCAL` | `runtime/watch.local` | 本机配置文件路径；`0` = 不用 |
 
+### 全自动进关（`NEKO_WATCH_AUTO`，默认 **关**）
+
+开着时：**主界面加入 → 切 Party 模式 → 大厅选主题 → 进可进入的关卡**。
+逻辑在 `neko/auto_level.py`（纯模块 + I/O 注入，可离线验；探针 `_autolevel_probe`）。
+
+| 变量 | 默认 | 干什么 |
+|---|---|---|
+| `NEKO_WATCH_AUTO` | `0` | **总开关**。`1` = 开。关着时**逐字退回老行为**（只补 P2，一个菜单键都不按） |
+| `NEKO_WATCH_AUTO_SEQ` | 见下 | **换序列**（不用改代码）：`screen=join,RB,A;lobby=A,A` |
+| `NEKO_WATCH_AUTO_GAP` | `1.5` | 每个动作之间等多久（秒） |
+| `NEKO_WATCH_AUTO_TRIES` | `3` | 同一阶段最多重来几遍；跑完还不变就**停手打警告** |
+| `NEKO_WATCH_AUTO_PAD` | `1` | 用哪个虚拟手柄（`0`/`1`） |
+
+**动作面**：`join`（补 P2，复用既有的 `join_lobby`）/ `wait` / `pad:<键>`（虚拟手柄，默认）/
+`kbd:<键>`（键盘，会当场把前台拽回游戏）。裸键名自动当 `pad:`。
+
+☠☠ **这是"盲发按键 + 看落到哪一屏"** —— 插件报不出"主菜单当前选中哪个标签页"
+（`app.menu` 读的是**游戏内**暂停菜单，主界面里恒为空串），也报不出"大厅里选了哪个主题"。
+能用的只有 `scene` / `inRound` / `users`：
+
+| `scene` | 阶段 | 动作 |
+|---|---|---|
+| `StartScreen` | 主界面 | 补 P2 → 切 Party/Coop → 确认 |
+| `Lobbies` | Coop 大厅 | 选主题（`PickLevel` **随机挑图**）→ 厨师选择那一屏再确认 |
+| 其它 | 加载/过场 | **一个键都不按**（乱按只会帮倒忙） |
+
+⇒ 卡住就看 `[进关] ▶ <阶段>: <动作>` 那几行，对着改 `NEKO_WATCH_AUTO_SEQ`。
+**默认序列是按逆向文档推的，实机第一次跑很可能要微调。**
+
 > 其它所有参数（评分/杂活/风/地图新鲜度/文件通道…）见
 > [`docs/参数配置.md`](docs/参数配置.md) —— 那张表是从代码里扫出来的全量 49 个。
 
