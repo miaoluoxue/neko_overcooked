@@ -5932,7 +5932,14 @@ class Engine:
             "plate_at": None,
             #: 这是**哪一单**的活 —— 只在"没有别的活可做"时用它决定"该不该继续等"(
             #: 见 `_execute_scored` 里 `_pots_pending` 那条)。空串 = 空闲备料(不属于任何单)。
-            "flow": (flow.name if flow is not None else ""),
+            #: ☠☠ **键必须是槽位键(`_plan_key`), 不是菜名**(2026-09-17, 同名多单那一族)。
+            #:   原来记的是 `flow.name` ⇒ 订单栏上同时挂 5 张 `Sushi_Fish` 时,
+            #:   **两张单的锅台账合成了同一张账**: A 单放进去的那口锅会被 B 单的
+            #:   `_pots_pending` 认成自己的 ⇒ "我这单还有菜在灶上"这一问**答错**,
+            #:   而它决定的正是"没别的活时该不该继续等"(等错了就是白烧整局)。
+            #:   ⚠ 同一局内写读两侧**同时**改, 不存在新旧键混用; `flow=None`(空闲备料)
+            #:     仍然是空串 ⇒ 那条路一行不变。
+            "flow": (self._plan_key(flow) if flow is not None else ""),
             "due": now + need,            # 游戏说它熟的时刻
             # ☠ **硬上限**: 焦(`burn_at = 2*need`)再往回留一点走路+取菜的时间。
             #   `burn_at` 直接取游戏报的那个数, **不自己再乘一遍**。
@@ -6028,8 +6035,13 @@ class Engine:
         判据只此一份: 台账里**属于这一单**的账(`_pot_put` 记的 `flow` 字段)。
         `flow=None`(空闲备料那条路) ⇒ 只要是**我开的火**就算 —— 那时没有"单"可归属。
         ⚠ 顺手对每一笔做一次 `_pot_valid`(它自己会清失效的账), 所以这个函数也**当检查用**。
+
+        ☠☠ **归属按槽位键比, 不按菜名**(2026-09-17, 同名多单那一族)。
+          台账那侧(`_pot_put`)写的是 `_plan_key(flow)` ⇒ 这一侧必须用**同一个函数**;
+          否则两张同名单会互相认领对方的锅。判据只有一份 —— 别再各写一遍字面。
+          ⚠ `flow.slot` 空(单人/老路径)时 `_plan_key` 退回菜名 ⇒ **与改前逐字相同**。
         """
-        want = flow.name if flow is not None else None
+        want = self._plan_key(flow) if flow is not None else None
         for _sid, ent in self._pots_live().items():
             # 别的单的账不算(空闲备料那种没有归属的账算我的 —— 那时没有"单"可归)。
             if want is not None and ent.get("flow") and ent.get("flow") != want:
@@ -8546,6 +8558,20 @@ class Engine:
 
         ⚠ **读不到就返回 True**(放行): 桥抽风/订单接口报错时宁可去试一次,
           也不能因为读不到订单把整条流程卡死在送餐这一步。
+
+        ☠☠ **它按菜名比, 而且这是故意的**(2026-09-17 复核, 同名多单那一族)。
+          本仓别处的"订单身份"一律用槽位键(`_plan_key`), 这里**是唯一的例外**,
+          理由是两个调用点问的都是**道菜级**的问题, 不是身份级:
+
+            · 两个调用点(`_execute_scored` 的"订单没了就别做了"两条)要判的是
+              **"这道菜还有没有人要"** —— 同名单轮换时, 手上这条链的产物
+              **照样有人收**(菜的规格一模一样) ⇒ 该继续做, 不该作废;
+            · 换成按订单实例判 ⇒ 同名单一换, 就会**把做了一半的活扔掉**
+              (台面上那盘半成品、灶上那锅), 比现在**更差**。
+
+          ⇒ **别顺手把它改成槽位键**。真要判"**这一张单**是不是我交掉的那张",
+            用 `_flow_completed_by` —— 那个有 op 自己的归属做依据, 是另一件事。
+          ⚠ `name` 空串 ⇒ 恒 True(调用方拿不到名字时不敢判死)。
         """
         if not name:
             return True
@@ -9351,14 +9377,20 @@ class Engine:
         _idle_since = None                  # "连续一个动作都做不了"从什么时候开始(见 IDLE_WAIT)
         _branch_n = 0                       # 本单里"换一支再试"已经用掉几回(见 BRANCH_RETRY_MAX)
         # **换单就清传递指令台账** —— 见 `HANDOFF_TTL` 的注释。
-        # ⚠ 判据是**订单名变了没有**, 不是"进了这个函数就清": 同一单会被外层
+        # ⚠ 判据是**订单身份变了没有**, 不是"进了这个函数就清": 同一单会被外层
         #   "连续失败 → 重新规划"**再送进来一次**, 那时清掉就等于把刚交出去的活忘了,
         #   会**再丢一份**给人类。
-        if self._handoff_flow != flow.name:
+        # ☠☠ **身份用槽位键(`_plan_key`), 不是菜名**(2026-09-17, 同名多单那一族)。
+        #   按菜名比的后果: A 单(`Sushi_Fish`)切到 B 单(**另一张** `Sushi_Fish`)时,
+        #   这里判"没换单" ⇒ **A 那几条传递指令原样被 B 继承** —— 而 B 的队友、
+        #   B 的世界位置和 A 根本不是一回事。传错单的代价不是"差一点", 是
+        #   "**去等一个不存在的队友**"(和 `_plan_key` 那条注释同一个形状)。
+        #   ⚠ `flow.slot` 空(单人/老路径)⇒ `_plan_key` 退回菜名 ⇒ 与改前逐字相同。
+        if self._handoff_flow != self._plan_key(flow):
             self._handoffs.clear()
             self._handoff_told.clear()
             self._handoff_seen.clear()
-            self._handoff_flow = flow.name
+            self._handoff_flow = self._plan_key(flow)
         while pending:
             # ☠☠ **外部命令必须在这里也读一次**(`pause`/`resume`/`stop`/`do`/`mode`)。
             #   原来 `apply_commands()` 只在**外层**(`run()` 里, 每单一次)跑, 而一单
@@ -9828,7 +9860,14 @@ class Engine:
             #   (实测 `s_sushi_1_3`: 交完 `Sushi_PlainPrawn` 之后连着十几轮只有那一个
             #    不可达的 `deliver`, 白白烧掉 20 秒 ≈ 一局 150 秒的 13%。)
             #   ⇒ 交完就收工, 让主循环干净地重新规划(新订单会走一条全新的 flow)。
-            if self._flow_completed_by(op, flow):
+            #   ☠☠ **`op_flow` 必须传**(2026-09-17, 同名多单那一族): 池跨单之后
+            #     `pool[i]` 可能是**别的单**的 `deliver` —— 不传它就只能退回
+            #     "比菜名"(SEE `_flow_completed_by`), 于是一张同名单交掉会把**本单**
+            #     判成"交掉了 ⇒ 收工", 链子被凭空掐断。
+            #     ⚠ `flow_of` 只覆盖**菜谱段**(四条平行表都不含杂活) ⇒ 越界/杂活时
+            #       `op_flow=None` ⇒ 退回老写法(那条路本来就是"target 就是本单名字")。
+            _ofi = (flow_of[i] if (flow_of is not None and 0 <= i < len(flow_of)) else None)
+            if self._flow_completed_by(op, flow, op_flow=_ofi):
                 self.log(f"[引擎] ★ {flow.name} 已经交掉了 —— 这一单收工")
                 return True
             # ☠☠ **`tend`(回来取菜)做成了 ⇒ 菜谱里那一步 `cook X` 也要销号**
@@ -9963,19 +10002,36 @@ class Engine:
             return pending
         return [p for p in pending if p not in drop]
 
-    @staticmethod
-    def _flow_completed_by(op, flow) -> bool:
+    def _flow_completed_by(self, op, flow, op_flow=None) -> bool:
         """这一步做完之后, **这一整单是不是就算交掉了**。
 
-        只认两件事: 动作是 `deliver`/`serve_any`, 且它交的**就是本单**(按名字比)。
+        只认两件事: 动作是 `deliver`/`serve_any`, 且它交的**就是本单**。
+
           · `deliver` —— 菜谱自己的最后一步, 交给送餐口。
           · `serve_any` —— **杂活**, 把台面上现成的一盘端去送(阶段二)。它不销菜谱的号,
             所以做完之后 `pending` 里那个 `deliver` 还在 —— 而手已经空了, 那一步**永远**做不了。
         两者共同的成败判据都是"这一单从订单栏上消失"(`_deliver_plate`), 所以命中即完成。
-        纯函数, 方便离线核对。
+        纯函数(**不读任何状态**), 方便离线核对。
+
+        ☠☠ **"它交的就是本单"必须按槽位键判**(2026-09-17, 同名多单那一族)。
+          老写法是 `op.target == flow.name` —— 而 `op.target` **本来就是从它自己那张单的
+          名字**造出来的(`cookbook` 的 `Op("deliver", flow.name, …)`), 于是这个比较
+          **分不出 op 属于哪张单**: 池跨单时, **B 单**的 `deliver Sushi_Fish` 会把
+          **A 单**(同名)判成"交掉了 ⇒ 这一单收工" ⇒ A 的链**被凭空掐断**。
+          ⇒ 正解是拿 **op 自己那张单的身份**去比 —— 那个身份调用方有(`flow_of[i]`),
+            所以新加 `op_flow` 参数由调用方传进来。
+
+        ⚠ **`op_flow` 给不出时逐字退回老写法**(`op.target == flow.name`) ——
+          单人 / 老调用方 / 离线桩一个字节都不变。**别把这条兜底删掉**:
+          删了它、又拿 `flow` 自己和自己比, 那就变成"动作对上就算本单交掉了",
+          比老写法**更松**(跨单池里别的单的 deliver 会被当成我的)。
         """
-        return (getattr(op, "action", "") in ("deliver", "serve_any")
-                and getattr(op, "target", "") == getattr(flow, "name", ""))
+        if getattr(op, "action", "") not in ("deliver", "serve_any"):
+            return False
+        if op_flow is not None:
+            _o = self._plan_key(op_flow)
+            return bool(_o) and _o == self._plan_key(flow)
+        return getattr(op, "target", "") == getattr(flow, "name", "")
 
     # ---------------------------------------------------------------- 递归规划器
     #
