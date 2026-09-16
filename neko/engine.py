@@ -102,17 +102,21 @@ SCORE_DRIVES_MODE = (os.environ.get("NEKO_SCORE") or "1").strip().lower() not in
 
 #: **递归规划器跑不跑、跑成什么样**(`neko/planner.py`)。三档, 照 `NEKO_SCORE` 的形状。
 #:
-#:   `"0"`(默认) —— 关。规划器一行都不跑, 行为与加它之前**逐字相同**。
-#:   `"shadow"`  —— **影子模式: 算计划 + 只打日志, 一行行为都不改**。
-#:                  为什么要先有这一档: 规划器读的是**语义视图**(货源析取/谁背着背包),
-#:                  引擎读的是 `km`/`st` —— 两边**一定会不一样**。直接接管执行的话,
-#:                  出了问题分不清是"规划推错了"还是"执行做不到"。影子模式把这件事
-#:                  在**改行为之前**摊开: 计划那份日志和现成的
-#:                  `[评分] 决策点 N 个候选 … 选中 X` 并排看。
-#:   `"on"`     —— 接管"选哪个"(尚未实现; 现在写 `on` 会**退回**旧行为并打一行提示)。
+#:   `"on"`(**默认**, 2026-09-17 起) —— **接管"选哪个"**: 走的是**软闸门 + 奖励分**
+#:                  (`_plan_next` 只放行计划排给我的那一步、`_plan_bonus` 给那一步 +8),
+#:                  不是另写一个调度器 —— 理由见 `_plan_bonus`。
+#:                  ☠ **这一步之前的两条 P0 必须先修好**(`inherited-fluttering-boot.md`):
+#:                    ① `evaluate()` 里 `flow_of[i]` 越界 ⇒ 跨单 + 杂活 = **整个线程死**;
+#:                    ② 规划器的 `pass` 步**两道闸门**叠着堵死 ⇒ "队友替我掏"恒推不出来。
+#:                  两者都修完(离线钉死)才把默认翻成 `on`。
+#:   `"shadow"` —— **影子模式: 算计划 + 只打日志, 一行行为都不改**。
+#:                 要"看计划推得对不对、但不想让它影响行为"时用这一档 ——
+#:                 计划那份日志和现成的 `[评分] 决策点 N 个候选 … 选中 X` 并排看。
+#:   `"0"`     —— **一键回退**: 规划器一行都不跑, 行为与加它之前**逐字相同**。
+#:                 行为不对时**先试这个**(比 `NEKO_COOP=0` 更靠内一层)。
 #:
 #: ⚠ 它是**旁路**: 规划器抛异常只打一行日志, **绝不影响主流程**(那是"绝不停机"的一部分)。
-PLAN_MODE = (os.environ.get("NEKO_PLAN") or "0").strip().lower()
+PLAN_MODE = (os.environ.get("NEKO_PLAN") or "on").strip().lower()
 PLAN_MODE = {"1": "on", "yes": "on", "true": "on", "off": "0", "no": "0",
              "false": "0", "0": "0"}.get(PLAN_MODE, PLAN_MODE)
 
@@ -160,6 +164,7 @@ class _PlanView:
         self._sid = getattr(e, "_assemble_sid", "")
         self._bench = getattr(e, "_step_bench", None)
         self._hand = getattr(e, "_handoffs", None)
+        self._potgate = getattr(e, "_pot_gate_off", False)
         e._preposed = {}
         # ☠☠ **冷板凳 / 交出去的也要按住。**
         #   它们和 `_preposed` 是同一类东西: **执行期的调度状态, 不是世界的事实**。
@@ -174,6 +179,17 @@ class _PlanView:
             e._step_bench = {}
         if self._hand is not None:
             e._handoffs = {}
+        # ☠☠ **"锅还没到点"那道反向闸门也要按住**(2026-09-17 三层的接缝)。
+        #   它和上面几样是**同一类东西**: 读的是 `self._pots`(开火台账)——
+        #   "我几分钟前把米放进去了、还差 8 秒熟"是**执行期的瞬态**, 不是世界的事实。
+        #   `_op_actionable` 的 cook 分支会据此判不可做 ——
+        #   ⇒ 不按住的话: 规划期只要有口锅在煮, 那个 `cook X` 步就被判"还没到点"
+        #     ⇒ **计划会绕开它 / 把它标成未验证**, 而计划问的恰恰是
+        #     "**如果一切顺利**该怎么做"(到点自然就熟了)。
+        #   ⚠ 判据一行不改 —— 只换上下文(`_op_actionable` 读这个标志, 见那里)。
+        #   ⚠ 计划**不是**要无视它: 执行期照旧走 `KIND_DEFER`("还没到回来的时候,
+        #     先去做别的"), 那才是正确的处置。
+        e._pot_gate_off = True
         # `assemble_spot` 保持原值: 若它本来就是 None(执行期还没挑), 那 `assemble` 那几步
         # 会被判"还没挑摆盘位" —— 那是**真的**: 规划期确实不知道要用哪块台面。
         # ⚠ **不去调 `pick_assemble_spot`** —— 那个会写 `_board.pick_spot`, 影子模式
@@ -189,6 +205,7 @@ class _PlanView:
             e._step_bench = self._bench
         if self._hand is not None:
             e._handoffs = self._hand
+        e._pot_gate_off = self._potgate
         return False
 
 #: **导航要不要做迎风补偿**(把摇杆/按键指向"净值方向"而不是"目标方向")。
@@ -623,6 +640,11 @@ class Engine:
         #: "我把某份料丢/放在哪了"。丢出去手上就空了, 所以 `cook/chop/mix/assemble`
         #: 得先靠这张表知道"它躺在附近, 先去捡回来"(见 `_pickup_preposed`)。
         self._preposed = {}
+        #: **规划视图**：`True` 时 `_op_actionable` 的"锅还没到点"那道反向闸门被按住
+        #: (见 `_PlanView`)。☠ 它读的是**开火台账**(执行期瞬态), 规划期看见它只会答错
+        #: 问题 —— 和 `_preposed`/`_step_bench`/`_handoffs` 是同一类东西。
+        #: ⚠ 执行期恒为 `False` ⇒ 行为一个字都不变。
+        self._pot_gate_off = False
         #: 上一次失败是**哪一类**(见 `KIND_BRANCH` / `"death"`) —— 决定"下一步该怎么办",
         #: 不是拿来打日志的: 摔死不原路重试, 分支不可行**换支**, 其余才值得原地重试。
         self._last_fail_kind = ""
@@ -7244,7 +7266,17 @@ class Engine:
         #     `_cook` 又 defer 一次: 表面上"在做", 实际每 0.5 秒空转一圈。
         #   ⚠ **`op.tend`(回来取那一趟)不受它管** —— 它**就是**"到点了, 回去拿"那一下,
         #     而 `_tends` 只在 `due` 到了之后才提它(见 `Op.tend` 的注释)。
-        if a == "cook" and not getattr(op, "tend", False):
+        if a == "cook" and not getattr(op, "tend", False) \
+                and not getattr(self, "_pot_gate_off", False):
+            # ☠☠ **`_pot_gate_off` = 规划视图按住的**(2026-09-17 三层的接缝)。
+            #   这道闸门读的是**开火台账**("我几分钟前把米放进去了、还差 8 秒熟") ——
+            #   那是**执行期的瞬态, 不是世界的事实**, 和 `_preposed` / `_step_bench` /
+            #   `_handoffs` 是同一类东西(它们已经在 `_PlanView` 里被按住了)。
+            #   ⇒ 不按住的话: 规划期只要有口锅在煮, `cook X` 就被判"还没到点"
+            #     ⇒ 计划会绕开它, 而计划问的恰恰是"**如果一切顺利**该怎么做"
+            #       (到点自然就熟了)。
+            #   ⚠ **判据一行不改**, 只换上下文 —— 与 `_PlanView` 的另外几样同一个做法。
+            #   ⚠ 执行期这个标志恒为 False ⇒ **行为一个字都不变**。
             _sid, _ent = self._pot_get(km, op.target)
             if _ent is not None and not self._pot_due(_ent):
                 return False, (f"我放进去的 {op.target} 还在 {_sid} 上煮"
@@ -7582,7 +7614,17 @@ class Engine:
         #     退回整池 —— 那正是"绝不停机"。硬锁会让一条过期的计划把整局锁死。
         _pn = self._plan_next(ops, pending)
         if _pn is not None:
+            # ☠☠ **只收窄"计划那张单"的步**(2026-09-17 三层合流)。
+            #   池跨单之后, `(action, target)` 匹配会把**别的单**里长得一样的那步
+            #   一起收进来(两张单完全可以有同名同步的步骤 —— 实测订单栏同时挂 5 张
+            #   `Sushi_Fish`)⇒ 收窄之后池里混着两张单的步, 而计划只覆盖其中一张。
+            #   ⚠ 归属用 `_plan_flow`(**按槽位键对**), **不靠菜名**。
+            #   ⚠ 对不上 ⇒ `_pf is None` ⇒ 不做归属过滤(退回老行为, 不会筛空)。
+            _pf = self._plan_flow(flow_of)
             _hit = [i for i in pending if i < n_recipe
+                    and (_pf is None
+                         or (flow_of is not None and i < len(flow_of)
+                             and flow_of[i] is _pf))
                     and ops[i].action == _pn.op.action
                     and self._norm(ops[i].target) == self._norm(_pn.op.target)]
             if _hit and all(info[i]["cell"] is not None for i in _hit):
@@ -7590,7 +7632,11 @@ class Engine:
                          f"{_pn.op.action} {_pn.op.target}")
                 # ⚠ 只收窄 `pending` —— `info` **不用重建**(它本来就是按原 `pending` 算的,
                 #   而 `_hit` 是它的子集)。`recipe`/`chores` 在函数开头就算好了, 不受影响。
-                pending = _hit
+                # ☠☠ **杂活必须留着**(2026-09-17): 收窄原来把 `pending` 整个换成 `_hit`,
+                #   而 `_hit` 只取 `i < n_recipe` ⇒ **这一轮一个杂活都进不来** ——
+                #   救锅靠 `_pot_overdue_pick` 那条硬上限兜着, 但洗盘子/开火/到点取菜
+                #   这类会**一起停**。计划管的是"菜谱那几步的顺序", 不是"别的活都别干"。
+                pending = _hit + [i for i in pending if i >= n_recipe]
 
         # ⚠ **兜底**: 严格档(要求"手上就是那东西")把候选筛空了, 就退回放宽档。
         #   闸门是用来**排序**的, 不是用来把活干没的(规则 5) ——
@@ -8851,6 +8897,23 @@ class Engine:
             if o.action in ("chop", "cook", "mix") and o.target:
                 made_by.setdefault(self._norm(o.target), []).append(o.action)
 
+        # ☠☠ **正在煮的那些当"事实"喂进去**(2026-09-17 三层的接缝) —— 开火台账
+        #   (`_pot_*`, "放完就走"那套)与递归规划器**今天完全不相干**, 于是计划会推
+        #   "去箱子拿一份米", 而米**已经在灶上**了。
+        #   ⚠ **只当事实**: 规划器拿它写 `assumptions`/`notes`(让日志说得出来),
+        #     **不改搜索判据** —— "到点回去取"是执行层的事(`_tends`+`KIND_DEFER`),
+        #     在这儿另造一条判据就是把同一件事写第二遍。
+        #   ⚠ 台账里的键是**灶台 id**、值是归一化过的 `target`, 与 `world.sources`
+        #     同一套归一化 ⇒ 直接对得上。
+        _cooking = []
+        try:
+            _now = time.time()
+            for _sid, _ent in (self._pots_live() or {}).items():
+                _cooking.append((str(_sid), str(_ent.get("target") or ""),
+                                 max(0.0, float(_ent.get("due", 0.0)) - _now)))
+        except Exception:                                        # noqa: BLE001
+            _cooking = []
+
         world = WorldView(
             chefs=tuple(chef_ids) or (0,),
             sources=sources,
@@ -8859,6 +8922,7 @@ class Engine:
             # 手上拿着什么 —— 计划推演的**起点**(之后由 `planner._apply_effect` 推进)。
             chef_held={c.id: (c.held or "") for c in (km.chefs or [])},
             resting_packs=[p.name for p in km.packs_resting()],
+            cooking=_cooking,
             epoch=getattr(self.terrain(), "ver", "") or "")
 
         # ---- 注入的检查器: 每厨师绑一份视图(位置/手持/BFS 表) ----
@@ -8939,6 +9003,26 @@ class Engine:
           所以这条现在是硬的; 空串只在单人/老路径上出现, 那时退回名字**逐字等于老行为**。
         """
         return str(getattr(flow, "slot", "") or "") or str(getattr(flow, "name", "") or "")
+
+    def _plan_flow(self, flow_of):
+        """当前那份计划**属于哪张单** —— 拿**黑板键**对, **不靠菜名**。
+
+        ☠☠ 为什么要它(2026-09-17 三层合流): `_plan_next` 只回一个 `Step`, 而 `Step`
+          里**没有**"我属于哪张单"。池跨单之后 `_hit` 是按 `(action, 归一化 target)`
+          匹配的 —— 而**两张单完全可以有同名同步的步骤**(实测订单栏同时挂 5 张
+          `Sushi_Fish`), 于是"计划排给我的那一步"会把**别的单**里长得一样的那步
+          一起收进来 ⇒ 收窄之后**池里混着两张单的步**, 而计划只覆盖其中一张。
+        ⚠ 判据用 `_plan_key`(槽位键)对 —— 本仓"订单没有 id、只有名字"那条账已记过四次。
+        ⚠ 对不上(计划过期/池里那张单已经下架)⇒ 返回 `None` ⇒ 调用方**不做归属过滤**
+          (退回老行为, 不会把候选筛空)。
+        """
+        _k = getattr(self, "_plan_cur_key", "")
+        if not _k or not flow_of:
+            return None
+        for _f in flow_of:
+            if self._plan_key(_f) == _k:
+                return _f
+        return None
 
     def _plan_tick(self, flow, km, st) -> None:
         """算一份计划并按开关处置 —— `shadow` 只打日志, `on` 另外把它交给评分层。
@@ -11207,15 +11291,11 @@ class Engine:
     def run(self, dry: bool = False):
         self.log("[引擎] 启动, 等对局...")
         if PLAN_MODE == "on":
-            # ☠☠ **这句话 2026-09-17 改了 —— 老的写的是"接管执行还没实现"**, 而那是**错的**:
-            #   递归规划器**已经**在接管"选哪个"了, 走的是**软闸门 + 奖励分**
-            #   (`_plan_next` 只放行计划排给我的那一步 + `_plan_bonus` 给那一步加分),
-            #   不是另写一个调度器 —— 那是独立审查给的方向, 理由见 `_plan_bonus`。
-            #   留着老话的代价不是"不准确", 是**把下一个读日志的人劝退**:
-            #   他会以为这东西只是个摆设, 于是不去查它推得对不对。
-            self.log(f"[引擎] 递归规划器: **已接管【选哪个】**(NEKO_PLAN=on; 每 {PLAN_INTERVAL:.0f} 秒"
-                     f"重算一次, {PLAN_TTL:.0f} 秒过期; 计划排给我的那一步优先, "
-                     f"这一步做不到就退回整池)")
+            # ☠☠ **这句话 2026-09-17 改了两次** —— 最早写的是"接管执行还没实现", 而那是**错的**;
+            #   现在它是**默认档**, 所以要把"怎么回退"一并说出来。
+            self.log(f"[引擎] 递归规划器: **已接管【选哪个】**(默认开; `set NEKO_PLAN=0` "
+                     f"一键回退)。每 {PLAN_INTERVAL:.0f} 秒重算一次, {PLAN_TTL:.0f} 秒过期; "
+                     f"计划排给我的那一步优先, 这一步做不到就退回整池")
         elif PLAN_MODE == "shadow":
             self.log(f"[引擎] 递归规划器: **影子模式**(每 {PLAN_INTERVAL:.0f} 秒算一次, "
                      f"只打日志、不改行为)")

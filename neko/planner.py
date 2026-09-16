@@ -112,7 +112,21 @@ class WorldView:
     #: **还在场上、没人背**的背包名 —— `solve_worn` 靠它区分
     #: "马上就能背上"和"已经不在了(被人捡走/掉水里)"
     resting_packs: list = field(default_factory=list)
+    #: **正在煮/搅的那些** —— `[(灶台 id, 归一化料名, 离熟还有几秒)]`。
+    #:
+    #: ☠☠ **只当事实用, 不参与搜索判据**(2026-09-17 三层的接缝)。它由 `_plan_ctx` 从
+    #:    开火台账(`Engine._pots_live`)现读 —— 那是"**放完就走**"那套的记忆。
+    #: 用途只有一处: 让**计划说得出来**"为什么没从『去箱子拿一份 X』开始"
+    #:   (X 已经在灶上了) —— 写进 `assumptions` / `notes`, 人读日志时一眼看见。
+    #: ☠ **为什么不拿它改搜索**: "到点回去取"是**执行层**的事(`_tends` + `KIND_DEFER`
+    #:   + 那条硬上限), 而规划器自己构造的 `tend` 步**没有 `at_x/at_z`**
+    #:   (`_tends` 才有) —— 在这儿另造一条判据 = 把同一件事写第二遍, 本仓为这个栽过两次。
+    cooking: list = field(default_factory=list)
     #: 这一刻的**世界指纹** —— 参与记忆化的 key。世界没变就不重算(见 `_Ctx.memo`)
+    #: ☠ **2026-09-17 核实: 这是死字段** —— `_plan_ctx` 老老实实填了 `terrain().ver`,
+    #:   而规划器全文**没有一处读它**; `memo` 又挂在每次新建的 `_Ctx` 上
+    #:   ⇒ "世界没变就不重算"**根本没实现**(只在单次 `plan()` 调用内有效)。留着是
+    #:   给以后接线用的, 别以为它现在管用。
     epoch: object = 0
 
 
@@ -359,13 +373,31 @@ def _solve_have_inner(ctx: _Ctx, chef: int, item: str) -> list | None:
                 continue
             # ---- 情形 B: 背包在**我自己**身上 ⇒ 我取不了 ⇒ **请另一个厨师替我掏、再传给我** ----
             #
-            # ☠☠ **这是 `s_festivemashup_1_3` 的正解**(2026-09-16 实测):
+            # ☠☠ **这是 `s_festivemashup_1_3` 要的那条路**(2026-09-16 那一局的诊断):
             #   那一关**每个背包出自己那份料** ⇒ P1 需要的料就在 P1 自己背上, 而
             #   `Backpack.CanHandleDispenserPickup`(`Backpack.cs:25-33`)是**别人**对你判的
             #   ⇒ **P1 单独一个人永远拿不到**, 必须队友掏出来递过来。
             #   引擎的贪心路径里**没有这个动作**(它只有"我丢给队友", 没有反向) ⇒
             #   实测表现是: 走去按自己背包的拾取键(按不动), 而那一刻游戏报的 `抓取`
             #   指向旁边队友背的**另一个**背包 ⇒ 掏错料 ⇒ 放回去 ⇒ 无限循环, 一局报废。
+            #
+            # ☠☠☠ **2026-09-17 更正 —— 这条注释原来写的是"(实测)", 而那是假的**:
+            #   这条路**从来没通过过**。两道闸门叠着堵死它, 两道都修完了才通:
+            #     ① **站位格**: 这里构造的 `pass` 步**不填 `at_x/at_z`**, 而
+            #        `_op_target_for_score` 的 pass 分支见到 0/0 就回
+            #        `None, "传球: 没解析到队友位置"` ⇒ `_feasible` 的
+            #        `if ok and target is not None` 不成立 ⇒ `cell=None` ⇒
+            #        `check` 回 `ok=False` ⇒ `if not ok2: continue` ⇒ **分支被丢弃**。
+            #        (传球那条路本来就走 `_throw_spot`、**不读** `at_x/at_z` ⇒ 已改成
+            #         不再拿"能不能解析出目标"当前置。)
+            #     ② **取错了人**: `_fetch_source_live` 的 `exclude_back` 硬取
+            #        `self.chef(st)`(**本引擎那个厨师**)的背 ⇒ 问"P2 能不能从 P1 背上掏"
+            #        时算出"那是 P1 自己背的, 不能掏" ⇒ 恒 None。
+            #        (已加 `me_back` 参数, 由 `_plan_ctx.check` 传**被评估那个厨师**的背。)
+            #   ⚠ 教训: 下面那句 `assume_held` 的注释**自己就说中了这个病**, 于是修了
+            #     **手持**那道闸门 —— 而同一步还有**第二道**(站位格)没人注意,
+            #     原地把修好的那道抵消了。**"我修好了一道闸门"不等于"这条路通了"。**
+            #   ⚠ 钉它的探针: `runtime/_planctx_probe.py` §⑭。改这一带必须先跑它。
             for d in ctx.world.chefs:
                 if d == chef:
                     continue
@@ -533,6 +565,11 @@ def plan(flow, world: WorldView, check, log=None) -> Plan | None:
     for c, p in (world.chef_back or {}).items():
         if p:
             assumptions.append(f"P{c+1} 一直背着 {p}")
+    # ☠ **正在煮的那些也记一笔**(2026-09-17): 它们是"**放完就走**"留下的账 ——
+    #   计划里没有"回去取"那一步(`_tends` 才有), 所以要让人读日志时看得见
+    #   "这份料在灶上、到点可取", 而不是以为计划把它漏了。
+    for _sid, _item, _left in (getattr(world, "cooking", None) or []):
+        assumptions.append(f"{_item} 正在 {_sid} 上煮(约 {_left:.0f}s 后熟, 到点回去取)")
 
     return Plan(flow=getattr(flow, "name", ""), steps=steps,
                 assumptions=sorted(set(assumptions)),
