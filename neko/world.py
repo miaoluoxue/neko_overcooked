@@ -76,18 +76,35 @@ class World:
         既省一半桥流量, 又保证两个人看到的是**同一帧**世界。
         """
         now = time.time()
+        # ☠☠ **整个方法都在锁里 —— 包括那次网络读。**
+        #
+        # 原来网络读在锁**外**(先 `with self._lock` 判缓存, 出了锁才 `self.br.get_state()`),
+        # 而 `state_ttl` 默认是 **0**(用户定的"和雷达一样, 每次都要最新一帧")
+        # ⇒ **每次调用都走到网络** ⇒ 双人时两个引擎线程**同时**对**同一条 socket**
+        #   发请求、读回包 ⇒ 请求交错、回包被两边各读一半。
+        #
+        # ☠ **实测症状**(2026-09-16 `run_team.py` 第一次双脚本实机):
+        #     [桥] 通信失败: Expecting ',' delimiter: line 1 column 8193 (char 8192)
+        #     [桥] 通信失败: Extra data: line 1 column 5 (char 4)
+        #   错误位置全落在 **8192/8191/8193** 附近 = **8KB 边界**, 而 `Extra data` =
+        #   **两条消息粘成一条** —— 两个方向都指向"同一条流被两个写者/读者交错"。
+        #   ⇒ 于是 `[世界] 读状态失败` / `[地形] 取图失败` 连成一片, 两个引擎的地图
+        #     和状态一起坏掉(日志里那几百行导航乱撞, 一半是它引起的)。
+        #   ⚠ **单引擎时永远碰不到** —— 所以它躲过了之前所有实机。
+        #
+        # ⚠ 顺带修好了另一件事: 类 docstring 说本方法"保证两个人看到的是**同一帧**世界",
+        #   而读在锁外时**根本没有这个保证**(两个线程各拉各的)。现在有了。
+        # ⚠ `self._lock` 是 **RLock** ⇒ 嵌套加锁安全(下面几处 `with` 不用动)。
         with self._lock:
             if (not force and self._st is not None
                     and now - self._st_t < self.state_ttl):
                 self.state_cache_hits += 1
                 return self._st
-        try:
-            st = self.br.get_state()
-        except Exception as e:
-            self.log(f"[世界] 读状态失败: {e}")
-            with self._lock:
+            try:
+                st = self.br.get_state()
+            except Exception as e:
+                self.log(f"[世界] 读状态失败: {e}")
                 return self._st
-        with self._lock:
             if st:
                 self._st = st
                 self._st_t = time.time()
@@ -121,29 +138,28 @@ class World:
         st = self.state()
         scene = (st or {}).get("scene") or ""
         now = time.time()
+        # ☠☠ **同 `state()`: 网络读必须在锁里** —— 否则两个引擎线程对同一条 socket
+        #   同时收发, 回包被各读一半(实测 2026-09-16, 见 `state()` 上面那段长注释)。
+        #   ⚠ 地形是 8 秒超时的重活, 锁住它确实会让另一个线程等 —— 但那正是应该的:
+        #     两个人都用**同一张**地图, 本来就该等第一份取回来(类 docstring 的原话)。
         with self._lock:
             if (not force and self._tm is not None
                     and self._tm_scene == scene and self._tm.ok
                     and (now - self._tm_at) < self.terrain_ttl):
                 return self._tm
-        try:
-            data = self.br.get_map(force=force, max_age=self.terrain_ttl)
-        except Exception as e:
-            self.log(f"[地形] 取图失败: {e}")
-            with self._lock:
+            try:
+                data = self.br.get_map(force=force, max_age=self.terrain_ttl)
+            except Exception as e:
+                self.log(f"[地形] 取图失败: {e}")
                 return self._tm
-        with self._lock:
             self.map_fetches += 1
-        tm = TerrainMap(data)
-        if tm.error:
-            self.log(f"[地形] 报错: {tm.error}")
-            with self._lock:
+            tm = TerrainMap(data)
+            if tm.error:
+                self.log(f"[地形] 报错: {tm.error}")
                 return self._tm
-        if not tm.ok:
-            self.log("[地形] 网格数据不完整, 退回旧寻路")
-            with self._lock:
+            if not tm.ok:
+                self.log("[地形] 网格数据不完整, 退回旧寻路")
                 return self._tm
-        with self._lock:
             old = self._tm
             if old is not None and old.ok and self._tm_scene == scene:
                 if tm.ver:

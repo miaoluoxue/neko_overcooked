@@ -39,6 +39,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "nek
 
 from bridge.client import BridgeClient   # noqa: E402
 from engine import Engine                # noqa: E402
+from logfile import enable               # noqa: E402
+
+# ⚠ **必须在任何输出之前** —— 它只接管之后的写入(见 `neko/logfile.py`)。
+#   影子模式(`NEKO_PLAN=shadow`)下默认写到桌面, 父进程(看护)会把同一个路径
+#   写回 `NEKO_LOG` 让本进程复用, 于是 `[看护]`/`[引擎]`/`[规划]` 落在同一个文件里。
+enable()
 from world import World                  # noqa: E402
 from modes import Roster, parse_mode_spec  # noqa: E402
 

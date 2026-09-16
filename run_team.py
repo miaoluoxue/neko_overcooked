@@ -1,13 +1,23 @@
 """双人自动做菜: 两个独立的个体各跑一个引擎循环, 共享一块订单黑板。
 
-P1 用 WASD + 左Shift/左Ctrl/左Alt,  P2 用 方向键 + 右Shift/右Ctrl/右Alt
-—— 走的是游戏自带的分屏双键盘。
+**输入可以按人分**(用户 2026-09-16: 场上就是"一个键盘 + 一个手柄")。
 
-输入层(环境变量 NEKO_INPUT 或 --input):
-  keys     (默认) 系统级键盘注入 —— 要求游戏在最前台
-  virtual  游戏内虚拟手柄 —— **每个厨师一个独立的虚拟手柄**, 游戏放后台也能做菜。
-           两个厨师跑在两个线程里, 驱动是**按线程隔离**的(keyboard_input._local),
-           否则后启动的线程会把前一个的驱动覆盖掉, 表现是"一个乱动另一个不动"。
+输入层(环境变量 `NEKO_INPUT` 或 `--input`, 写法同 `--mode`):
+  `virtual`          (**默认**) 两个人都用游戏内虚拟手柄 —— **不看焦点, 后台也能做菜**
+  `keys,virtual`     P1 键盘 / P2 手柄(按人分)
+  `keys`             两个人都用系统级键盘注入 —— 要求游戏在最前台
+  `1:keys,2:virtual` 分别指定(按 **1 基**编号)
+
+☠ **为什么默认是两只都用手柄**(用户 2026-09-16 实机后定的): 先试过"一个键盘一个手柄",
+  **键盘那只被焦点闸门反复暂停、整局一步没动** —— `SendInput` 只发给**当前前台窗口**,
+  而"看一眼终端"就把前台抢走了; 看护每 2 秒拽一次, 人一抢回去它又暂停。
+  那一单全靠走虚拟手柄的另一只跑完。⇒ 两只都用手柄: 不看焦点、后台可跑。
+
+☠ **按人分的能力仍然保留**(原来 `--input` 是全有全无的开关, 表达不了"一键盘一手柄" ——
+  见 `parse_input_spec`), 但**只要配置里有一只走键盘, 整局就得盯着前台**, 后果如上。
+
+两个厨师跑在两个线程里, 驱动是**按线程隔离**的(`keyboard_input._local`),
+否则后启动的线程会把前一个的驱动覆盖掉, 表现是"一个乱动另一个不动"。
 
 用法(先在大厅让两个玩家都加入, 再进对局):
   python run_team.py             # 双人自动做菜
@@ -32,6 +42,64 @@ from engine import Engine                           # noqa: E402
 from team import OrderBoard                         # noqa: E402
 from world import World                             # noqa: E402
 from modes import Roster, parse_mode_spec           # noqa: E402
+from logfile import enable                          # noqa: E402
+
+# ⚠ **必须在任何输出之前**(见 `neko/logfile.py`)。双人时两个线程共用这一个文件 ——
+#   `_Tee` 逐行 flush, 行不会被拆散(两个厨师的日志按真实发生次序穿插)。
+enable()
+
+
+#: 不传 `--input` 时的默认输入层 —— **两只都走虚拟手柄**。
+#:
+#: ☠ **为什么默认是这个**(用户 2026-09-16 定的, 两次): 先要"一个键盘一个手柄",
+#:   实机跑完发现**键盘那只会被焦点闸门反复暂停、整局瘫痪** ——
+#:   `SendInput` 只发给**当前前台窗口**, 而"看终端"这件事本身就把前台抢走了;
+#:   看护的 `KEEP_FOCUS` 每 2 秒拽一次, 人一抢回去它就又暂停 ⇒ P1 **一步没动**
+#:   (实测那一单全靠走虚拟手柄的 P2 一个人跑完)。
+#:   ⇒ 两只都用手柄: **不看焦点、后台也能跑**, 而且 `runInBackground` 被手柄打开。
+#:
+#: ⚠ 提成模块常量是为了**能被探针验到** —— 埋在 `main()` 的 `add_argument` 里
+#:   探针碰不到(同 `run_watch.py` 的 `_argv_of` 那条理由)。
+DEFAULT_INPUT = os.environ.get("NEKO_INPUT") or "virtual"
+
+
+def _is_virtual(s: str) -> bool:
+    return (s or "").strip().lower() in ("virtual", "ver", "hook", "pad", "gamepad")
+
+
+def parse_input_spec(spec: str) -> dict:
+    """把 `--input` 解析成 `{cid: 用不用虚拟手柄}`。**写法与 `modes.parse_mode_spec` 一致**。
+
+    支持:  `keys`                → 两个人都用键盘
+           `virtual`             → 两个人都用虚拟手柄
+           `keys,virtual`        → P1 键盘 / P2 手柄(**按顺序**)
+           `1:keys,2:virtual`    → 分别指定(按 **1 基**编号)
+
+    ☠☠ **为什么必须能按人分**(用户 2026-09-16 指出): 场上是**一个键盘 + 一个手柄**。
+      原来 `--input` 是**全有全无**的开关(要么两只都键盘、要么两只都虚拟手柄),
+      表达不了"一只键盘、一只手柄"—— 而那恰恰是最常见的一台机器两人的配法。
+      ⇒ 按人分。默认值(`keys`)与加这个之前**逐字相同**。
+    """
+    out: dict = {}
+    spec = (spec or "").strip()
+    if not spec:
+        return out
+    parts = [p.strip() for p in spec.split(",") if p.strip()]
+    if not parts:
+        return out
+    if len(parts) == 1 and ":" not in parts[0]:
+        return {"*": _is_virtual(parts[0])}
+    if all(":" not in p for p in parts):
+        return {i: _is_virtual(p) for i, p in enumerate(parts)}
+    seq = 0
+    for p in parts:
+        if ":" in p:
+            k, v = p.split(":", 1)
+            out[int(k.strip()) - 1] = _is_virtual(v)
+        else:
+            out[seq] = _is_virtual(p)
+            seq += 1
+    return out
 
 
 def worker(cid: int, bindings: dict, board: OrderBoard, dry: bool, roster,
@@ -98,13 +166,18 @@ def main() -> int:
     ap.add_argument("--dry", action="store_true", help="只规划不驱动")
     ap.add_argument("--only", type=int, default=0, choices=[0, 1, 2],
                     help="只跑某一个玩家(1 或 2), 默认两个都跑")
-    ap.add_argument("--input", default=os.environ.get("NEKO_INPUT", "keys"),
-                    help="输入层: keys(默认) | virtual(每个厨师一个独立虚拟手柄)")
+    ap.add_argument("--input", default=DEFAULT_INPUT,
+                    help="输入层(默认 %s): keys | virtual | **按人分**: keys,virtual 或 "
+                         "1:keys,2:virtual —— 见 parse_input_spec" % DEFAULT_INPUT)
     ap.add_argument("--mode", default="coop",
                     help="个体模式: coop | clumsy | sabotage(可写 1:sabotage,2:coop)")
     args = ap.parse_args()
 
-    use_virtual = (args.input or "keys").strip().lower() in ("virtual", "ver", "hook")
+    # ☠ **按人分, 不搞全有全无** —— 场上是"一个键盘 + 一个手柄"(见 `parse_input_spec`)。
+    _in_spec = parse_input_spec(args.input)
+
+    def use_virtual_of(cid: int) -> bool:
+        return bool(_in_spec.get(cid, _in_spec.get("*", False)))
 
     # 模式册: **每个厨师一份独立状态**(原代码这里漏了, roster 未定义 → 双人入口直接 NameError)
     roster = Roster(chefs=[0, 1])
@@ -132,12 +205,21 @@ def main() -> int:
     if args.only in (0, 2):
         players.append((1, PLAYER2))
 
-    print(f"[输入] {'虚拟手柄(每个厨师一个, 后台也能跑)' if use_virtual else '键盘注入(需要游戏在最前台)'}",
-          flush=True)
+    for cid, _b in players:
+        print("[输入] P%d: %s" % (cid + 1, "虚拟手柄(后台也能跑)" if use_virtual_of(cid)
+                                  else "键盘注入(**需要游戏在最前台**)"), flush=True)
+    if any(not use_virtual_of(c) for c, _b in players):
+        # ⚠ **只要有一只走键盘, 整局就得盯着前台** —— `SendInput` 发给的是当前前台窗口。
+        #   这一条会推翻"拉起子进程之后就不管焦点"那条(见 `run_watch.py` 的模块 docstring),
+        #   所以必须说出来, 否则读日志的人会以为背景跑不了是别的原因。
+        print("[输入] ⚠ 有厨师走**键盘注入** ⇒ 跑的时候**别把游戏切到后台**"
+              "(SendInput 只发给前台窗口; 想后台跑就两只都用手柄: --input virtual)",
+              flush=True)
     threads = []
     for cid, bindings in players:
         t = threading.Thread(target=worker,
-                             args=(cid, bindings, board, args.dry, roster, use_virtual, world),
+                             args=(cid, bindings, board, args.dry, roster,
+                                   use_virtual_of(cid), world),
                              daemon=True, name=f"chef{cid}")
         t.start()
         threads.append(t)

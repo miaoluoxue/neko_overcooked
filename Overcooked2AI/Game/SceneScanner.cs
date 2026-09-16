@@ -47,6 +47,17 @@ namespace Overcooked2AI.Game
             "Cannon",                // 大炮
             "PushableObject",        // 可推物体
             "CookingRegion",         // 烹饪区域
+            // 背包(DLC09 的"可移动食材箱"): **必须排在 PickupItemSpawner 之前**。
+            //
+            // 机制(反编译): 背包是一个 `CarryableItem`, 身上**同时**挂着
+            //   `PickupItemSpawner`(`Backpack.cs` / `ServerBackpackDispenser.cs:14`
+            //   `RequireComponent<ServerPickupItemSpawner>()`)。而 `Reclassify`
+            //   是"**按本数组顺序返回第一个命中的类型**" ⇒ 放在 `PickupItemSpawner`
+            //   后面的话, 背包会被归成普通食材箱(语义 `crate`) —— 那正是我们要区分的:
+            //     · 没被背 ⇒ 走过去把它**背上**(`ServerBackpack.cs:70-82`)
+            //     · 已被背 ⇒ 从里面**掏一份料**(referral 转给 dispenser)
+            //   两种含义共用一个物体, 而"它是不是个能走过去的箱子"完全取决于状态。
+            "Backpack",
             // 生成器: 食材箱/分发器。箱子可能只挂这些, 不挂 AttachStation
             "PickupItemSpawner",
             "AttachItemSpawner",
@@ -329,6 +340,12 @@ namespace Overcooked2AI.Game
                         // 客户端那份会晚一帧(见 ReadHeldItems)
                         string held, heldC, heldHas;
                         ReadHeldItems(go, out held, out heldC, out heldHas);
+                        // **背上挂着什么** —— 背包(DLC09)机制的唯一入口, 见 `ReadBackItem`。
+                        // 从"谁背着出某份料的背包"到"走过去掏一份"整条路都靠这两个字段:
+                        // 没有它就只能靠坐标猜"背包在谁身上", 而规则 2 就是"拿不准问游戏,
+                        // 不要自己算几何"。`backspawn` = 这个背包出什么料(和台面的 `spawn` 同源)。
+                        string backItem, backSpawn;
+                        ReadBackItem(go, out backItem, out backSpawn);
                         // **厨师归属哪个玩家** —— 这是决定用哪套键盘的唯一权威依据。
                         // 依据 ClientInputTransmitter.Setup(): iD = GetComponent<PlayerIDProvider>().GetID()
                         // Player.One → 键盘左半(SplitPadHost) → WASD
@@ -349,10 +366,15 @@ namespace Overcooked2AI.Game
                         string inter = ReadInteraction(go);
                         if (chefCount > 0)
                             chefs.Append(",");
+                        // ⚠ `back` / `backspawn` 是**字面键**(不是片段) ⇒ 逗号归父串,
+                        //   紧跟在 `heldhas` 后面自己带前导逗号。下面 `{12}{13}` 两个实参
+                        //   必须与格式串里的下标一一对应(`_csjson_probe.py` 会验"下标恰好
+                        //   覆盖 0..n-1")。
                         chefs.Append(string.Format(
-                            "{{\"id\":{0},\"seq\":{0},\"player\":\"{1}\",\"name\":\"{2}\",\"x\":{3:F2},\"y\":{4:F2},\"z\":{5:F2},\"held\":\"{6}\",\"heldc\":\"{7}\",\"heldhas\":\"{8}\"{9}{10}{11}}}",
+                            "{{\"id\":{0},\"seq\":{0},\"player\":\"{1}\",\"name\":\"{2}\",\"x\":{3:F2},\"y\":{4:F2},\"z\":{5:F2},\"held\":\"{6}\",\"heldc\":\"{7}\",\"heldhas\":\"{8}\",\"back\":\"{12}\",\"backspawn\":\"{13}\"{9}{10}{11}}}",
                             chefCount, player, SafeName(go.name), pos.x, pos.y, pos.z,
-                            held, heldC, heldHas, control, inter, local));
+                            held, heldC, heldHas, control, inter, local,
+                            backItem, backSpawn));
                         chefCount++;
                     }
                 }
@@ -1538,22 +1560,43 @@ namespace Overcooked2AI.Game
                  + "],\"onhas\":[" + hases + "],\"n\":" + cnt;
         }
 
-        /// <summary>箱子/生成器出什么食材(PickupItemSpawner.m_itemPrefab.name)。</summary>
+        /// <summary>**出什么食材的裸名字**(`PickupItemSpawner.m_itemPrefab.name`), 拿不到 = ""。
+        ///
+        /// 单独拆出来是因为**有两处要它**, 而两处的包装形状不同:
+        ///   · `ReadSpawn` —— 台面用的 JSON 片段 `,"spawn":"…"`;
+        ///   · `ReadBackItem` —— 厨师背挂点上的背包出什么料。
+        /// ☠ 判据只留这一份: 本项目已经为"同一件事两处各写一份"栽过两次
+        ///   (`OP_PREREQ` 与 `derive()` 给出相反顺序; `brief.py` 按猜的键名找链)。
+        /// </summary>
+        private static string SpawnNameOf(GameObject go)
+        {
+            try
+            {
+                if (go == null)
+                    return "";
+                var st = FindType("PickupItemSpawner");
+                if (st == null)
+                    return "";
+                var sp = go.GetComponent(st);
+                if (sp == null)
+                    return "";
+                var f = st.GetField("m_itemPrefab");
+                if (f == null)
+                    return "";
+                var prefab = f.GetValue(sp) as UnityEngine.Object;
+                return prefab != null ? prefab.name : "";
+            }
+            catch (Exception) { }
+            return "";
+        }
+
+        /// <summary>箱子/生成器出什么食材(PickupItemSpawner.m_itemPrefab.name)。
+        /// 形状见 `SpawnNameOf`(判据只有那一份)。</summary>
         private static string ReadSpawn(GameObject go)
         {
             try
             {
-                var st = FindType("PickupItemSpawner");
-                if (st == null)
-                    return "\"spawn\":\"\"";
-                var sp = go.GetComponent(st);
-                if (sp == null)
-                    return "\"spawn\":\"\"";
-                var f = st.GetField("m_itemPrefab");
-                if (f == null)
-                    return "\"spawn\":\"\"";
-                var prefab = f.GetValue(sp) as UnityEngine.Object;
-                return "\"spawn\":\"" + SafeName(prefab != null ? prefab.name : "") + "\"";
+                return "\"spawn\":\"" + SafeName(SpawnNameOf(go)) + "\"";
             }
             catch (Exception) { }
             return "\"spawn\":\"\"";
@@ -2020,6 +2063,46 @@ namespace Overcooked2AI.Game
             }
             catch (Exception) { }
 
+            // ---- 背包: **现在有没有被背着** ----
+            //
+            // 为什么需要这个键: 背包是"**两种含义共用一个物体**"的典型 ——
+            //   · 没被背 ⇒ 按拾取键是把人**背上**它(`ServerBackpack.cs:70-82`)
+            //   · 已被背 ⇒ referral 被转给 `ServerBackpackDispenser`
+            //               (`ServerBackpack.cs:57-68`) ⇒ 按拾取键是从里面**掏一份料**
+            //   分叉就写在 `ServerBackpack.CanBlockReferral`(`ServerBackpack.cs:47-50`):
+            //     `return !m_attachment.IsAttached();`
+            //   ⇒ **`IsAttached()` 就是"背没背"的权威判据**, 不用自己猜。
+            //
+            // 为什么 Python 侧必须知道这件事:
+            //   · 没被背时它是一个**能走过去的地方**(去把它背上);
+            //   · 被背时它**挂在某个厨师身上**、跟着人走, 是"某个厨师的属性", 不是地方。
+            //   而它的坐标**每帧重读**(`AppendRef` :277), 所以被背时坐标天然跟着人走 ——
+            //   这正是"从队友背上取料"不需要另建一条通道的原因。
+            //
+            // ☠☠ **状态走独立布尔键, 绝不能让 `Reclassify` 按它返回两个不同 typeName**:
+            //   那个返回值在 `AppendRef` 里**同时当 `id` 前缀和 `kind`**(本文件
+            //   `:typeName` 两处都用) —— 类型名一翻转, 同一个物理背包的 `id` 跟着翻,
+            //   Python 按 `id` 建的索引整片失效。这正是 `Reclassify` 注释里警告的那类事故
+            //   ("id 跟着抖")。形状照 `Terminal` 的 `session`: **类型名固定, 状态另给一个键**。
+            if (typeName == "Backpack")
+            {
+                try
+                {
+                    // 服务端那份是权威(和 `held` 同一个取舍); 纯客户端局面退回客户端那份。
+                    // 两者都有 `IsAttached()`(`IAttachment` 的成员, 各自实现)。
+                    var at = FindType("ServerPhysicalAttachment")
+                             ?? FindType("ClientPhysicalAttachment");
+                    var comp = at != null ? go.GetComponent(at) : null;
+                    if (comp != null)
+                    {
+                        var m = at.GetMethod("IsAttached", Type.EmptyTypes);
+                        bool worn = m != null && (bool)m.Invoke(comp, null);
+                        sb.Append(",\"worn\":").Append(worn ? "true" : "false");
+                    }
+                }
+                catch (Exception) { }
+            }
+
             // ---- 传送门: **配对** ----
             //
             // 传送门是**两两配对**的, 而配对信息就是 `Teleportal` 上的一个**直接引用**:
@@ -2267,6 +2350,75 @@ namespace Overcooked2AI.Game
                 }
             }
             catch (Exception) { }
+        }
+
+        /// <summary>读厨师**背挂点**上的东西(`PlayerAttachTarget.Back`) —— 返回物体名;
+        /// `spawn` 顺带给出**它出什么料**。拿不到 = ""。
+        ///
+        /// 为什么要单独一个(不能复用 `ReadFromCarrier`): 那个写死了 `Type.EmptyTypes`
+        ///   (无参重载 = `PlayerAttachTarget.Default` = **手**挂点)。背包在**背**挂点上,
+        ///   是 1 号槽 —— 只有 `ServerPlayerAttachmentCarrier.cs:105-108` 那个**带参重载**
+        ///   才读得到(`m_carriedObjects[(int)playerAttachTarget]`)。
+        ///   ⚠ `Type.GetMethod` **必须显式给参数类型数组**, 否则两个重载会抛
+        ///   `AmbiguousMatchException` —— 这个坑 `ReadFromCarrier` 的注释里记过一次
+        ///   (症状是 `held` 永远读成空串 → 脚本"拿了又放下", 被 `catch{}` 藏了很久)。
+        ///
+        /// ☠ **拿不到就返回空串, 绝不退化成"读手挂点"** —— 那会让"背上有没有背包"
+        ///   永远为真, 于是引擎会对着自己的手去掏料。
+        ///
+        /// 游戏机制(反编译): 背包是一个 `CarryableItem`, 背上之后它的拾取被 referral
+        ///   转给 `ServerBackpackDispenser`(`ServerBackpack.cs:57-68`) ⇒ 同一个物体、
+        ///   同一个键, "没背"是把它**背上**、"背了"是从里面**掏一份料**。分叉写在
+        ///   `ServerBackpack.CanBlockReferral`(`ServerBackpack.cs:47-50`, `!IsAttached()`)。
+        /// </summary>
+        private static void ReadBackItem(GameObject chefGo, out string item,
+                                         out string spawn)
+        {
+            item = "";
+            spawn = "";
+            try
+            {
+                if (chefGo == null)
+                    return;
+                // 服务端那份是权威(同 `ReadHeldItems` 的取舍); 纯客户端局面退回客户端那份。
+                var ct = FindType("ServerPlayerAttachmentCarrier")
+                         ?? FindType("ClientPlayerAttachmentCarrier");
+                if (ct == null)
+                    return;
+                var carrier = chefGo.GetComponentInChildren(ct);
+                if (carrier == null)
+                    return;
+                var targetType = FindType("PlayerAttachTarget");
+                if (targetType == null)
+                {
+                    _lastReflectErr = "ReadBackItem: 找不到 PlayerAttachTarget";
+                    return;
+                }
+                // ⚠ 显式给参数类型数组挑重载 —— 裸 `GetMethod("名字")` 会抛
+                //   `AmbiguousMatchException`(这个类有无参/带参两个同名重载)。
+                var m = ct.GetMethod("InspectCarriedItem", new Type[] { targetType });
+                if (m == null)
+                {
+                    _lastReflectErr = ct.Name + ".InspectCarriedItem(PlayerAttachTarget) 找不到";
+                    return;
+                }
+                // ☠ **按名字取枚举成员, 不硬编码 1** —— `PlayerAttachTarget` 是
+                //   `{ Default, Back, COUNT }`(`PlayerAttachTarget.cs`), 换版本不会错。
+                object back = Enum.Parse(targetType, "Back");
+                var obj = m.Invoke(carrier, new object[] { back }) as UnityEngine.Object;
+                if (obj == null)
+                    return;
+                var igo = obj as GameObject
+                          ?? (obj as Component != null ? (obj as Component).gameObject : null);
+                if (igo != null)
+                    spawn = SafeName(SpawnNameOf(igo));   // 它出什么料(判据只有那一份)
+                item = SafeName(obj.name);
+            }
+            catch (Exception ex)
+            {
+                // 不静默吞 —— 同 `ReadFromCarrier` 的教训(那个 bug 被 catch{} 藏过很久)
+                _lastReflectErr = "ReadBackItem: " + ex.GetType().Name + " " + ex.Message;
+            }
         }
 
         private static volatile string _lastReflectErr = "";

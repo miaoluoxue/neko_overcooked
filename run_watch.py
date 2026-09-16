@@ -22,18 +22,56 @@
   · 所以"从终端起脚本"这件事本身就破坏了前提 —— 前台被终端占了。
   ⇒ 启动时、以及**每次要按 A 之前**, 都调 `keyboard_input.activate_game()`
     (它用 `AttachThreadInput` 绕过"只有前台进程能改前台"的限制, `keyboard_input.py:286-313`)。
-  等引擎起来之后就不用管了: 那时 `runInBackground` 已经被打开, 放后台照样跑。
-  `NEKO_WATCH_FOCUS=0` 可关掉这个行为。
+  ⚠ **"等引擎起来就不用管了"只在两只都用手柄时成立** —— `runInBackground` 被打开的是
+    **游戏**, 而**键盘注入走的是 `SendInput`, 它只发给当前前台窗口**。
+    所以 `run_team.py --input keys,virtual`(一个键盘一个手柄)那种配置下,
+    **进对局之后仍然必须保持前台** —— 否则走键盘的那只当场不动。
+    ⇒ `NEKO_WATCH_KEEP_FOCUS=1` 开一个后台线程, 失焦就拽回来(见 `KEEP_FOCUS`)。
+    ☠ 它会**抢走你的焦点** —— 那是这个开关的意义, 不是副作用; 默认**关**。
+  `NEKO_WATCH_FOCUS=0` 可关掉"启动时/按 A 前"那两次切前台。
 
 ⚠ 桥是**长连接**: 建一条用到最后, **不写重连包装器** ——
   `tools/pathtest.py:20-22` 与 `README.md:78` 都明写: 桥的 `AcceptLoop`
   (`BridgeServer.cs:50-69`)一出异常就 `break`, 之后整个会话不再接新连接。
 
+## 参数本地化 —— 写一次, 以后直接跑
+
+每开一次终端都要 `set` 一串环境变量, 忘一个就跑成另一个配置, 而**跑错配置的代价
+是一整局**。所以参数可以从 **`runtime/watch.local`**(`runtime/` 是 gitignore 的)读:
+
+```ini
+# 每行 KEY=VALUE; # 开头是注释
+NEKO_WATCH_CHILD=run_team.py --input keys,virtual
+NEKO_PLAN=on
+NEKO_WATCH_KEEP_FOCUS=1
+```
+
+☠ **显式设的环境变量优先于这个文件**(走 `setdefault`) —— 临时改一格
+(`set NEKO_PLAN=shadow`) 仍然管用, 不用去动文件。路径可用 `NEKO_WATCH_LOCAL` 换。
+
 环境变量:
+  `NEKO_WATCH_KEEP_FOCUS` **持续把游戏拽回前台**(默认 0)。见下面那条。
+  `NEKO_WATCH_KEEP_FOCUS_EVERY` 拽前台的重试间隔秒(默认 2.0)
   `NEKO_WATCH_INTERVAL`  轮询间隔秒(默认 2.5)
   `NEKO_WATCH_MISSES`    "对局结束"要连续几次读不到 `inRound` 才算(默认 3, 防抖)
   `NEKO_WATCH_HEARTBEAT` 无变化时的心跳间隔秒(默认 30; `0` = 不打)
   `NEKO_WATCH_PY`        子进程用的解释器(默认 `sys.executable`)
+  `NEKO_WATCH_CHILD`     要拉起**哪个**子脚本(+ 参数), 空格分隔(默认 `run_engine.py`)。
+
+## 它同时是 `run_team.py` 的看护
+
+看护这套逻辑(**轮询大厅 / 缺 P2 就补 / 进对局拉起 / 对局结束 `CTRL_BREAK` 收掉 /
+一局一连**)**和跑哪个子脚本无关** —— 唯一的差别就是那段 `argv`。所以这里是**参数化**,
+不是复制一份出来(本项目为"同一件事两处各写一份"栽过两次)。
+
+```bat
+:: 双人(两个引擎跑在**同一个进程**的两个线程里, 所以还是一个子进程)
+set NEKO_WATCH_CHILD=run_team.py --input virtual
+python -u run_watch.py
+```
+
+⚠ 双人**必须**带 `--input virtual`: 键盘注入要求游戏在最前台, 而看护拉起子进程之后
+  自己就不再抢焦点了(`runInBackground` 那时已经被虚拟手柄打开, 放后台照样跑)。
 """
 
 from __future__ import annotations
@@ -42,10 +80,70 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 
 _ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(_ROOT, "neko"))
+
+
+def _load_local_config() -> str:
+    """**把本机参数本地化** —— 从 `runtime/watch.local` 读 `KEY=VALUE` 填进环境变量。
+
+    为什么要它(用户 2026-09-16: "将参数本地化"): 每开一次终端都要 `set` 一串环境变量
+    (`NEKO_WATCH_CHILD=run_team.py --input keys,virtual`、`NEKO_PLAN=on`、焦点策略…),
+    忘一个就跑成另一个配置 —— 而**跑错配置的代价是一整局**。
+    ⇒ 写一次在文件里, 以后直接 `python -u run_watch.py`。
+
+    · 路径: `runtime/watch.local`(`NEKO_WATCH_LOCAL` 可改; `runtime/` 是 **gitignore** 的)。
+    · 格式: 每行 `KEY=VALUE`, `#` 开头或空行忽略。**值里的 `=` 原样保留**
+      (所以 `NEKO_WATCH_CHILD=run_team.py --input virtual` 这种带参数的写法没问题)。
+    · ☠ **用 `setdefault`**: 显式设过的环境变量**优先于文件** —— 临时改一格
+      (`set NEKO_PLAN=shadow`) 仍然管用, 不用去动文件。
+    · **文件不存在 / 读不动 ⇒ 静默跳过**(它不是必需项; 打一行日志就够)。
+    """
+    path = os.environ.get("NEKO_WATCH_LOCAL") or os.path.join(_ROOT, "runtime", "watch.local")
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except Exception:                                              # noqa: BLE001
+        return ""
+    n = 0
+    for k, v in parse_local_config(text).items():
+        # ☠ `setdefault` 的语义: **已经设过的不动** ⇒ 显式环境变量优先(见 docstring)。
+        if k not in os.environ:
+            os.environ[k] = v
+            n += 1
+    return path if n else ""
+
+
+def parse_local_config(text: str) -> dict:
+    """`KEY=VALUE` 文本 → dict。**纯函数**(探针直接喂字符串验)。
+
+    规则(都很容易写错, 所以单独拎出来):
+      · `#` 开头 / 空行 ⇒ 忽略;
+      · **值里的 `=` 原样保留**(`split("=", 1)`) —— 否则
+        `NEKO_WATCH_CHILD=run_team.py --input virtual` 会被截断;
+      · 两边空白去掉(**值里的空格保留** —— `--input keys,virtual` 那个空格是参数分隔);
+      · 没有 `=` 的行 ⇒ 忽略(不报错: 配置文件写歪了不该让看护起不来)。
+
+    ⚠ **副作用提醒**: 本模块在 **import 时**就会把配置灌进 `os.environ`。
+      探针/工具 import 它的话环境会被改(实测无碍: 只有 `_watch_probe` import 它,
+      而那个探针不碰规划器)。要干净的隔离就用 `NEKO_WATCH_LOCAL=0`。
+    """
+    out = {}
+    for ln in (text or "").splitlines():
+        ln = ln.strip()
+        if not ln or ln.startswith("#") or "=" not in ln:
+            continue
+        k, v = ln.split("=", 1)
+        k, v = k.strip(), v.strip()
+        if k:
+            out[k] = v
+    return out
+
+
+_LOCAL_CFG = _load_local_config()
 
 from bridge import keyboard_input as ki                       # noqa: E402
 from bridge.client import BridgeClient, BridgeError           # noqa: E402
@@ -61,6 +159,49 @@ READ_FAILS = int(os.environ.get("NEKO_WATCH_READ_FAILS") or 5)
 STOP_TIMEOUT = float(os.environ.get("NEKO_WATCH_STOP_TIMEOUT") or 30.0)
 #: 要不要在启动时 / 按 A 之前把游戏切到前台。见模块 docstring 里那条**前提**。
 FOCUS = (os.environ.get("NEKO_WATCH_FOCUS") or "1") not in ("0", "", "false", "False")
+#: **持续把游戏拽回前台**(`NEKO_WATCH_KEEP_FOCUS=1`, 默认 0)。
+#:
+#: 为什么需要它(2026-09-16, 用户: "可以持续保持前台"):
+#:   `FOCUS` 只管**两个时刻** —— 启动时、以及每次要按 A 之前。进对局**之后**就不管了,
+#:   那条假设是"虚拟手柄已经把 `runInBackground` 打开了, 放后台照样跑"。
+#:   可**只要有厨师走键盘注入, 那条就不成立** —— `SendInput` 只发给**当前前台窗口**:
+#:     · `run_team.py --input keys,virtual`(一个键盘一个手柄) ⇒ P1 走键盘 ⇒ **必须前台**;
+#:     · 跑这一局时你要是切出去看一眼别的东西, P1 那一只就**当场不动了**。
+#:   ⇒ 开了这个之后, 后台线程每隔几秒看一眼, 一失焦就拽回来。
+#: ☠ **它会真的抢走你的焦点** —— 这是这个开关的**全部意义**, 不是副作用。
+#:   不想要就别开(默认就是关的)。
+KEEP_FOCUS = (os.environ.get("NEKO_WATCH_KEEP_FOCUS") or "0") not in ("0", "", "false", "False")
+#: 拽前台的重试间隔(秒)。太快会和你抢鼠标, 太慢则键盘厨师会白等一段。
+KEEP_FOCUS_EVERY = float(os.environ.get("NEKO_WATCH_KEEP_FOCUS_EVERY") or 2.0)
+#: 要拉起的子脚本 + 参数(**空格分隔**)。默认单引擎。
+#:
+#: 为什么是参数而不是复制一份 `run_team_watch.py`: 看护那套(轮询/补 P2/拉起/收尾/
+#: 一局一连)和跑哪个子脚本**无关**, 唯一的差别就是这几行 `argv`。
+#: 两份文件迟早会漂开 —— 而这个仓库为"同一件事两处各写一份"栽过两次。
+#: ⚠ **双人必须带 `--input virtual`**: `run_team.py` 默认 `keys`(键盘注入)要求游戏在
+#:   最前台, 而看护拉起子进程之后就不再抢焦点了。
+CHILD = (os.environ.get("NEKO_WATCH_CHILD") or "run_engine.py").split()
+
+
+def _argv_of(child: list, py: str, root: str) -> list:
+    """把 `CHILD`(脚本 + 参数)拼成完整的命令行。**空列表 ⇒ 返回空**(调用方报错)。
+
+    为什么提成纯函数: `CHILD` 是 **import 时**读的环境变量, 探针改不动它 ——
+    而"参数怎么拼"恰好是最容易写错的一处(少个 `-u`、把参数当脚本名…)。
+    提出来之后 `runtime/_watch_probe.py` 能直接喂字符串验。
+    """
+    if not child:
+        return []
+    return [py, "-u", os.path.join(root, child[0])] + list(child[1:])
+
+
+def _child_label(argv) -> str:
+    """日志里管这个子进程叫什么。双人时说"引擎"会让人以为是单只。"""
+    return "双人" if any("run_team" in str(c) for c in (argv or ())) else "引擎"
+
+
+#: 日志里叫它什么 —— 见 `_child_label`。⚠ 必须排在函数**之后**定义。
+CHILD_LABEL = _child_label(CHILD)
 
 
 def focus_game(log=print, when: str = "", quiet_if_already: bool = True) -> bool:
@@ -81,6 +222,43 @@ def focus_game(log=print, when: str = "", quiet_if_already: bool = True) -> bool
     log("[看护] " + (f"✓ 已把游戏切到前台({when})" if ok
                      else f"⚠ 没能把游戏切到前台({when}) —— 大厅里按 A 可能不生效"))
     return ok
+
+
+def start_keep_focus(log=print):
+    """**持续把游戏拽回前台**的后台线程 —— 见 `KEEP_FOCUS`。不开就返回 `None`。
+
+    ⚠ 只做一件事: **失焦就 `activate_game()`**。用的就是 `focus_game` 那一个
+      (模块 docstring 里"只有前台进程能改前台"那条的同一把钥匙)。
+    ⚠ **只在真的拽回来时打日志**, 而且**失败要节流** —— 每 2 秒刷一行会把日志淹掉,
+      而这份日志是要拿来对照 `[规划]`/`[引擎]` 的。
+    """
+    if not KEEP_FOCUS:
+        return None
+
+    def _loop():
+        fails = 0
+        while True:
+            time.sleep(KEEP_FOCUS_EVERY)
+            try:
+                if ki.game_focused():
+                    fails = 0
+                    continue
+                if ki.activate_game():
+                    fails = 0
+                    log("[看护] 🔒 游戏失焦 —— 已拽回前台")
+                else:
+                    fails += 1
+                    if fails in (1, 10, 100):
+                        log(f"[看护] ⚠ 失焦了但**拽不回来**(第 {fails} 次) —— "
+                            f"键盘注入只发给前台窗口, 那一只会不动")
+            except Exception as e:                                 # noqa: BLE001
+                fails += 1
+                if fails in (1, 10, 100):
+                    log(f"[看护] ⚠ 拽前台报错(第 {fails} 次): {e!r}")
+
+    t = threading.Thread(target=_loop, daemon=True, name="keepfocus")
+    t.start()
+    return t
 
 
 #: `subprocess.CREATE_NEW_PROCESS_GROUP` —— 让子进程**不**接收控制台的 Ctrl+C。
@@ -288,48 +466,63 @@ class ChildEngine:
     def start(self) -> None:
         if self.p is not None:
             # 上一只还赖着没退(收尾超时) —— **不并起第二个**, 否则两只抢同一个厨师
-            self.log(f"[看护] ⚠ 上一只引擎还没退(pid={self.p.pid}) —— 先不起新的")
+            self.log(f"[看护] ⚠ 上一只{CHILD_LABEL}还没退(pid={self.p.pid}) —— 先不起新的")
             return
         py = os.environ.get("NEKO_WATCH_PY") or sys.executable
-        argv = [py, "-u", os.path.join(_ROOT, "run_engine.py")]
+        # `CHILD[0]` = 脚本名, 其余 = 它的参数(见 `CHILD` 的注释)。
+        argv = _argv_of(CHILD, py, _ROOT)
+        if not argv:
+            self.log("[看护] ✗ NEKO_WATCH_CHILD 是空的 —— 不知道要起什么")
+            return
         try:
             self.p = subprocess.Popen(
                 argv, cwd=_ROOT, creationflags=CREATE_NEW_PROCESS_GROUP)
         except Exception as e:                                     # noqa: BLE001
-            self.log(f"[看护] ✗ 起引擎失败: {e!r}")
+            self.log(f"[看护] ✗ 起{CHILD_LABEL}失败: {e!r}")
             self.p = None
             return
-        self.log(f"[看护] ▶ 起引擎 pid={self.p.pid} ({os.path.basename(py)}) —— "
-                 f"下面开始是它的日志")
+        # ⚠ 打的是**你配置里写的那一行**(`CHILD`), 不是原始 argv ——
+        #   后者带着 `-u` 和脚本的绝对路径, 对着 `watch.local` 核不上。
+        self.log(f"[看护] ▶ 起{CHILD_LABEL} pid={self.p.pid}: "
+                 f"{' '.join(CHILD)} —— 下面开始是它的日志")
 
     def stop(self, why: str) -> None:
         if self.p is None:
             return
         if self.p.poll() is not None:
-            self.log(f"[看护] 引擎已退出(码={self.p.returncode}), {why}")
+            self.log(f"[看护] {CHILD_LABEL}已退出(码={self.p.returncode}), {why}")
             self.p = None
             self._stop_at = None
             return
         if self._stop_at is None:
             self._stop_at = time.time()
-            self.log(f"[看护] ⏹ 收掉引擎({why}) —— 发 CTRL_BREAK(等价 Ctrl+C), "
+            self.log(f"[看护] ⏹ 收掉{CHILD_LABEL}({why}) —— 发 CTRL_BREAK(等价 Ctrl+C), "
                      f"等它自己 uninstall 完")
             try:
                 os.kill(self.p.pid, signal.CTRL_BREAK_EVENT)
             except Exception as e:                                 # noqa: BLE001
                 self.log(f"[看护] ⚠ 发 CTRL_BREAK 失败: {e!r}(会继续等它自己退)")
         if time.time() - self._stop_at > STOP_TIMEOUT:
-            self.log(f"[看护] ⚠ 等了 {STOP_TIMEOUT:.0f}s 引擎还没退(pid={self.p.pid}) —— "
+            self.log(f"[看护] ⚠ 等了 {STOP_TIMEOUT:.0f}s {CHILD_LABEL}还没退(pid={self.p.pid}) —— "
                      f"**不 kill**(kill 会把虚拟手柄留在游戏里, 那只厨师就废了直到重启游戏)。"
                      f"要么它自己缓过来, 要么你手动关掉它。")
             self._stop_at = time.time()      # 重新计时, 别刷屏
 
 
 def main() -> int:
+    # ⚠ **必须在任何输出之前**(见 `neko/logfile.py`)。它同时会把解析出来的路径写回
+    #   `NEKO_LOG` —— 下面 `ChildEngine` 起的 `run_engine.py` 继承环境变量, 于是
+    #   **父子两个进程写同一个文件**, `[看护]` 和 `[引擎]`/`[规划]` 落在同一份日志里。
+    from logfile import enable
+    enable()
     log = lambda m: print(m, flush=True)                           # noqa: E731
-    log("[看护] 启动 —— 轮询游戏状态, 缺 P2 就补, 进对局拉起 run_engine.py")
+    log(f"[看护] 启动 —— 轮询游戏状态, 缺 P2 就补, 进对局拉起 {CHILD[0]}")
     log(f"[看护] 间隔 {INTERVAL}s / 对局结束要连续 {MISSES} 次读不到 / "
         f"心跳 {HEARTBEAT:.0f}s;   Ctrl+C 收工")
+    # 本地化参数的来路 —— 读到了就要**说出来**, 否则"为什么这个配置生效了"没法查。
+    if _LOCAL_CFG:
+        log(f"[看护] 已读本机配置 {_LOCAL_CFG}(显式设的环境变量优先于它)")
+    log(f"[看护] 子脚本: {' '.join(CHILD)}")
     b = BridgeClient()
     log(f"[看护] 连桥... (retries=999, **不做重连**)")
     try:
@@ -340,6 +533,12 @@ def main() -> int:
     log("[看护] ✓ 桥已连上(游戏没开时这里会一直等)")
     # 桥通了 ⇒ 游戏窗口一定在 ⇒ 现在就把前台切过去(否则大厅里按 A 不生效, 见模块 docstring)。
     focus_game(log, when="启动", quiet_if_already=False)
+    # **持续保持前台**(`NEKO_WATCH_KEEP_FOCUS=1`) —— 键盘注入只发给前台窗口,
+    # 而 `focus_game` 只管"启动时"和"按 A 之前"两个时刻, 进对局之后就不管了。
+    if start_keep_focus(log) is not None:
+        log(f"[看护] 🔒 持续保持前台: 开着(每 {KEEP_FOCUS_EVERY:.1f}s 检查一次失焦) —— "
+            f"**它会抢走你的焦点, 这是这个开关的意义**; 不想要就 "
+            f"`set NEKO_WATCH_KEEP_FOCUS=0`")
 
     eng = ChildEngine(log=log)
 

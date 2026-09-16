@@ -47,10 +47,16 @@ _KIND_SEM = {
     "cannon": "cannon",               # 大炮
     "pushableobject": "pushable",     # 可推物体(会把厨师推开)
     "cookingregion": "cooking_region",
-    # 生成器 = 食材箱 / 分发器
-    "pickupitemspawner": "crate",
-    "attachitemspawner": "crate",
-    "placementitemspawner": "crate",
+    # 背包: **可移动的食材箱**(DLC09 `s_festivemashup_1_3`)。
+    # 机制(反编译): 两个厨师各背一个, 各自从**对方背上**取料 —— 于是它有两种身份:
+    #   · 没被背(`worn == False`) ⇒ 它是一个**能走过去的地方**(走过去按拾取把它背上);
+    #   · 被背(`worn == True`)    ⇒ 它挂在某个厨师身上、跟着人走, 是"**某个厨师的属性**"。
+    # ☠ **语义绝不能复用 `crate`** —— `find_source`(本文件 :677)只在 `of("crate")` 里找,
+    #   而背包不是"走得到的箱子": 被背时它的坐标每帧跟着人跑, 混进 crate 会让货源解析
+    #   挑到一个**移动的**"箱子"却按静态台面去规划。
+    # ⚠ C# 侧 `StationTypes` 里 `Backpack` **必须排在 `PickupItemSpawner` 之前** ——
+    #   背包身上同时挂着那个组件, 而 `Reclassify` 是先命中者赢(见那边的注释)。
+    "backpack": "pack",
     # 危险物
     "firehazard": "hazard",
     "splathazard": "hazard",
@@ -204,6 +210,15 @@ class Station:
     #: 它驾驶的是哪个物体(`Terminal.m_pilotableObject` 的名字) —— 用来跟 dyn 里的
     #: platforms 表对上, 从而知道"平台现在在哪一格"。
     pilots: str = ""
+    # ---- 背包(kind == "Backpack")专属 ----
+    #: **现在有没有被人背着**(C# 读 `ServerPhysicalAttachment.IsAttached()`)。
+    #: 机制: 背包是"两种含义共用一个物体"—— 没被背时按拾取是**把它背上**,
+    #: 被背时按拾取是**从里面掏一份料**(referral 被转给 dispenser)。
+    #: 判据在 `ServerBackpack.CanBlockReferral: !m_attachment.IsAttached()`。
+    #: ⚠ `x/z` 是**每帧重读**的(C# `AppendRef` 不缓存坐标) ⇒ 被背时坐标天然跟着人走;
+    #:   所以"从队友背上取料"不需要另建通道, 但**也不能把它当成静止的台面**去规划。
+    #: 老 dll 没这字段 → 默认 False(当成"没被背", 退回老行为)。
+    worn: bool = False
 
     @property
     def paired(self) -> bool:
@@ -254,6 +269,14 @@ class Chef:
     z: float
     held: str = ""             # 手上拿着什么
     player: str = ""           # 归属玩家(Player.One/Two) —— 决定该发哪套键盘
+    #: **背上挂着什么**(`PlayerAttachTarget.Back` 那个槽位, 见 C# `ReadBackItem`)。
+    #: DLC09 的背包机制全靠它: 两个厨师各背一个, 各自从**对方背上**取料。
+    #: ⚠ 这是"谁背着哪个背包"的**权威连接** —— 别拿坐标去猜(C# 那边背包的坐标虽然
+    #:   每帧跟着人走, 但"跟着谁"只能靠这个字段, 规则 2: 拿不准问游戏)。
+    back: str = ""
+    #: 背上那个背包**出什么料**(`PickupItemSpawner.m_itemPrefab`)。
+    #: 用来判"队友背上这个背包能不能出我要的那份" —— 别拿 `back` 的名字去猜。
+    backspawn: str = ""
 
 
 @dataclass
@@ -603,12 +626,15 @@ class KitchenMap:
                 recv_delay=float(s.get("recvDelay", 0) or 0),
                 active=bool(s.get("active", True)),
                 session=bool(s.get("session", False)),
-                pilots=s.get("pilots", "") or "")
+                pilots=s.get("pilots", "") or "",
+                worn=bool(s.get("worn", False)))
         for i, c in enumerate(layout.get("chefs") or []):
             km.chefs.append(Chef(
                 id=int(c.get("id", i)), name=c.get("name", f"P{i}"),
                 x=float(c.get("x", 0)), z=float(c.get("z", 0)),
-                held=c.get("held", ""), player=c.get("player", "")))
+                held=c.get("held", ""), player=c.get("player", ""),
+                back=c.get("back", "") or "",
+                backspawn=c.get("backspawn", "") or ""))
         for m in _aslist(layout.get("movers"), "movers"):
             km.movers.append(Mover(
                 name=m.get("name", ""), kind=m.get("kind", ""),
@@ -667,6 +693,37 @@ class KitchenMap:
 
     def sorted_by_dist(self, sem: str, x: float, z: float) -> list:
         return sorted(self.of(sem), key=lambda s: (s.x - x) ** 2 + (s.z - z) ** 2)
+
+    # ---------------------------------------------------------------- 背包
+    def packs_resting(self) -> list:
+        """**没被人背着**的背包 —— 它们此刻是**能走过去的地方**(去把它背上)。
+
+        为什么要和"被背的"分开(用户 2026-09-16 定的形状):
+          · 没被背 ⇒ 按拾取键是**把它背上**(`ServerBackpack.cs:70-82`);
+          · 已被背 ⇒ 按拾取键是**从里面掏一份料**(referral 转给 dispenser)。
+        同一个物体、同一个键, 两种含义 —— 判据就是 `worn`。
+        """
+        return [s for s in self.of("pack") if not s.worn]
+
+    def packs_worn(self) -> list:
+        """**已经被背着**的背包 —— 坐标跟着人走, 是"某个厨师的属性"而不是地方。
+
+        ⚠ 别拿它们的 `x/z` 当静态坐标做规划: 那是**读快照那一刻**的位置。
+        "这一趟走到那儿"能不能成, 由 `_aim_ok`(游戏自己报的交互目标)裁 —— 规则 2。
+        """
+        return [s for s in self.of("pack") if s.worn]
+
+    def pack_yielding(self, ing_name: str) -> list:
+        """被背着的背包里, **出这项料**的那些 —— `backspawn` 精确比(归一化)。
+
+        为什么要单独一个(不拿 `back` 的名字去猜): `back` 是**背包的物体名**,
+        而我们要的是**它出什么料** —— 两者是不同的字段(`PickupItemSpawner.m_itemPrefab`)。
+        实测教训同源: 名字里凑巧带目标词的东西会被误判(见 `find_source` 的模糊层)。
+        """
+        key = _norm_name(ing_name)
+        if not key:
+            return []
+        return [s for s in self.packs_worn() if _norm_name(s.spawn) == key]
 
     def chef(self, cid: int) -> Optional[Chef]:
         for c in self.chefs:
