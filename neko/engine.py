@@ -2561,7 +2561,7 @@ class Engine:
         return _GroundItem(it)
 
     def _fetch_source_live(self, km, st, op, x: float, z: float,
-                           tm=None, reach=None) -> Station | None:
+                           tm=None, reach=None, me_back=None) -> Station | None:
         """**实时**解析"这一步该去哪儿取 `op.target`" —— 三个来源里**最近的、够得着的**那个。
 
         三个来源(**规则只有这一份**, 评分和执行都走它):
@@ -2611,7 +2611,16 @@ class Engine:
         #   出这份料, 那走箱子本来就是对的(还更省一趟)。
         # ⚠ `exclude_back` = **我自己背着的那个** —— 自己背的取不了, 见
         #   `_nearest_worn_pack` 里那段实测账(2026-09-16 一局报废就是它)。
-        _my_back = (self.chef(st or {}) or {}).get("back") or ""
+        # ☠☠ **"我"是谁必须能由调用方指定**(2026-09-17 修): 规划器要问的是
+        #   "**P2** 能不能从 P1 背上掏" —— 而这里原来硬取 `self.chef(st)`(**本引擎
+        #   那个厨师**, 即 P1)的背 ⇒ 永远算出"那是 P1 自己背的, 不能掏" ⇒
+        #   规划器那条"**队友替我掏**"的路**恒推不出来**。
+        #   这正是 `s_festivemashup_1_3` 的场景("P2 从我背上掏、再传给我")——
+        #   它和 `pass` 那道站位闸门**叠在一起**, 两道都要修才通。
+        # ⚠ `me_back=None`(默认) ⇒ **逐字退回老行为**(本引擎厨师的背) ——
+        #   执行期与所有老调用方一个字都不变。
+        _my_back = ((self.chef(st or {}) or {}).get("back") or "") \
+            if me_back is None else me_back
         pack = self._nearest_worn_pack(km, op.target, x, z,
                                        exclude_back=_my_back)
         if pack is not None:
@@ -6945,7 +6954,7 @@ class Engine:
         return ox, oz, held, still, bool(self.teammate_is_human)
 
     def _op_target_for_score(self, km, st, op, x: float, z: float,
-                             tm=None, reach=None):
+                             tm=None, reach=None, me_back=None):
         """给评分用: 这一步"要去哪儿" —— 返回 `((tx,tz), label)` 或 `(None, 原因)`。
 
         ⚠ **只调 `do_op` 用的那些同一个 helper**, 一行判定规则都不抄。
@@ -6969,7 +6978,8 @@ class Engine:
             #   需要的食材" ⇒ **脚边就有的别跑去开箱子**)。计划坐标是 `find_source`
             #   按距离挑的, 它**看不见台面上/地上的现货** —— 于是"地上躺着一块要用的料,
             #   脚本径直去了箱子"(实机被用户抓到)。
-            _live = self._fetch_source_live(km, st, op, x, z, tm=tm, reach=reach)
+            _live = self._fetch_source_live(km, st, op, x, z, tm=tm, reach=reach,
+                                            me_back=me_back)
             if _live is not None:
                 return (_live.x, _live.z), (getattr(_live, "id", "") or op.at_name or "?")
             tgt = (op.at_x, op.at_z) if (op.at_x or op.at_z) else None
@@ -6977,7 +6987,8 @@ class Engine:
                 if self._stand_cell_of(tm, tgt[0], tgt[1], x, z,
                                        ortho_only=True, reach=reach) is not None:
                     return tgt, (op.at_name or "?")
-                s = self._fetch_source_live(km, st, op, x, z, tm=tm, reach=reach)
+                s = self._fetch_source_live(km, st, op, x, z, tm=tm, reach=reach,
+                                            me_back=me_back)
                 if s is not None:
                     _k = (op.action, op.target, s.id)
                     if _k not in self._src_swap_told:       # 每个决策点都会走到这里, 别刷屏
@@ -6990,7 +7001,8 @@ class Engine:
                               f"也没有别的够得着的货源")
             if tgt is None:
                 # 计划里压根没有货源坐标 —— 再现场找一次(箱子可能刚刷出来/知识表没认出来)
-                s = self._fetch_source_live(km, st, op, x, z, tm=tm, reach=reach)
+                s = self._fetch_source_live(km, st, op, x, z, tm=tm, reach=reach,
+                                            me_back=me_back)
                 if s is not None:
                     return (s.x, s.z), s.id
                 return None, "无货源坐标(现场也没找到能出它的箱子/台面)"
@@ -7539,9 +7551,21 @@ class Engine:
                 # ☠☠ **`flow` 的语义变了**(按步协作, D2): 从"本单"变成"**这一个候选所属的单**"
                 #   —— 池跨订单之后, 每个候选的菜谱/依赖/货源都可能是别的单的。
                 #   ⇒ 这里传 `flow_of[i]`; 老调用方(不传 `flow_of`)逐字不变。
+                # ☠☠ **`flow_of` 必须带长度守卫**(2026-09-17 修): 四条平行表**只覆盖
+                #   菜谱段**(长度 == `n_recipe`), 而 `pending` 里**含杂活下标**
+                #   (`>= n_recipe`) —— 杂活是之后在 `_execute_scored` 里拼到池尾的
+                #   (`pool = ops + chores`), 平行表**不跟着加长**。
+                #   ⇒ 漏了守卫就是 **`IndexError`** ⇒ 一路冒到 `run_team.py` 的 worker
+                #     `except` ⇒ **那个厨师的线程直接死**。
+                #   ☠ 触发面很大: `COOP` 开 + 池里 **≥2 张单** + 这一轮**有任一杂活**,
+                #     而 `_rescues`(救锅)/`_tends`(到点取菜)**不受 `NEKO_CHORES` 管**
+                #     ⇒ 跨单的第一次实机必然撞上。离线 45 个探针**一个都没跑到这块**
+                #     (集成层没有专属探针, 见 `sleepy-riding-liskov.md` 的账)。
+                #   ⚠ 另外三处引用平行表的地方**本来就有**同样的守卫
+                #     (`_op_actionable:7157` / D3 切位 `:8449`) —— 只有这里漏了。
+                _f_i = (flow_of[i] if (flow_of is not None and i < len(flow_of)) else flow)
                 out[i] = self._feasible(km, st, ops[i], i, cx, cz, held, tm, my_reach,
-                                        ops, pending,
-                                        (flow_of[i] if flow_of else flow),
+                                        ops, pending, _f_i,
                                         mate=mate, strict=strict,
                                         steps=steps, flow_of=flow_of)
             return out
@@ -8853,7 +8877,7 @@ class Engine:
                                        extra_edges=edges) if (tm is not None and tm.ok) else None
             except Exception:                                      # noqa: BLE001
                 rc = None
-            views[c.id] = (c.x, c.z, c.held or "", rc)
+            views[c.id] = (c.x, c.z, c.held or "", getattr(c, "back", "") or "", rc)
 
         ops_all = list(getattr(flow, "ops", None) or [])
         mate = self._mate(st)
@@ -8871,9 +8895,9 @@ class Engine:
             v = views.get(chef)
             if v is None:
                 return False, f"没有 P{chef+1} 这个厨师", None
-            if tm is None or not getattr(tm, "ok", False) or v[3] is None:
+            if tm is None or not getattr(tm, "ok", False) or v[4] is None:
                 return False, "地形不可用, 规划期判不了", None
-            cx, cz, held, reach = v
+            cx, cz, held, back, reach = v
             if assume_held is not None:
                 held = assume_held
             # 假设步骤表: 把这一步接到链尾, 前面的都当"还没做完" ——
@@ -8881,9 +8905,13 @@ class Engine:
             scratch = ops_all + [op]
             idx = len(scratch) - 1
             steps = list(range(len(scratch)))
+            # ☠☠ **`back=` 不能漏**(2026-09-17 修): 规划器问的是"**P2** 能不能从 P1
+            #   背上掏", 而 `_fetch_source_live` 原来硬取**本引擎那个厨师**的背 ⇒
+            #   永远算出"那是 P1 自己背的" ⇒ "队友替我掏"那条路恒推不出来。
+            #   这里把**被评估那个厨师**的背传下去。
             r = self._feasible(km, st, op, idx, cx, cz, held, tm, reach,
                                scratch, steps, flow, mate=mate, strict=True,
-                               steps=steps)
+                               steps=steps, back=back)
             # ☠☠ **格距必须自己查 `reach` —— `_feasible` 返回的 `dist` 是个占位 `None`。**
             #   真正的格距是 `_rank_candidates` **事后**填的:
             #       d = my_reach.get(r["cell"]) ...; r["dist"], r["follow"] = d, follow
@@ -9283,6 +9311,20 @@ class Engine:
                         slot_of.append(_slot)
                         t_of.append(_t)
                         step_of.append(_idx[_n] if _n < len(_idx) else _n)
+                # ☠☠ **形状守卫**(2026-09-17): 四条平行表**只覆盖菜谱段**, 长度必须
+                #   `== len(ops) == n_recipe` —— 杂活是之后在 `_execute_scored` 里才拼到
+                #   池尾的(`pool = ops + chores`), **平行表不跟着加长**。
+                #   ⇒ 下游**任何按池下标读平行表的地方都必须自己守卫**
+                #     (`_op_actionable:7157` / `evaluate` / D3 切位 —— 三处同款)。
+                #   ☠ 为什么要把它钉成断言而不是"记得加守卫": 漏一处就是
+                #     **`IndexError` ⇒ 整个厨师线程死**, 而离线的 45 个探针**一个都没跑到
+                #     集成层那块**(见 `sleepy-riding-liskov.md` 的账)。
+                #     宁可在这里当场炸出**说人话**的一行, 也不要让它在池子里随机炸。
+                _n_all = len(_all)
+                assert len(flow_of) == len(slot_of) == len(t_of) == len(step_of) == _n_all, (
+                    f"平行表形状不一致: flow_of={len(flow_of)} slot_of={len(slot_of)} "
+                    f"t_of={len(t_of)} step_of={len(step_of)} vs ops={_n_all} —— "
+                    f"四条表必须与菜谱段等长(杂活段不 pad)")
                 ops = _all
                 total = len(ops)
                 self.log(f"[订单] 池里 {len(_pool[:COOP_ORDERS])} 张单 / {total} 步"
@@ -9561,7 +9603,8 @@ class Engine:
         return None
 
     def _feasible(self, km, st, op, i, cx, cz, held, tm, reach, ops, pending, flow,
-                  mate=None, strict: bool = True, steps=None, flow_of=None) -> dict:
+                  mate=None, strict: bool = True, steps=None, flow_of=None,
+                  back=None) -> dict:
         """**这一步现在可行吗** —— 一次算齐"去哪儿 / 做不做得了 / 为什么不行 / 站哪个格"。
 
         这是"**可信验证**"的**唯一入口**。用户 2026-09-15 定的形状:
@@ -9591,7 +9634,13 @@ class Engine:
 
         ⚠ 只**读**世界, 不动任何状态(和 `_op_target_for_score` 同一个约束)。
         """
-        target, label = self._op_target_for_score(km, st, op, cx, cz, tm=tm, reach=reach)
+        # ⚠ `me_back` **只在有值时传**(同 `flow_of` 的纪律): 老调用方/离线桩的子类
+        #   可能还没这个形参(`_splitkitchen_probe` 就覆写了 `_op_target_for_score`)——
+        #   不传 ⇒ 那条路**逐字退回老行为**, 也不会把桩炸掉。
+        #   ⚠ 执行期走的就是"不传"(= 本引擎厨师的背), 行为一个字都不变。
+        _tb = {"me_back": back} if back is not None else {}
+        target, label = self._op_target_for_score(km, st, op, cx, cz, tm=tm, reach=reach,
+                                                  **_tb)
         # ⚠ `flow_of` **只在有值时传**(按步协作): 老调用方/离线桩的子类可能还没有这个
         #   形参(`_splitkitchen_probe` 就自己覆写了 `_op_actionable`)——
         #   不传 ⇒ 那条路**逐字退回老行为**, 也不会把桩炸掉。
@@ -9599,15 +9648,31 @@ class Engine:
         ok, why = self._op_actionable(km, st, op, cx, cz, held, strict=strict,
                                       idx=i, ops=ops, pending=pending, flow=flow,
                                       steps=steps, **_extra)
-        if target is None and not why:
+        # ☠ **传球那条路不吃 `target`** —— 见下面 `cell` 那段长注释。
+        #   提到这里是因为**上面那句 `why = label`** 也要看它: 成功了却挂一句
+        #   `"传球: 没解析到队友位置"` 会把下一局读日志的人**直接带偏**。
+        _pass_ok = (op.action == "pass" and mate is not None)
+        if target is None and not why and not _pass_ok:
             # ☠ `_op_target_for_score` 的**"为什么解析不到目标"**就装在 `label` 里
             #   (如 "够不着: 计划货源@12.0,-6.0, 也没有别的够得着的货源")。
             #   不搬到 `why` 就会被日志丢掉, 表里只剩一句干巴巴的"够不着" ——
             #   而那正是"该去查哪个坐标/哪个箱子"的唯一线索(§5.1: 算了就要用)。
             why = label
         cell = None
-        if ok and target is not None:
-            if op.action == "pass" and mate is not None:
+        # ☠☠ **传球**那条路**不吃 `target`**(2026-09-17 修): 它的站位格由 `_throw_spot`
+        #   拿**队友的实时坐标**算, **根本不读 `op.at_x/at_z`**。而**规划器构造的
+        #   `pass` 步不填那两个字段**(`planner.py:380` / `:399`) ⇒ `_op_target_for_score`
+        #   的 pass 分支回 `None, "传球: 没解析到队友位置"` ⇒ 老写法这一句 `target is not None`
+        #   不成立 ⇒ `cell` 留在 `None` ⇒ `check` 返回 `ok=False` ⇒
+        #   **规划器的两条"队友代取再传"分支恒被丢弃**(`planner.py:382` `if not ok2: continue`)。
+        #   ☠ 特别值得记: `planner.py:400-402` 的注释**正好说中了这个病**, 于是他们加了
+        #     `assume_held` 把**手持**那道闸门修通 —— 而同一步还有**第二道**闸门(就是这里),
+        #     没人注意, 原地把修好的那道抵消了。设计文档里那张递归规则表、那两条跨人约束
+        #     ("取的人 ≠ 背的人" / "pass 要求 d ≠ c")代码全在、全都能跑, 就是**产不出结果**。
+        #   ⚠ 判据**一行不改**: 传球仍然要走 `_throw_spot` 那条现成的判据, 这里只是
+        #     不再用"能不能解析出目标"当它的前置。
+        if ok and (target is not None or _pass_ok):
+            if _pass_ok:
                 # ☠ **传球有自己的判据** —— "站得到 + 丢得到队友", 不是"站得到队友旁边"。
                 #   理由见 `_throw_spot`: 分厨房里"队友旁边"恰恰是走不到的地方,
                 #   用 `_stand_cell_of` 会让 `pass` 恒 `-inf`(提议了却永远选不上)。
