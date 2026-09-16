@@ -82,6 +82,11 @@ CHAIN_DEAD_PENALTY = 1e6
 PLAN_MAKESPAN = (os.environ.get("NEKO_PLAN_MAKESPAN") or "1").strip().lower() \
     not in ("0", "off", "no", "false")
 
+#: `WorldView.plate_src` 的 `how` → **日志里那句人话**。
+#: 只在 `assumptions` 里用 ⇒ 键对不上时退回打原样(不许因为它而丢一行)。
+PLATE_HOW = {"on_spot": "摆盘位上那只", "stack": "盘子堆", "counter": "台面上的空盘",
+             "hand": "手上那只"}
+
 #: 可以用来"拆成两半 + 传递"的动作 —— 料能拿在手上的那些。
 #: ⚠ `assemble`/`deliver` **不在**里面: 它们作用的是台面/盘子, 不是"把料传过去"能解决的。
 PASSABLE = ("fetch", "chop", "cook", "mix")
@@ -143,6 +148,36 @@ class WorldView:
     #:   ⇒ "世界没变就不重算"**根本没实现**(只在单次 `plan()` 调用内有效)。留着是
     #:   给以后接线用的, 别以为它现在管用。
     epoch: object = 0
+
+    #: **本单的摆盘位** —— `(sid, x, z)`;"这块台面摆盘"是**规划期**用**只读**模式
+    #: (`pick_assemble_spot(claim=False)`)挑出来的。`None` = 这一关一块能摆盘的台面都没有。
+    #:
+    #: ☠☠ 为什么要它(用户点名的"规划器**推不出『去哪拿一只盘子』**"):
+    #:   执行层拿盘子的路有**三条**(摆盘位上已经有一只 / `_empty_plate_source` 的
+    #:   盘子堆与台面空盘 / 手上那只), 而规划器**一条都不知道** ——
+    #:   `derive()` 的链里压根没有"拿盘子"这一步(执行层是在 `op_assemble` /
+    #:   `_get_plate_for_pot` 里顺手解决的)。后果有两层:
+    #:     · 计划说不出"摆盘位在哪", 于是 `assemble` 那几步**恒被标成**
+    #:       `探测期判不可行(还没挑摆盘位)` —— 一句**假理由**(那不是"不可能",
+    #:       是"规划期没去问"); 见 `Engine._PlanView`。
+    #:     · **"盘子从哪来"这条约束根本没进计划** ⇒ 这份计划在"全场一只空盘都没有"
+    #:       的世界里看起来照样成立, 到执行期才一个接一个失败。
+    #: ⇒ 现在把执行层那三条**只读地**在规划期解析一遍, 由适配器填进来。
+    plate_spot: tuple = None
+    #: **那只空盘从哪来** —— `(how, sid, x, z)`; `how` ∈
+    #:   `"on_spot"`(摆盘位上已经有一只, 材料放上去直接进盘) /
+    #:   `"stack"`(盘子堆) / `"counter"`(台面上的空盘)。
+    #: ⚠ 与 `plate_spot` **是两件事**: 位子挑得出来 ≠ 上面有盘。
+    #: ⚠ **"不知道"和"问过了、真没有"是两回事** —— 后者见 `plate_known`。
+    plate_src: tuple = None
+    #: **适配器真的去查过"盘子"这件事吗**。
+    #:
+    #: ☠☠ 没有它, 老调用方(手写 `WorldView` 的离线桩, 以及 `NEKO_PLAN_PLATE=0`)
+    #:   会被读成"**全场一只空盘都没有**" ⇒ 每份计划都多一条 `⚠` 假设 + 一条剪枝理由。
+    #:   那是**假信号**: 真因是"没人去问"。本仓为这个形状栽过(见 `cook_steps` 的
+    #:   "空列表 = 拿不到这件信息 ⇒ 退回老行为, 别当成'哪儿都不能进'")。
+    #: ⇒ `False`(默认) = **一行都不说**; `True` + `plate_src is None` 才是"真的没有"。
+    plate_known: bool = False
 
 
 # ---------------------------------------------------------------- 计划
@@ -678,6 +713,32 @@ def _plan_one(flow, world: WorldView, check, log=None, notes_out=None) -> Plan |
     #   "这份料在灶上、到点可取", 而不是以为计划把它漏了。
     for _sid, _item, _left in (getattr(world, "cooking", None) or []):
         assumptions.append(f"{_item} 正在 {_sid} 上煮(约 {_left:.0f}s 后熟, 到点回去取)")
+
+    # ---- 「去哪拿一只盘子」(2026-09-17, 用户点名的那一条) ----
+    # ☠ 计划里**没有**"拿盘子"这一步(`derive()` 的链里就没有) —— 执行层是在
+    #   `op_assemble` / `_get_plate_for_pot` 里**顺手**解决的。所以这里能做的、
+    #   也应该做的, 是**把那条约束说出来**:
+    #     · 摆盘位在哪儿(规划期只读挑的) ⇒ 写进 `assumptions` 让人看得见;
+    #     · 那只空盘从哪来 ⇒ 同上;
+    #     · **全场没有可用的空盘** ⇒ 这是一条**真的剪枝理由**, 进 `notes`
+    #       (只在"推不出解"时打印) —— 免得它又被伪装成"留给执行层"。
+    #   ⚠ `into_bowl` 那些 `assemble` 的落点是**碗**(搅拌台), 与盘子无关 ⇒ 不算。
+    if any(getattr(s.op, "action", "") in ("assemble", "deliver")
+           and not getattr(s.op, "into_bowl", False) for s in steps) \
+            and getattr(world, "plate_known", False):
+        _ps = getattr(world, "plate_spot", None)
+        _pc = getattr(world, "plate_src", None)
+        if _ps:
+            assumptions.append(f"摆盘位 {_ps[0]} (规划期只读挑的)")
+        if _pc and _pc[0] == "on_spot":
+            assumptions.append(f"那只空盘**已经在** {_pc[1]} 上(材料放上去直接进盘)")
+        elif _pc:
+            assumptions.append(f"空盘从 {_pc[1]} 取({PLATE_HOW.get(_pc[0], _pc[0])})")
+        else:
+            _msg = ("全场**没有可用的空盘**(盘子堆 / 台面上的空盘都没有)"
+                    " —— 摆盘那一步要现找, 很可能做不成")
+            assumptions.append("⚠ " + _msg)
+            ctx.notes.append("⚠ 盘子: " + _msg)
 
     return Plan(flow=getattr(flow, "name", ""), steps=steps,
                 assumptions=sorted(set(assumptions)),

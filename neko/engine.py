@@ -216,10 +216,23 @@ class _PlanView:
         #   ⚠ 计划**不是**要无视它: 执行期照旧走 `KIND_DEFER`("还没到回来的时候,
         #     先去做别的"), 那才是正确的处置。
         e._pot_gate_off = True
-        # `assemble_spot` 保持原值: 若它本来就是 None(执行期还没挑), 那 `assemble` 那几步
-        # 会被判"还没挑摆盘位" —— 那是**真的**: 规划期确实不知道要用哪块台面。
-        # ⚠ **不去调 `pick_assemble_spot`** —— 那个会写 `_board.pick_spot`, 影子模式
-        #   就不该碰共享黑板。要让规划期也能判 `assemble`, 等真正接管时再说。
+        # ☠☠ **摆盘位: 现在规划期也答得出来了**(2026-09-17, 用户点名"规划器**推不出
+        #   『去哪拿一只盘子』**")。这一段原来是:
+        #     > "`assemble_spot` 保持原值 …… **不去调 `pick_assemble_spot`** ——
+        #     >  那个会写 `_board.pick_spot`, 影子模式就不该碰共享黑板。
+        #     >  要让规划期也能判 `assemble`, **等真正接管时再说**。"
+        #   —— 那个"等"到了(`NEKO_PLAN` 已默认 `on`), 而担心的副作用**早就有只读档**:
+        #   `pick_assemble_spot(claim=False)` 是**评分层替队友算**用的, 它不写
+        #   `_assemble_sid`、不碰黑板。`_plan_ctx` 用它挑好之后存在 `_plan_spot` 上。
+        #   ⇒ 换进来之后 `assemble` 那几步不再背 `探测期判不可行(还没挑摆盘位)`
+        #     那句**假理由**(它不是"不可能", 是"当时没去问")。
+        # ⚠ 只换**判据的输入**, 一行判据都没改 —— 同这个类上面那条纪律。
+        # ⚠ `_plan_spot` 是 `None`(没解析出来 / `NEKO_PLAN_PLATE=0`)⇒ **原样保留**
+        #   执行期那个值 = 逐字老行为。
+        _ps = getattr(e, "_plan_spot", None)
+        if _ps is not None:
+            e.assemble_spot = _ps
+            e._assemble_sid = getattr(_ps, "id", "") or ""
         return e
 
     def __exit__(self, *exc):
@@ -5685,7 +5698,8 @@ class Engine:
         km = self.map(st) if st else None
         return km.cooking_on(stove) if km else None
 
-    def _empty_plate_source(self, km: KitchenMap, x: float, z: float, want_type: str):
+    def _empty_plate_source(self, km: KitchenMap, x: float, z: float, want_type: str,
+                            claim: bool = True):
         """找"空盘子"的来源。
 
         优先级: ① 盘子堆里对得上订单容器类型的(干净, 类型必对)
@@ -5693,6 +5707,12 @@ class Engine:
                 ③ 任意盘子堆
         为什么必须空: 装了菜的盘子拿到锅边按交互, 走的是"把手上容器的内容倒进目标"
         那条分支(ServerPlacementContainer 反向分支), 结果是把菜倒进锅里, 正好反了。
+
+        `claim=False` —— **只读模式**: 算出来但**不占位**(不写 `_claim_res`)。
+        ☠ 规划期必须用它: 规划器是**影子**(`NEKO_PLAN=shadow` 时纯算不执行),
+          不该在共享黑板上留下"这只盘归我"的痕迹 —— 同 `pick_assemble_spot(claim=False)`
+          的纪律(`stove_owner`/`spot_owner` 那一族的原话: 评分/规划**不许顺手占位**)。
+        ⚠ 默认 `True` = 逐字老行为, 执行层的四个调用点一个都不受影响。
         """
         t = self._norm(want_type) if want_type else ""
         cand = []          # (优先级, 距离, 台子)
@@ -5719,7 +5739,8 @@ class Engine:
                 #     用短 TTL(`PLATE_CLAIM_TTL=8s`)当释放机制 —— 漏放的代价是
                 #     那盘 8 秒没人能用, 可接受; 而"每处 pickup 都要记得释放"那种写法
                 #     一旦漏一处就是 25~30 秒的锁(切菜板那边我显式接了 6 处, 那是值得的)。
-                if not self._claim_res("plate", s.id, PLATE_CLAIM_TTL):
+                #   ⚠ 规划期(`claim=False`)整个跳过占位 —— 影子模式不碰共享黑板。
+                if claim and not self._claim_res("plate", s.id, PLATE_CLAIM_TTL):
                     continue
                 cand.append((1, (s.x - x) ** 2 + (s.z - z) ** 2, s))
         if not cand:
@@ -9965,6 +9986,66 @@ class Engine:
     #   `_op_target_for_score` + `_op_actionable` 的唯一合并入口)。这个项目为
     #   "同一件事两处各写一份"栽过两次, 规划器**不**做第三份。
 
+    #: **规划期要不要解析"摆盘位在哪、那只空盘从哪来"**(2026-09-17, 用户点名
+    #: "规划器**推不出『去哪拿一只盘子』**")。
+    #:
+    #: `0` = 逐字退回老行为(规划期不知道摆盘位, `assemble` 那几步恒被标成
+    #: `探测期判不可行(还没挑摆盘位)`) —— 本仓一键回退的惯例。
+    #:
+    #: ☠☠ **要它是因为那条老注释已经过期**。`_PlanView.__enter__` 里写着:
+    #:   > "**不去调 `pick_assemble_spot`** —— 那个会写 `_board.pick_spot`, 影子模式
+    #:   >  就不该碰共享黑板。要让规划期也能判 `assemble`, **等真正接管时再说**。"
+    #:   —— 那个"等"到了: `NEKO_PLAN` 已经**默认 `on`**(三层合流 `9e6aff2`)。
+    #:   而当时担心的那个副作用**早就有现成的只读档**: `pick_assemble_spot(claim=False)`
+    #:   是**评分层替队友算**用的, 它不写 `_assemble_sid`、不在黑板占位
+    #:   (docstring 原话: "那种调用绝不能以我的 cid 占走台面")。
+    #:   ⇒ 规划期直接用那个档, 一行副作用都不产生。
+    #:
+    #: ⚠ **它只影响"计划怎么说", 不影响"计划怎么收窄"**: 收窄闸门
+    #:   (`_plan_next_all`) 匹配的是 `(槽位, action, target)` 三元组, **从不看坐标**
+    #:   ⇒ 把 `assemble` 那几步的目标坐标从"没有"变成"有", 不会改任何候选的放行。
+    #: ⚠ 解析失败一律**当没有**(退回老行为), 绝不让规划期因为读不到盘子而炸 ——
+    #:   那是"绝不停机"的一部分(规划器本来就是旁路)。
+    PLAN_PLATE = (os.environ.get("NEKO_PLAN_PLATE") or "1").strip().lower() \
+        not in ("0", "off", "no", "false")
+
+    def _plan_plate(self, km, x: float, z: float, flow=None):
+        """**规划期只读地**算出 `(摆盘位, 空盘来源)` —— 执行层那三条来源的镜像。
+
+        返回 `(spot, src)`:
+          · `spot` = 摆盘位那个 `Station`(或 `None`);
+          · `src`  = `(how, sid, sx, sz)`, `how` ∈ `on_spot` / `stack` / `counter`;
+                     `None` = **全场没有可用的空盘**。
+
+        ☠ **判据只有一份** —— 这里调的 `pick_assemble_spot` / `_empty_plate_source`
+          就是执行层用的那两个, **不另写一套"规划期专用"的挑法**
+          (本仓为"同一件事两处各写一份"栽过两次)。区别只有 `claim=False` 那一档。
+        ⚠ `pick_assemble_spot(claim=False)` **不认 R1**(本单绑着的那盘) ——
+          那条要读黑板。所以规划期算出来的位子**可能**和执行期最终用的那块不同;
+          这正是 `assumptions` 里那句"规划期只读挑的"要说清的事, 别当成承诺。
+        """
+        spot = None
+        try:
+            spot = self.pick_assemble_spot(km, x, z, claim=False,
+                                           slot=(getattr(flow, "slot", "") or ""),
+                                           flow=flow)
+        except Exception:                                        # noqa: BLE001
+            spot = None
+        want = getattr(flow, "plate", "") or ""
+        src = None
+        try:
+            if spot is not None and self._has_plate(spot):
+                # ① 摆盘位上已经有一只 ⇒ 材料放上去**直接进盘**, 不用跑一趟。
+                src = ("on_spot", spot.id, spot.x, spot.z)
+            else:
+                p = self._empty_plate_source(km, x, z, want, claim=False)
+                if p is not None:
+                    src = ("stack" if (p.id or "").startswith("plates") else "counter",
+                           p.id, p.x, p.z)
+        except Exception:                                        # noqa: BLE001
+            src = None
+        return spot, src
+
     def _plan_view(self):
         """**规划视图** —— 进这个上下文之后, 判据答的是"世界是什么样", 不是"我现在在干什么"。
 
@@ -10058,6 +10139,22 @@ class Engine:
         except Exception:                                        # noqa: BLE001
             _cooking = []
 
+        # ---- 「去哪拿一只盘子」(2026-09-17) ----
+        # ☠ 见 `PLAN_PLATE` 那段: 规划期**只读地**把执行层那三条来源解析一遍,
+        #   填进视图。`assemble` 那几步从此答得出"摆盘位在哪", 而"全场没有空盘"
+        #   会变成一条**说得出口的理由**(`planner._plan_one` 把它写进 notes)。
+        # ⚠ 位子只挑**一次**(第一张单的槽位/菜谱)—— 摆盘位本来就是一关一块,
+        #   与哪张单无关; 而 `assemble` 那几步的坐标是靠 `_plan_spot` 经由
+        #   `_PlanView` 生效的(见那边), 这里存下来就是给它用。
+        _pspot, _psrc = None, None
+        if self.PLAN_PLATE:
+            try:
+                _px, _pz, _ = self.pos(st) if st else (None, None, "")
+                _pspot, _psrc = self._plan_plate(km, _px, _pz, flow=_fs[0])
+            except Exception:                                    # noqa: BLE001
+                _pspot, _psrc = None, None
+        self._plan_spot = _pspot
+
         world = WorldView(
             chefs=tuple(chef_ids) or (0,),
             sources=sources,
@@ -10067,6 +10164,11 @@ class Engine:
             chef_held={c.id: (c.held or "") for c in (km.chefs or [])},
             resting_packs=[p.name for p in km.packs_resting()],
             cooking=_cooking,
+            plate_spot=((_pspot.id, _pspot.x, _pspot.z) if _pspot is not None else None),
+            plate_src=_psrc,
+            # ☠ **"问过了"才敢说"没有"** —— 见 `WorldView.plate_known`。
+            #   `PLAN_PLATE=0` 时恒 `False` ⇒ 一句盘子的话都不说(逐字老行为)。
+            plate_known=bool(self.PLAN_PLATE),
             epoch=getattr(self.terrain(), "ver", "") or "")
 
         # ---- 注入的检查器: 每厨师绑一份视图(位置/手持/BFS 表) ----
