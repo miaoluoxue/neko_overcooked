@@ -10656,8 +10656,21 @@ class Engine:
             else:
                 cell = self._stand_cell_of(tm, target[0], target[1], cx, cz,
                                            ortho_only=True, reach=reach)
+        # ☠☠ **这两个字段现在还没人读 —— 别删, 它们是下一刀的原料**(2026-09-17)。
+        #   本来想用它们把「动作不可能」和「规划期接不上地」分开, 好让规划器
+        #   **别剪掉存在的分支**。`runtime\_planctx_probe.py` 第 ⑭ 节当场打回来:
+        #     ✗ 反面: **背包的主人自己取不了**(改前/改后都必须是 False)
+        #   根因: **跨人约束不是由 `_op_actionable` 执行的** —— 它是靠
+        #   `_fetch_source_live` 的 `exclude_back` 在**接地那一层**把货源排除掉。
+        #   ⇒ "接地失败"里混着**两类**, 而 `action`/`grounded` 这两个布尔**分不开**:
+        #     · **真的没有**(哪都没有货源) —— **该剪**; 跨人约束就从这儿进
+        #     · **有, 但此刻够不着/解析不出坐标** —— **不该剪**(接地是执行期的事)
+        #   ⇒ 下一刀要让 `_op_target_for_score` 把"为什么没接地"**分类带出来**
+        #     (至少 `no_source` / `unreachable` 两种), 而不是再加一个布尔。
         return {"op": op, "label": label, "why": why, "cell": cell,
-                "dist": None, "follow": 0.0}
+                "dist": None, "follow": 0.0,
+                "action": bool(ok),
+                "grounded": bool(target is not None or _pass_ok)}
 
     def _dish_foreign(self, have, flow) -> set:
         """`have`(一盘里装的东西)里**本单不要**的那些 —— **非空就是"别的单的菜"**。
