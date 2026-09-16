@@ -592,6 +592,12 @@ class Engine:
         #: 递归规划器最近算出来的那份计划(`neko/planner.py`) —— `None` = 没有/推不出。
         #: 见 `_plan_tick`(算)与 `_plan_bonus`(用)。`NEKO_PLAN=0` 时永远是 None。
         self._plan = None
+        #: ☠ **计划自己的算出时刻** —— 判新鲜度(`PLAN_TTL`)用它, **不用** `_plan_at`。
+        #:   `_plan_at` 是"**我**上次算的时刻"(管节流); 拿它判新鲜度的话, 从黑板上
+        #:   读回来的那份会被当成刚算的 ⇒ **一份冻住的计划永远不过期**(老代码的栽法)。
+        self._plan_ts = 0.0
+        #: 最近算的那份计划在黑板上的键(槽位键) —— `_plan_dirty` 作废时用它清黑板。
+        self._plan_cur_key = ""
         self._plan_at = 0.0
         #: 上一步真失败过 ⇒ 下一轮**跳过节流**立刻重算(见 `_plan_dirty`)。
         self._plan_force = False
@@ -8894,6 +8900,18 @@ class Engine:
 
         return world, check
 
+    def _plan_key(self, flow) -> str:
+        """计划在黑板上的键 —— **槽位键**(`DishFlow.slot`), 没有才退回菜名。
+
+        ☠☠ 原来直接用 `flow.name` ⇒ **同名多单会互相顶着对方的计划**。订单栏上同时挂
+          5 张 `Sushi_Fish` 是实测见过的, 而它们的**分工是对着不同的世界算的** ——
+          拿错一份的后果不是"差一点", 是"**去等一个不存在的队友**"。
+          这正是本仓记过三回的"订单没有 id、只有名字", 这是第四处。
+        ⚠ Stage 1 之后 `slot` 在池里**一直有值**(`_order_pool` 在 `derive` 之后填),
+          所以这条现在是硬的; 空串只在单人/老路径上出现, 那时退回名字**逐字等于老行为**。
+        """
+        return str(getattr(flow, "slot", "") or "") or str(getattr(flow, "name", "") or "")
+
     def _plan_tick(self, flow, km, st) -> None:
         """算一份计划并按开关处置 —— `shadow` 只打日志, `on` 另外把它交给评分层。
 
@@ -8913,6 +8931,9 @@ class Engine:
             return
         self._plan_force = False
         self._plan_at = now
+        _calc_at = now          # ☠ **这份计划算出来的时刻** —— 上黑板时当版本号用,
+                                #   读的人拿它判新鲜度(`_plan_ts`)。它和 `_plan_at`
+                                #   (**我**上次算的时刻, 管节流)是**两个**时间戳。
         try:
             import planner
             world, check = self._plan_ctx(flow, km, st)
@@ -8924,12 +8945,25 @@ class Engine:
             return
         # ☠☠ **双人时计划必须上黑板** —— 两个引擎各算一份的话, 对"谁做哪一步"会分叉,
         #   而分叉的代价是**死锁**("A 等 B 背背包、B 等 A 背背包"), 一局 150 秒报废。
-        #   先发布的赢, 两边都读回同一份。见 `team.OrderBoard.publish_plan`。
+        #   两边读回**同一份**。刷新/过期/接管的规则全在 `team.OrderBoard.publish_plan`。
         if self.board is not None and p is not None:
-            self.board.publish_plan(flow.name, p, self.cid)
-            _shared = self.board.get_plan(flow.name)
+            # ☠☠ **计划键 = 槽位键**(`flow.slot`), 不是菜名(2026-09-17)。
+            #   老写法 `flow.name` ⇒ **同名多单会互相顶着对方的计划** —— 而订单栏上
+            #   同时挂 5 张同名单是实测见过的, 它们的**分工是对着不同的世界算的**。
+            #   本仓"订单没有 id、只有名字"这条账已经记过三回, 这是第四处。
+            _key = self._plan_key(flow)
+            self._plan_cur_key = _key      # `_plan_dirty` 作废时用它清黑板
+            # ☠ `ts` 传**我算它的时刻**(`_calc_at`), 不是"现在" —— 读的人的节流
+            #   (`_plan_at`)和新鲜度(`_plan_ts`)是**两个**时间戳, 别混。
+            self.board.publish_plan(_key, p, self.cid, ts=_calc_at, ttl=PLAN_TTL)
+            _shared, _sts = self.board.get_plan(_key)
             if _shared is not None:
                 p = _shared
+                # ☠ **用计划自己的时刻**判新鲜度。用"我读到的时刻"的话, 一份冻住的
+                #   计划**永远不会过期**(老代码就是这么栽的, 见 `publish_plan`)。
+                self._plan_ts = _sts
+        else:
+            self._plan_ts = _calc_at
         self._plan = p
         if PLAN_MODE != "shadow":
             return
@@ -9133,6 +9167,17 @@ class Engine:
             return
         self._plan = None
         self._plan_force = True
+        # ☠☠ **黑板上那份也要清**(2026-09-17)。不清的话下一轮 `_plan_tick` 重算完,
+        #   `publish_plan` 会因为"那是别人发的、还新鲜"**被拒** ⇒ 读回来的还是**同一份
+        #   已知不行的计划** ⇒ 作废**白作废**, 而冷板凳(20s)和 `PLAN_TTL`(20s)一样长,
+        #   正好能把 20 秒烧光。清掉之后两边下一轮各自重算、谁先写谁得, 仍然收敛。
+        _bd = getattr(self, "board", None)
+        _k = getattr(self, "_plan_cur_key", "")
+        if _bd is not None and _k:
+            try:
+                _bd.drop_plan(_k)
+            except Exception:                                    # noqa: BLE001
+                pass
         if why:
             self.log(f"[规划] ↻ 计划作废({why}) —— 下一轮立刻重算, 这段时间走评分那条路")
 
@@ -9149,7 +9194,9 @@ class Engine:
         p = getattr(self, "_plan", None)
         if p is None or PLAN_MODE != "on":
             return None
-        if time.time() - getattr(self, "_plan_at", 0.0) > PLAN_TTL:
+        # ☠ **判新鲜度用 `_plan_ts`(计划自己的算出时刻), 不用 `_plan_at`** ——
+        #   从黑板读回来的那份如果拿"我读到的时刻"判, 就**永远不会过期**。
+        if time.time() - getattr(self, "_plan_ts", 0.0) > PLAN_TTL:
             return None                        # 过期 ⇒ 当没有计划(动态地图那条)
         alive = {(ops[j].action, self._norm(ops[j].target))
                  for j in pending if 0 <= j < len(ops)}
@@ -9177,7 +9224,7 @@ class Engine:
         p = getattr(self, "_plan", None)
         if p is None:
             return 0.0
-        if time.time() - getattr(self, "_plan_at", 0.0) > PLAN_TTL:
+        if time.time() - getattr(self, "_plan_ts", 0.0) > PLAN_TTL:
             return 0.0                     # 过期 ⇒ 当作没有计划(下一轮会重算)
         n = self._norm(op.target)
         for s in p.steps_of(self.cid):
@@ -11095,8 +11142,15 @@ class Engine:
     def run(self, dry: bool = False):
         self.log("[引擎] 启动, 等对局...")
         if PLAN_MODE == "on":
-            self.log("[引擎] ⚠ NEKO_PLAN=on —— **接管执行还没实现**, 现在仍走评分那条路。"
-                     "先用 shadow 看计划对不对。")
+            # ☠☠ **这句话 2026-09-17 改了 —— 老的写的是"接管执行还没实现"**, 而那是**错的**:
+            #   递归规划器**已经**在接管"选哪个"了, 走的是**软闸门 + 奖励分**
+            #   (`_plan_next` 只放行计划排给我的那一步 + `_plan_bonus` 给那一步加分),
+            #   不是另写一个调度器 —— 那是独立审查给的方向, 理由见 `_plan_bonus`。
+            #   留着老话的代价不是"不准确", 是**把下一个读日志的人劝退**:
+            #   他会以为这东西只是个摆设, 于是不去查它推得对不对。
+            self.log(f"[引擎] 递归规划器: **已接管【选哪个】**(NEKO_PLAN=on; 每 {PLAN_INTERVAL:.0f} 秒"
+                     f"重算一次, {PLAN_TTL:.0f} 秒过期; 计划排给我的那一步优先, "
+                     f"这一步做不到就退回整池)")
         elif PLAN_MODE == "shadow":
             self.log(f"[引擎] 递归规划器: **影子模式**(每 {PLAN_INTERVAL:.0f} 秒算一次, "
                      f"只打日志、不改行为)")
@@ -11319,7 +11373,10 @@ class Engine:
                 # ⚠ **按槽位放, 不按名字** —— `name` 是菜名, 而认领的键是槽位
                 #   (`team.key_of`); 拿名字放等于**没放掉**, 要等下一轮 `plan()` 才补上。
                 self.board.release_order(self._claimed, self.cid)
-                # ☠ 计划也要清 —— 否则下一局/下一张单会顶着同一个订单名拿到**上一份**计划,
+                # ☠ 计划也要清 —— 否则下一局/下一张单会顶着**同一个键**拿到**上一份**计划,
                 #   而它的分工是对着旧世界算的(实测最坏: 两边按不同的旧计划各做各的)。
-                self.board.drop_plan(name)
+                #   ☠☠ **键要跟着 `_plan_key` 走**(槽位键) —— 老代码这里传的是 `name`
+                #     (菜名), 而 `_plan_tick` 发布时用的是 `flow.slot` ⇒ **两边根本不是
+                #     同一个键, 等于从来没清掉过**。同名多单时更糟: 清掉的是别人的那一格。
+                self.board.drop_plan(self._claimed or name)
             time.sleep(0.5)

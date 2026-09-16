@@ -34,9 +34,10 @@ class OrderBoard:
         #: **盘子绑定**: 台面 id -> `{slot, cid, at, stamp}`。☠ **不存盘里装了什么**
         #: (内容每次从地图现读) —— 抄进黑板就是造第二份真相。
         self._plates = {}
-        #: 订单名 -> `(Plan, 发布者 cid, 发布时刻)` —— 见 `publish_plan`。
+        #: 计划键(**槽位键**, 见 `Engine._plan_key`) -> `(Plan, 发布者 cid, 算出时刻)`。
         #: ☠ 只发布**分工**(谁做哪步), **不发布可行性** —— 可行性是执行期每轮重判的
         #:   (`_feasible`), 世界变了就该变; 把它冻在黑板里等于拿旧世界硬套。
+        #: ☠ 键**不是菜名** —— 同名多单(实测一次挂 5 张 `Sushi_Fish`)会互相顶着对方的计划。
         self._plans = {}
         self.log = lambda *a: None
 
@@ -330,24 +331,54 @@ class OrderBoard:
     #      一局 150 秒直接报废。
     #
     # 形状照抄上面那几张表: dict + `Lock`, 谁先 claim 谁得。
-    def publish_plan(self, order: str, plan, cid: int) -> bool:
-        """发布一份计划。**第一个发布的赢** —— 后来者**不覆盖**。
+    def publish_plan(self, order: str, plan, cid: int, ts: float = None,
+                     ttl: float = 0.0) -> bool:
+        """发布一份计划 —— **同一个订单只留一份**(双引擎各持一份的代价是**死锁**)。
 
-        为什么要"先到先得"而不是"后者覆盖": 覆盖的话两边可能各持一份(各自发布之后
-        又各自读到了不同的时间点), **又分叉了** —— 那就白上黑板了。
-        返回 `True` = 这次是我发布的; `False` = 已经有人发布过了(去读它)。
+        规则(2026-09-17 重写; 原来是"先到先得、**永不覆盖**"):
+          · 还没有                       ⇒ 写;
+          · 那份是**我自己**发的         ⇒ **覆盖**(刷新);
+          · 那份是**别人**发的、还新鲜   ⇒ **不覆盖**(返回 `False`, 去读它);
+          · 那份是**别人**发的、已过期   ⇒ 写 —— 见下面那条 ☠。
+
+        ☠☠ **为什么必须允许刷新**: 老规则下 `_plan_tick` 每 `PLAN_INTERVAL`(6 秒)重算一次
+          **全是白算** —— 黑板永远吐回第一份, 于是计划在**整张单的生命周期里冻住**。
+          更糟的是引擎读回之后会把 `_plan_at` 刷成"现在" ⇒ 连 `PLAN_TTL` 都**永远不过期**,
+          一份几分钟前的分工会被当成新鲜的用。
+        ☠☠ **为什么过期的那份要让别人写**: 规划者那个引擎没了(崩了/单子归它但它被
+          冷板凳锁住)之后, 另一个如果只能"读到就认", 就会**永远抱着它的陈计划**。
+          `ts` 过期 ⇒ 谁都写不进去也谁都不用 ⇒ 死循环。所以过期一律可覆盖。
+        ⚠ 两个人的"谁先写谁得"仍然保留在**新鲜**那一档上: 那才是"两边对'谁做哪一步'
+          必须一致"真正要保护的时刻。
+        ⚠ `ttl <= 0` ⇒ 退回老规则(只认第一个发布的) —— 老调用方/离线桩逐字不变。
+
+        `ts` = **计划算出来的时刻**(不是发布的时刻) —— 读的人拿它判新鲜度
+        (见 `Engine._plan_tick`)。不传 ⇒ 用现在。
         """
+        now = time.time()
+        ts = now if ts is None else float(ts)
         with self._lock:
-            if order in self._plans:
-                return False
-            self._plans[order] = (plan, cid, time.time())
+            e = self._plans.get(order)
+            if e is not None:
+                # ☠ `ttl <= 0` ⇒ **逐字退回老规则**(只认第一个发布的)。老调用方/离线桩
+                #   不传 `ttl`, 它们的行为必须一个字都不变 —— 尤其不能变成"后写者得"。
+                if ttl <= 0:
+                    return False
+                _old_ts = float(e[2]) if len(e) > 2 else 0.0
+                if e[1] != cid and (now - _old_ts) <= ttl:
+                    return False                     # 别人发的、还新鲜 ⇒ 去读它
+            self._plans[order] = (plan, cid, ts)
             return True
 
     def get_plan(self, order: str):
-        """读已经发布的那份计划; 没有 ⇒ `None`。"""
+        """读已经发布的那份计划 ⇒ `(plan, 算出时刻)`; 没有 ⇒ `(None, 0.0)`。
+
+        ⚠ 返回**元组**(2026-09-17): 读的人必须拿**计划自己的**时刻判新鲜度 ——
+          拿"我读到的时刻"判的话, 一份冻住的计划**永远不会过期**(正是上面那条 ☠)。
+        """
         with self._lock:
             e = self._plans.get(order)
-            return e[0] if e else None
+            return (e[0], float(e[2])) if e else (None, 0.0)
 
     def drop_plan(self, order: str) -> None:
         """订单下架/换关时清掉 —— 否则下一局的计划会顶着上一局的订单名。"""
