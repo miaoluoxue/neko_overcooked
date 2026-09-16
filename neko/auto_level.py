@@ -49,7 +49,11 @@ import time
 STAGE_INROUND = "inround"      # 已经在局里 ⇒ 进关成功, 停手
 STAGE_LOBBY = "lobby"          # `scene == "Lobbies"` ⇒ 大厅
 STAGE_SCREEN = "screen"        # `scene == "StartScreen"` ⇒ 主界面
-STAGE_OTHER = "other"          # 加载/过场/世界地图… ⇒ **别乱按**
+#: ☠ **走错分支了** —— 按错了标签(比如进了战役 `WorldMap`/`Campaign`)。
+#: 判据由用户实机给出(2026-09-17): *"按一下之后进入了现在在 'WorldMap'(mode='Campaign'),
+#: 这个时候判断 `mode != party`, 执行返回"*。⇒ 先按退路回主菜单, 再重来。
+STAGE_WRONG = "wrong"
+STAGE_OTHER = "other"          # 加载/过场/别的场景… ⇒ **别乱按**
 
 #: 主界面场景名。依据 `overcooked_decomp/ClientLobbyFlowController.cs:201`
 #: `ServerMessenger.LoadLevel("StartScreen", GameState.MainMenu, …)`。
@@ -57,6 +61,9 @@ SCENE_SCREEN = "StartScreen"
 #: Coop 大厅场景名。依据 `FrontendCoopTabOptions.OnCouchPlayClicked()`
 #: (`overcooked_decomp/FrontendCoopTabOptions.cs:44-67`): `LoadLevel("Lobbies", GameState.PartyLobby)`。
 SCENE_LOBBY = "Lobbies"
+
+#: 目标模式 —— 进关要的是 **`Party`**(Coop/街机那一支)。`stage()` 拿它判"走错没有"。
+MODE_PARTY = "Party"
 
 #: **默认序列** —— `{阶段: [动作, …]}`。
 #:
@@ -67,18 +74,19 @@ SCENE_LOBBY = "Lobbies"
 #:   · 主界面(StartScreen): 先补 P2(`join`), 再切到 Coop/Party 标签, 再确认。
 #:     ☠ `join` **必须走虚拟手柄** —— 那是加入流程唯一的入口(见模块头), 所以它是
 #:       一个**独立动作**, 不是按键, 不受 `AUTO_INPUT` 影响。
-#:     ☠ **切标签用 `D`/`RIGHT`, 不是肩键** —— 2026-09-17 实机: 用户报"**按 RB 没用**"。
-#:       依据 `PlayerInputLookup.cs:612-616`: 前端的移动输入是
-#:       `MovementX = AmbiPadValue.StickX + DPadX` —— **只有摇杆和十字键, 没有肩键**。
-#:   · 大厅(Lobbies): `UISelectNotStart` 的**键盘分支硬编码含 `Space`**
+#:     ☠☠ **要按`俩`下 `D`** —— 用户 2026-09-17 实机: *"按一下之后进入了现在在
+#:       'WorldMap'(mode='Campaign')"* ⇒ 第一下落在**战役**标签上, 第二下才到 Party。
+#:     ☠ 切标签用 `D`/`RIGHT`, **不是肩键** —— 用户报"按 RB 没用"; 依据
+#:       `PlayerInputLookup.cs:612-616`: 前端移动输入是 `MovementX = StickX + DPadX`,
+#:       **只有摇杆和十字键, 没有肩键**。
+#:   · 玄关/大厅(Lobbies): `UISelectNotStart` 的**键盘分支硬编码含 `Space`**
 #:     (`PlayerInputLookup.cs:482-489`) ⇒ 键盘上确认键就是 `SPACE`。
-#:     单人合作时 `AllUsersSelected()` 直接为真(`ServerLobbyFlowController.cs:641-667`)
-#:     ⇒ **一次确认就该进图**; 第二个是给**加载界面的厨师选择**那一屏准备的
-#:     (`LobbyUIController.cs:257-271` 的"开始"也是同一个键)。
+#:   · **走错**(`wrong`): 用户给的退路 —— `ESC,↓,↓,↓,SPACE,←,SPACE` 回主菜单。
 #: ⚠ **用户 2026-09-17: "那用键盘, 键盘有效"** ⇒ `NEKO_WATCH_AUTO_INPUT` 默认 `kbd`。
 DEFAULT_SEQ = {
-    STAGE_SCREEN: ["join", "D", "SPACE"],
+    STAGE_SCREEN: ["join", "D", "D", "SPACE"],
     STAGE_LOBBY: ["SPACE", "SPACE"],
+    STAGE_WRONG: ["ESC", "DOWN", "DOWN", "DOWN", "SPACE", "LEFT", "SPACE"],
 }
 
 #: 不是按键的动作 —— `norm_seq` 不给它们补前缀。
@@ -111,18 +119,27 @@ def norm_seq(seq, prefix: str = "pad:"):
 def stage(st: dict) -> str:
     """**现在到哪一步了** —— 纯函数, 只吃一份 state 快照。
 
-    ⚠ 判据**只有** `inRound` / `scene` —— `mode` 只用来打日志(它和 `scene` 冗余:
-      `StartScreen` ↔ `OnlineKitchen`、`Lobbies` ↔ `Party`, 用 `scene` 更准)。
+    ⚠ 判据**只有** `inRound` / `scene` / `mode`(后两个用来区分"在哪一屏")。
+    ☠☠ **`mode` 是"走错没有"的判据**(用户 2026-09-17 实机给的):
+      *"按一下之后进入了现在在 'WorldMap'(mode='Campaign'), 这个时候判断 `mode != party`,
+      执行返回"*。⇒ 人要的是 **Party**(Coop/街机那一支), 落到别的模式就先退回来。
     ⚠ 认不出的场景一律 `other` ⇒ **不按**。宁可不动, 也别在过场里乱按。
+    ⚠ `mode` 读不到(空串/旧 dll)⇒ **不判走错**, 退回 `other`(保守: 不乱按退路键)。
     """
     st = st or {}
     if st.get("inRound"):
         return STAGE_INROUND
     sc = str(st.get("scene") or "")
+    md = str(st.get("mode") or "")
     if sc == SCENE_LOBBY:
         return STAGE_LOBBY
     if sc == SCENE_SCREEN:
         return STAGE_SCREEN
+    # ---- 走错分支了吗 ----
+    # 主界面有它自己的 mode(`OnlineKitchen`), 已经在上面return了;
+    # 走到这儿的都是**别的场景** ⇒ 只要 mode 报得出来、且不是 Party, 就是走错了。
+    if md and md != MODE_PARTY:
+        return STAGE_WRONG
     return STAGE_OTHER
 
 
@@ -210,9 +227,16 @@ class AutoLevel:
             return
 
         if s != self._stage:
-            self.log(f"[进关] 阶段 → {s}(scene={(st or {}).get('scene')!r}"
-                     f" mode={(st or {}).get('mode')!r} "
-                     f"users={len((st or {}).get('users') or [])})")
+            if s == STAGE_WRONG:
+                # ☠ 这一行要**显眼** —— 它是"按错标签了、正在退回来", 不是正常推进。
+                #   用户 2026-09-17 给的判据与退路都在这条日志里点出来。
+                self.log(f"[进关] ⚠ **走错分支了** —— scene={(st or {}).get('scene')!r} "
+                         f"mode={(st or {}).get('mode')!r}(要的是 {MODE_PARTY}) ⇒ "
+                         f"按退路回主菜单再重来")
+            else:
+                self.log(f"[进关] 阶段 → {s}(scene={(st or {}).get('scene')!r}"
+                         f" mode={(st or {}).get('mode')!r} "
+                         f"users={len((st or {}).get('users') or [])})")
             self._enter(s)
 
         if now < self._at:
