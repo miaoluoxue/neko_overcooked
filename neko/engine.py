@@ -5393,85 +5393,98 @@ class Engine:
         #:         ⇒ **队友被挡**(和 `_pick_board` 那次是同一类账, 只是另一条路)。
         #:   ⚠ 教训: **失败路径上的收尾和成功路径一样是承重的** —— 别让一个
         #:     `UnboundLocalError` 把"划死 + 放占位"整段带走, 而日志上只剩一句含糊的"异常"。
-        _blame_hand = False
-        for i in range(max_chops + 3):
-            if not self.round_active():
-                return False
-            if _board_workable():
-                landed += 1
-            self.kb.chop()
-            time.sleep(0.35)
-            cur = self._board_item(board.id)
-            if base and cur and cur != base:
-                self.log(f"[步骤] 切好了({i+1} 刀): {base} → {cur}")
-                self._release_res("board", board.id)      # 切完了 ⇒ 板让出来
-                done = True
-                break
-            if not base and landed and i + 1 >= max_chops:
-                done = True   # 读不到板上的名字, 按刀数收工(**但要有回执**)
-                break
-        if not done:
-            if not landed:
-                # ☠☠ **两种情况必须分开报**(实测 2026-09-15, board0/1/2 三块板连着犯):
-                #     · 板上**没东西** ⇒ 这块板真的是空的, 换一块就对
-                #     · 板上**有东西**, 而 `use` 还是没有目标 ⇒ **不是空板**,
-                #       是**站位/朝向**的问题 —— 拿到的正是 `(板上: SushiFish)`
-                #       紧接着 `直调 use 失败: 身边没有可互动的东西` ×10。
-                #   ⚠ 根因: `_align_for_place` 验的是 `placeh`(**放置目标**),
-                #     而 `use` 是**另一个字段**(`m_interactable`) —— **放置对得上 ≠
-                #     交互够得着**。所以"放上去了、却按不动"是完全可能的状态。
-                #   ⚠ 原来这里一律写"多半是这块板空的", 在第二种情况下**是错的**,
-                #     会把人引去查台面而不是查站位。
-                _on = self._board_item(board.id)
-                _, _, _h = self.pos(self.state() or {})
-                #: 这一趟是**手上的锅**还是**板的锅** —— 决定要不要把这块板划掉(见下面)。
-                _blame_hand = False
-                if _on:
-                    # ☠☠ **别急着写"站位/朝向"** —— 还有第三种成因, 而且更常见:
-                    #   上来之前**手上拿着别的东西**, 而 `op_chop` 的头一件事是
-                    #   `if held: interact("pickup")`("先放上板") ⇒ 那件废料被放上去,
-                    #   板子当场失效、`use` 全部打空。实测(2026-09-15): 手持**生 SushiRice**
-                    #   去切板上那块 `SushiFish`, 上面这条日志把排查引去查脚下,
-                    #   而真正的原因在**手上**(见 `_op_actionable` 的 `chop` 分支)。
-                    #   ⇒ 手上有东西就把 **`手上={_h!r}`** 一起打出来, 一眼能分开这两种。
-                    _who = (f" —— ⚠ 而**手上还拿着 {_h!r}**(上板前那一下会把它放上去, "
-                            f"板子就废了)" if _h else
-                            " —— **不是空板, 是站位/朝向**(`placeh` 对得上但 "
-                            "`m_interactable` 是空的)")
-                    self.log(f"[步骤] ✗ 按了但**一下都没落到 {board.id} 上**, 而板上"
-                             f"**明明有 {_on!r}**{_who}")
-                    _blame_hand = bool(_h)
+        try:
+            _blame_hand = False
+            for i in range(max_chops + 3):
+                if not self.round_active():
+                    return False
+                if _board_workable():
+                    landed += 1
+                self.kb.chop()
+                time.sleep(0.35)
+                cur = self._board_item(board.id)
+                if base and cur and cur != base:
+                    self.log(f"[步骤] 切好了({i+1} 刀): {base} → {cur}")
+                    # ⚠ **不在这儿放板**: 收尾那一下(把切好的料拿回手上)还在同一个 `try` 里,
+                    #   让占位**盖住它**才对 —— 否则队友正好在这半秒里占了这块板、
+                    #   把自己的料放上来, 我那一"拿起"会端走**他的**东西。
+                    #   统一由下面的 `finally` 放(见那段注释)。
+                    done = True
+                    break
+                if not base and landed and i + 1 >= max_chops:
+                    done = True   # 读不到板上的名字, 按刀数收工(**但要有回执**)
+                    break
+            if not done:
+                if not landed:
+                    # ☠☠ **两种情况必须分开报**(实测 2026-09-15, board0/1/2 三块板连着犯):
+                    #     · 板上**没东西** ⇒ 这块板真的是空的, 换一块就对
+                    #     · 板上**有东西**, 而 `use` 还是没有目标 ⇒ **不是空板**,
+                    #       是**站位/朝向**的问题 —— 拿到的正是 `(板上: SushiFish)`
+                    #       紧接着 `直调 use 失败: 身边没有可互动的东西` ×10。
+                    #   ⚠ 根因: `_align_for_place` 验的是 `placeh`(**放置目标**),
+                    #     而 `use` 是**另一个字段**(`m_interactable`) —— **放置对得上 ≠
+                    #     交互够得着**。所以"放上去了、却按不动"是完全可能的状态。
+                    #   ⚠ 原来这里一律写"多半是这块板空的", 在第二种情况下**是错的**,
+                    #     会把人引去查台面而不是查站位。
+                    _on = self._board_item(board.id)
+                    _, _, _h = self.pos(self.state() or {})
+                    #: 这一趟是**手上的锅**还是**板的锅** —— 决定要不要把这块板划掉(见下面)。
+                    _blame_hand = False
+                    if _on:
+                        # ☠☠ **别急着写"站位/朝向"** —— 还有第三种成因, 而且更常见:
+                        #   上来之前**手上拿着别的东西**, 而 `op_chop` 的头一件事是
+                        #   `if held: interact("pickup")`("先放上板") ⇒ 那件废料被放上去,
+                        #   板子当场失效、`use` 全部打空。实测(2026-09-15): 手持**生 SushiRice**
+                        #   去切板上那块 `SushiFish`, 上面这条日志把排查引去查脚下,
+                        #   而真正的原因在**手上**(见 `_op_actionable` 的 `chop` 分支)。
+                        #   ⇒ 手上有东西就把 **`手上={_h!r}`** 一起打出来, 一眼能分开这两种。
+                        _who = (f" —— ⚠ 而**手上还拿着 {_h!r}**(上板前那一下会把它放上去, "
+                                f"板子就废了)" if _h else
+                                " —— **不是空板, 是站位/朝向**(`placeh` 对得上但 "
+                                "`m_interactable` 是空的)")
+                        self.log(f"[步骤] ✗ 按了但**一下都没落到 {board.id} 上**, 而板上"
+                                 f"**明明有 {_on!r}**{_who}")
+                        _blame_hand = bool(_h)
+                    else:
+                        self.log(f"[步骤] ✗ 按了但**一下都没落到 {board.id} 上**"
+                                 f"(游戏说 use 作用不到它) —— 这块板**确实是空的**; "
+                                 f"不把「原地空按」当成切好了")
                 else:
-                    self.log(f"[步骤] ✗ 按了但**一下都没落到 {board.id} 上**"
-                             f"(游戏说 use 作用不到它) —— 这块板**确实是空的**; "
-                             f"不把「原地空按」当成切好了")
-            else:
-                # ClientWorkableItem 完成时会替换板上的物件。若名字仍未变化，说明
-                # use 没有送到游戏；把生料拿回手里不能算切菜完成。
-                self.log("[步骤] ✗ 切完但板上物品没有变化，拒绝把生料当成成品")
-            # 这一类 = **这一趟办不成** ⇒ 换一支, 别原地重试(用户: "返回到其他路")。
-            self._last_fail_kind = KIND_BRANCH
-            if _blame_hand:
-                # ☠ **不是这块板的错, 别把它划掉 25 秒** —— 错在手上(上来之前拿着别的料),
-                #   板子是好的。实测那局 `board1`/`board2` 各被冤枉划掉一次(每次 25 秒),
-                #   最后只剩 board0 能用。⇒ 板子留着, 让上层**换一份手**再来。
-                self.log(f"[步骤]    这一趟是**手上拿着东西**的锅 —— {board.id} 不划掉"
-                         f"(它是好的, 别让它背 25 秒冷板凳)")
-            else:
-                self.mark_branch_dead(op.target, board.id, "切不动")
-                self._release_res("board", board.id)   # ☠ 这一支走不通 ⇒ 放板, 让队友来试
-            return False
-        # ⚠ **收尾那一下必须是「拿起」, 不能是「放下」** —— `verify_hold_change` 的判据是
-        #   "持有物变了没有", 而**放下也会让它变** ⇒ 原来对着空板按一下就把手里的料
-        #   丢在那儿, 却报 `✓`(实机日志里 `✓ chop` 的**下一格**就是 `assemble 手空`)。
-        if not self.interact("pickup", verify_hold_change=True):
-            return False
-        _, _, _held_after = self.pos(self.state(force=True) or {})
-        if not _held_after:
-            self.log("[步骤] ✗ 切完收尾那一下把手里的料**放下去了**(收工时手是空的) —— "
-                     "这不是「拿起」, 判失败")
-            return False
-        return True
+                    # ClientWorkableItem 完成时会替换板上的物件。若名字仍未变化，说明
+                    # use 没有送到游戏；把生料拿回手里不能算切菜完成。
+                    self.log("[步骤] ✗ 切完但板上物品没有变化，拒绝把生料当成成品")
+                # 这一类 = **这一趟办不成** ⇒ 换一支, 别原地重试(用户: "返回到其他路")。
+                self._last_fail_kind = KIND_BRANCH
+                if _blame_hand:
+                    # ☠ **不是这块板的错, 别把它划掉 25 秒** —— 错在手上(上来之前拿着别的料),
+                    #   板子是好的。实测那局 `board1`/`board2` 各被冤枉划掉一次(每次 25 秒),
+                    #   最后只剩 board0 能用。⇒ 板子留着, 让上层**换一份手**再来。
+                    self.log(f"[步骤]    这一趟是**手上拿着东西**的锅 —— {board.id} 不划掉"
+                             f"(它是好的, 别让它背 25 秒冷板凳)")
+                else:
+                    self.mark_branch_dead(op.target, board.id, "切不动")
+                    # ⚠ **放占位统一由 `finally` 做** —— 见那段注释("一个出口")。
+                return False
+            # ⚠ **收尾那一下必须是「拿起」, 不能是「放下」** —— `verify_hold_change` 的判据是
+            #   "持有物变了没有", 而**放下也会让它变** ⇒ 原来对着空板按一下就把手里的料
+            #   丢在那儿, 却报 `✓`(实机日志里 `✓ chop` 的**下一格**就是 `assemble 手空`)。
+            if not self.interact("pickup", verify_hold_change=True):
+                return False
+            _, _, _held_after = self.pos(self.state(force=True) or {})
+            if not _held_after:
+                self.log("[步骤] ✗ 切完收尾那一下把手里的料**放下去了**(收工时手是空的) —— "
+                         "这不是「拿起」, 判失败")
+                return False
+            return True
+        finally:
+            # ☠☠ **这一趟的**唯一出口** —— 认领了菜板就必须还**(2026-09-17)。
+            #   原来 `return` 有 **5 处**没放占位(用户点名的 `round_active` 那条只是其一):
+            #   收尾那次 `interact` 失败 / 收尾后手是空的 / `_blame_hand` 那条 /
+            #   **按刀数收工那条成功路** —— 每一条都把菜板锁给队友 `BOARD_CLAIM_TTL`(25s)。
+            #   ⚠ 这一族**前面已经栽过一次**(本函数顶上的 `UnboundLocalError` 那段):
+            #     失败路径上的收尾和成功路径一样是承重的。⇒ 结构上只留**一个**出口,
+            #     下一个新增的 `return` 再也漏不掉(`_release_res` 只放自己的, 重复调无害)。
+            self._release_res("board", board.id)
 
     def op_cook(self, km, x, z, op: Op, st: dict, flow: DishFlow = None) -> bool:
         """把东西放上灶台, 盯到"刚熟"立刻取下(生和焦都不算)。
