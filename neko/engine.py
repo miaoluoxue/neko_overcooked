@@ -7597,6 +7597,48 @@ class Engine:
                 still = now - pt
         return ox, oz, held, still, bool(self.teammate_is_human)
 
+    # ---- 接地分类(2026-09-17, 用户: "完整语义的可行性规划")-------------------
+    #: `_op_target_for_score` **为什么没解析出目标** —— 见 `_no_target` 的长注释。
+    #: 规划器原来把"解析不出目标"**一律当成"这条支不存在"**并剪掉; 可它混着四类,
+    #: **只有 `no_source` 该剪**。
+    GROUND_UNKNOWN = "unknown"          # 判不了 ⇒ **归它 = 保守(照老行为, 剪)**
+    GROUND_NO_SOURCE = "no_source"      # 真的没有货源 / 没有那个工位  ⇒ **剪**
+    GROUND_FAR = "far"                  # 有货源、就是够不着            ⇒ 不剪
+    GROUND_BUSY = "busy"                # 工位都被占着                  ⇒ 不剪
+    GROUND_PENDING = "pending"          # 还没挑 / 还没解析出坐标        ⇒ 不剪
+    #: **该剪的那几类**。⚠ 归类错只会**退回老行为**(照旧剪), 不会把判据修松 ——
+    #: 所以保守方向是"判不了归这里"。`runtime\_planctx_probe.py` 第 ⑭ 节
+    #: ("背包的主人自己取不了")就是靠这条保住的。
+    GROUND_PRUNE = (GROUND_NO_SOURCE, GROUND_UNKNOWN)
+
+    def _no_target(self, kind: str, label: str):
+        """`_op_target_for_score` 的**失败出口** —— 顺手记下"为什么接不上地"的分类。
+
+        ☠☠ 为什么必须有它: 规划器把 `_op_target_for_score` 返回 `None`
+          **一律当成"这条支不存在"**并剪掉(`check` 的 `ok = _cell is not None`),
+          而那 11 个失败出口里**混着四类**, 只有一类是真的不可能:
+
+            · `no_source` **真的没有** —— 哪都没有货源 / 这关没有送餐口 /
+              这关没有搅拌台 / 空操作。**该剪。**
+              ☠ **跨人约束也从这儿进**: "自己的背包自己取不了" 并不是
+                `_op_actionable` 判的, 而是 `_fetch_source_live` 的 `exclude_back`
+                在**接地这一层**把货源排除掉 ⇒ 它长得和"真的没有"一模一样。
+                (2026-09-17 实测: 拿两个布尔去分, `_planctx_probe` ⑭ **当场打回**。)
+            · `far`       有货源、计划坐标也在, **就是够不着** —— 可达性会变, 不剪
+            · `busy`      工位**都被占着** —— 别人做完了就有, 不剪
+            · `pending`   **还没挑 / 还没解析出坐标**(摆盘位、队友位置、杂活目标)——
+                          而"接地"的定义就是**执行期每轮重解析**(`planner.py`
+                          文件头那张"骨架 / 接地"表), 不剪
+
+        ⚠ **不改返回形状**(仍是 `(None, label)`) —— 它有 4 个调用点, 而且
+          `runtime\_splitkitchen_probe.py` 里的桩**覆写**了 `_op_target_for_score`,
+          改签名会把那个离线探针一起炸掉。所以分类走**实例属性**这个出口。
+        ⚠ 读的人(`_feasible`)会**先清零再读** ⇒ 读到的永远是**本次**那个 ——
+          别在别处读 `_ground_kind`(那可能是上一次的残留)。
+        """
+        self._ground_kind = kind
+        return None, label
+
     def _op_target_for_score(self, km, st, op, x: float, z: float,
                              tm=None, reach=None, me_back=None):
         """给评分用: 这一步"要去哪儿" —— 返回 `((tx,tz), label)` 或 `(None, 原因)`。
@@ -7641,28 +7683,37 @@ class Engine:
                                  f"@{tgt[0]:.1f},{tgt[1]:.1f} 够不着 → "
                                  f"改用够得着的 {s.id}@{s.x:.1f},{s.z:.1f}")
                     return (s.x, s.z), s.id
-                return None, (f"够不着: 计划货源@{tgt[0]:.1f},{tgt[1]:.1f}, "
-                              f"也没有别的够得着的货源")
+                return self._no_target(
+                    self.GROUND_FAR,
+                    f"够不着: 计划货源@{tgt[0]:.1f},{tgt[1]:.1f}, "
+                    f"也没有别的够得着的货源")
             if tgt is None:
                 # 计划里压根没有货源坐标 —— 再现场找一次(箱子可能刚刷出来/知识表没认出来)
                 s = self._fetch_source_live(km, st, op, x, z, tm=tm, reach=reach,
                                             me_back=me_back)
                 if s is not None:
                     return (s.x, s.z), s.id
-                return None, "无货源坐标(现场也没找到能出它的箱子/台面)"
+                return self._no_target(
+                    self.GROUND_NO_SOURCE,
+                    "无货源坐标(现场也没找到能出它的箱子/台面)")
             return tgt, (op.at_name or "?")
         if a == "chop":
             # ⚠ **和 `op_chop` 用同一个 `_pick_board`** —— 不能一个挑"最近那块"、
             #   另一个挑"收得下的那块": 判据一旦漂开, 就会出现"评分算的是这块板、
             #   执行跑去了那块板"(这项目已经栽过好几次)。
             b = self._pick_board(km, x, z, op.target, claim=False)   # 评分: 不占位
-            return ((b.x, b.z), b.id) if b else (None, "没有能用的切菜板(都被占着?)")
+            if b is None:
+                return self._no_target(self.GROUND_BUSY,
+                                       "没有能用的切菜板(都被占着?)")
+            return (b.x, b.z), b.id
         if a == "mix":
             # ⚠ **搅拌台不是切菜板**: 去的是 `MixingStation`(`sem == "mix"`)。
             #   原来这两类共用一行"最近的切菜板", 于是 mix 永远指着一个板子 ——
             #   而 `op_mix` 去了那儿只会把料放板上(切成片而不是搅匀)。
             mk = km.nearest("mix", x, z)               # 与 op_mix 同一行
-            return ((mk.x, mk.z), mk.id) if mk else (None, "没有搅拌台")
+            if mk is None:
+                return self._no_target(self.GROUND_NO_SOURCE, "没有搅拌台")
+            return (mk.x, mk.z), mk.id
         if a == "cook":
             want_pot = bool(getattr(op, "in_pot", False))
             s, _ck = self._find_pot_with(km, x, z, op.target, claim=False)
@@ -7670,7 +7721,9 @@ class Engine:
                 s, _p, _c = self._pick_stove(km, x, z, want_pot, claim=False, ing=op.target)
             if s is None and want_pot:
                 s, _p, _c = self._pick_stove(km, x, z, False, claim=False, ing=op.target)
-            return ((s.x, s.z), s.id) if s else (None, "没有能用的灶台")
+            if s is None:
+                return self._no_target(self.GROUND_BUSY, "没有能用的灶台")
+            return (s.x, s.z), s.id
         if a == "assemble":
             # ☠ **目的地是碗的那些**(mix 组, `Op.into_bowl`)⇒ 去**搅拌台**,
             #   而不是摆盘位 —— 用户: "碗的内容物无法和盘子交互"。
@@ -7678,25 +7731,33 @@ class Engine:
             #     是同一个台子"(和 `mix` 的可行性分支同一行惯用法)。
             if getattr(op, "into_bowl", False):
                 mk = km.nearest("mix", x, z)
-                return ((mk.x, mk.z), mk.id) if mk else (None, "这关没有搅拌台(放不进碗)")
+                if mk is None:
+                    return self._no_target(
+                        self.GROUND_NO_SOURCE, "这关没有搅拌台(放不进碗)")
+                return (mk.x, mk.z), mk.id
             sp = self.assemble_spot                     # 只读 —— 见上面那段警告
-            return ((sp.x, sp.z), sp.id) if sp else (None, "还没挑摆盘位")
+            if sp is None:
+                return self._no_target(self.GROUND_PENDING, "还没挑摆盘位")
+            return (sp.x, sp.z), sp.id
         if a == "deliver":
             sv = km.nearest("serve", x, z)              # 与 618 / 2911 同一惯用法
-            return ((sv.x, sv.z), sv.id) if sv else (None, "没有送餐口")
+            if sv is None:
+                return self._no_target(self.GROUND_NO_SOURCE, "没有送餐口")
+            return (sv.x, sv.z), sv.id
         # **传球**: 目标是**队友**(探测阶段写进 `at_x/at_z`)。
         if a == "pass":
             if op.at_x or op.at_z:
                 return (op.at_x, op.at_z), (op.at_name or "队友")
-            return None, "传球: 没解析到队友位置"
+            return self._no_target(self.GROUND_PENDING,
+                                   "传球: 没解析到队友位置")
         # **杂活**: 目标在**探测阶段**就解析好了(`_chore_candidates` 写进 `at_x/at_z`),
         # 这里直接拿 —— 和 `fetch` 的"已知货源"同一条路。
         # ⚠ 探测和执行必须看同一个台面, 否则会"按 A 台算的分、走到 B 台去干"。
         if a in CHORE_ACTIONS:
             if op.at_x or op.at_z:
                 return (op.at_x, op.at_z), (op.at_name or a)
-            return None, f"{a}: 没解析到目标"
-        return None, f"空操作({a})"
+            return self._no_target(self.GROUND_PENDING, f"{a}: 没解析到目标")
+        return self._no_target(self.GROUND_NO_SOURCE, f"空操作({a})")
 
     def _cook_takeout(self, km, x, z, op) -> bool:
         """这一步 `cook` 是**"从锅里取菜"**那一半吗(锅里**已经**有要煮的那份了)。
@@ -9705,6 +9766,11 @@ class Engine:
                 _owner[id(_o)] = _f
         mate = self._mate(st)
 
+        #: **一键回退**: `NEKO_PLAN_GROUND=0` ⇒ 逐字退回"接不上地就剪"的老行为。
+        #: 按本仓惯例给回退口 —— 这一刀动的是**规划器的判据**。
+        _ground_ok = (os.environ.get("NEKO_PLAN_GROUND") or "1").strip().lower() \
+            not in ("0", "off", "no", "false")
+
         def check(op, chef, assume_held=None):
             """`(op, chef, assume_held) -> (ok, why, dist)` —— 见 `planner._ok`。
 
@@ -9749,7 +9815,23 @@ class Engine:
             #     (从厨师出发的 BFS 步数表), 不自己算几何。
             _cell = r.get("cell")
             _dist = reach.get(_cell) if _cell is not None else None
-            return (_cell is not None, r.get("why") or "", _dist)
+            if _cell is not None:
+                return True, r.get("why") or "", _dist
+            # ☠☠ **只有「真的没有」那一类才剪**(2026-09-17)。
+            #   规划器原来拿 `_cell is not None` 一刀切 ⇒ "此刻接不上地"被当成
+            #   "这条支不存在"剪掉 ⇒ **完备求解器不完备**。分类见 `_no_target`。
+            #   ⚠ 收下的那几类给一个**悲观代价**(999.0): 有真解得出来时**永远输给真解**,
+            #     只有**全都**接不上地时才轮到它 —— 既恢复完备性, 又不扭曲偏好
+            #     (代价只在"同一个目标的不同拿法"之间比, 不参与"选哪一步")。
+            #   ⚠ `no_source` / `unknown` **照旧剪** —— 跨人约束就藏在 `no_source` 里
+            #     (`runtime\_planctx_probe.py` ⑭ 盯着这条, 别把它修松)。
+            if _ground_ok and r.get("action") \
+                    and r.get("ground") not in self.GROUND_PRUNE:
+                return (True,
+                        f"规划期接不上地[{r.get('ground')}]"
+                        f"({r.get('why') or '解析不出目标'}) —— 按'存在'收下, 执行期再解析",
+                        999.0)
+            return False, r.get("why") or "", _dist
 
         return world, check
 
@@ -10614,8 +10696,12 @@ class Engine:
         #   不传 ⇒ 那条路**逐字退回老行为**, 也不会把桩炸掉。
         #   ⚠ 执行期走的就是"不传"(= 本引擎厨师的背), 行为一个字都不变。
         _tb = {"me_back": back} if back is not None else {}
+        # ☠ **先清零再问** —— `_no_target` 把分类写在实例属性上(不改返回形状, 见那边
+        #   的注释), 清零保证下面读到的是**本次**那个, 不是上一次的残留。
+        self._ground_kind = self.GROUND_UNKNOWN
         target, label = self._op_target_for_score(km, st, op, cx, cz, tm=tm, reach=reach,
                                                   **_tb)
+        _ground = self._ground_kind
         # ⚠ `flow_of` **只在有值时传**(按步协作): 老调用方/离线桩的子类可能还没有这个
         #   形参(`_splitkitchen_probe` 就自己覆写了 `_op_actionable`)——
         #   不传 ⇒ 那条路**逐字退回老行为**, 也不会把桩炸掉。
@@ -10656,21 +10742,18 @@ class Engine:
             else:
                 cell = self._stand_cell_of(tm, target[0], target[1], cx, cz,
                                            ortho_only=True, reach=reach)
-        # ☠☠ **这两个字段现在还没人读 —— 别删, 它们是下一刀的原料**(2026-09-17)。
-        #   本来想用它们把「动作不可能」和「规划期接不上地」分开, 好让规划器
-        #   **别剪掉存在的分支**。`runtime\_planctx_probe.py` 第 ⑭ 节当场打回来:
-        #     ✗ 反面: **背包的主人自己取不了**(改前/改后都必须是 False)
-        #   根因: **跨人约束不是由 `_op_actionable` 执行的** —— 它是靠
-        #   `_fetch_source_live` 的 `exclude_back` 在**接地那一层**把货源排除掉。
-        #   ⇒ "接地失败"里混着**两类**, 而 `action`/`grounded` 这两个布尔**分不开**:
-        #     · **真的没有**(哪都没有货源) —— **该剪**; 跨人约束就从这儿进
-        #     · **有, 但此刻够不着/解析不出坐标** —— **不该剪**(接地是执行期的事)
-        #   ⇒ 下一刀要让 `_op_target_for_score` 把"为什么没接地"**分类带出来**
-        #     (至少 `no_source` / `unreachable` 两种), 而不是再加一个布尔。
+        # ☠☠ **这三个字段是给规划器的**(2026-09-17, 用户: "完整语义的可行性规划")。
+        #   规划器原来只有一个 `cell is not None` 可用 ⇒ **两种完全不同的"不行"
+        #   长得一模一样** ⇒ 把"此刻接不上地"当成"这条支不存在"剪掉 ⇒
+        #   **完备求解器不完备** ⇒ `[规划] … 推不出解`。
+        #     · `action` = `_op_actionable` 的判决(前置/阶段/手持闸门)
+        #     · `ground` = **为什么没接上地** —— 四类, 见 `_no_target` 的长注释;
+        #       **只有 `no_source` 该剪**(跨人约束也从那儿进)
+        #   ⚠ 新增键是**加法** —— `_rank_candidates` 读的是 `d`/`why`/`label`/`cell`,
+        #     多几个键不影响它。
         return {"op": op, "label": label, "why": why, "cell": cell,
                 "dist": None, "follow": 0.0,
-                "action": bool(ok),
-                "grounded": bool(target is not None or _pass_ok)}
+                "action": bool(ok), "ground": _ground}
 
     def _dish_foreign(self, have, flow) -> set:
         """`have`(一盘里装的东西)里**本单不要**的那些 —— **非空就是"别的单的菜"**。
