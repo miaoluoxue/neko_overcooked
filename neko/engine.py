@@ -4610,6 +4610,21 @@ class Engine:
 
         landed = 0
         done = False
+        #: **这一趟是「手上的锅」还是「板的锅」** —— 失败时决定要不要把这块板划掉。
+        #:
+        #: ☠☠ **必须在这里初始化, 不能等失败分支里再赋**(2026-09-17 实机打回来的):
+        #:   原来只在下面 `if not landed:` 那个分支里赋 `False`, 而**块外**
+        #:   `if _blame_hand:` 要读它 ⇒ 走另一条失败路(**`landed` 为真、但板上名字没变**,
+        #:   即日志里那句"切完但板上物品没有变化")时它**从没被赋值** ⇒
+        #:     `UnboundLocalError: cannot access local variable '_blame_hand'`
+        #:   ☠ 代价远不止一行报错 —— 异常从 `op_chop` 冒到 `do_op` 的 `except`
+        #:     (只留一行 `[引擎] chop 异常: …`), 后面那两件事**全都走不到**:
+        #:       · `mark_branch_dead` ⇒ 这块板**不被划掉** ⇒ 下一轮又选它, 原地打转;
+        #:       · `_release_res("board", …)` ⇒ **菜板占位泄漏 25 秒**(`BOARD_CLAIM_TTL`)
+        #:         ⇒ **队友被挡**(和 `_pick_board` 那次是同一类账, 只是另一条路)。
+        #:   ⚠ 教训: **失败路径上的收尾和成功路径一样是承重的** —— 别让一个
+        #:     `UnboundLocalError` 把"划死 + 放占位"整段带走, 而日志上只剩一句含糊的"异常"。
+        _blame_hand = False
         for i in range(max_chops + 3):
             if not self.round_active():
                 return False
