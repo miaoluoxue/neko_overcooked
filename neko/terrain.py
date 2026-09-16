@@ -121,6 +121,19 @@ STEP_HEIGHT_MAX = 0.65
 #:   所以一个数就够, 不需要"坡道豁免"那种特判。
 STEP_MAX = 1.00
 
+#: **贴边代价**(格) —— A* 每经过一格"紧挨着会掉下去的地方"就加这么多。
+#:
+#: 用户 2026-09-17(`s_wonderland_1_5` 实机): "**寻路有问题, 最好边缘有一点距离**"。
+#: 那一局两个厨师**摔死 12 次**, 而路径一直是**贴着深渊那一条**走 —— 被 NPC
+#: (`DLC03_NPC_02`) 或者风推一下就下去。这一关 41x24 格里**危险格 434**(≈44%),
+#: 平台四周全是 KillPlane, 所以"贴边"在这里就是"走在悬崖沿上"。
+#:
+#: ⚠ **是代价, 不是闸门**: 窄通道整条都是贴边格, 那时它只是个常数, 路照样通。
+#:   这和 `STEP_MAX`(闸门)是两回事 —— 别把任何一个改成另一个。
+#: 值取 0.6: 比一格直走(1.0)小、比"绕一格再回来"贵一点点 ⇒ **只有当绕行不远时
+#:   才值得**; 要绕很远时 A* 照旧走边上那条(不会为了躲边把路绕飞)。
+RIM_STEP_PENALTY = 0.6
+
 #: **默认高度容差** —— 只在"这一关算不出层间距"时才用(见 `_derive_height_tol`)。
 #:
 #: ⚠ 正常路径**不是**用它: 每张 `TerrainMap` 会从**自己这一关**的地板高度分布
@@ -621,6 +634,59 @@ class TerrainMap:
     def is_danger_world(self, x: float, z: float) -> bool:
         return self.is_danger(*self.cell_of(x, z))
 
+    # ---------------------------------------------------------------- 贴边
+    def fall_margin(self, i: int, j: int) -> int:
+        """**这一格离"会掉下去的地方"还有几格** —— 0 = 它自己就是危险格, 1 = 紧挨着。
+
+        为什么要有个"几格"而不是一个布尔(用户 2026-09-17: "**最好边缘有一点距离**"):
+          "贴边"不是一个是非题 —— 站在悬崖沿上和站在里面第二格, 被 NPC/风推一下的
+          结果完全不一样。而**判据只有一处**(`is_danger`), 别在调用方各写各的:
+            · `is_rim()` = `== 1`(最外那一圈) —— 给"要躲开"的地方用;
+            · A* 加的是 `<= 1` 的代价(见 `RIM_STEP_PENALTY`)。
+          ⚠ **界外不算**: 网格不一定正好扣着平台, 拿"界外"当掉下去会把整圈边界格
+            都判成贴边 —— 那是假的, 而且会平白把路推离地图边缘。判据只有 `is_danger`。
+
+        实现: 从**所有**危险格做一次多源 BFS, 每格记步数; 只数到 4 格以内就停
+        (再远就没意义了 —— 我们要的只是"贴不贴边")。结果**按 `TerrainMap` 实例缓存**:
+        实例变了(地形版本变了)自然重算, 与 `_field_cache` 那套同一个道理。
+        """
+        return self._margin_map().get((i, j), 9)
+
+    def _margin_map(self) -> dict:
+        m = getattr(self, "_margin", None)
+        if m is not None:
+            return m
+        m = {}
+        if self.ok:
+            from collections import deque
+            q = deque()
+            for j in range(self.h):
+                for i in range(self.w):
+                    if self.is_danger(i, j):
+                        m[(i, j)] = 0
+                        q.append((i, j))
+            while q:
+                ci, cj = q.popleft()
+                d = m[(ci, cj)]
+                if d >= 4:
+                    continue
+                for di, dj in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                    n = (ci + di, cj + dj)
+                    if n in m or not self.inside(*n):
+                        continue
+                    m[n] = d + 1
+                    q.append(n)
+        self._margin = m
+        return m
+
+    def is_rim(self, i: int, j: int) -> bool:
+        """**贴边格** = 可走、但紧挨着会掉下去的地方(`fall_margin == 1`)。
+
+        ⚠ 窄通道里**每一格都是贴边格** ⇒ 凡是用它的地方都必须是**偏好**而不是闸门,
+          否则等于把窄通道整条封死(和 `RIM_STEP_PENALTY` 那条注释同一个理由)。
+        """
+        return self.walkable(i, j) and self.fall_margin(i, j) == 1
+
     def nearest_walkable(self, i: int, j: int, radius: int = 5) -> tuple | None:
         """找离 (i,j) 最近的可走格 —— 台子本身是障碍, 得站到它旁边。
 
@@ -737,6 +803,14 @@ class TerrainMap:
         came = {start: None}
         best = {start: 0}
         found = None
+        # ☠ **贴边代价**: 拿"离危险格几格"当每格的地皮税 —— 见 `RIM_STEP_PENALTY`
+        #   (用户 2026-09-17: "最好边缘有一点距离")。**只进代价, 不进启发式** ——
+        #   `h` 仍然是"格数", 加了正的地皮税只会让真实代价**更大**, 可采纳性不受影响。
+        #   ⚠ 已知局限: `_smooth`(视线拉直)只按 `ok` 判, **不知道这条税** ——
+        #     于是拉直那一跳**仍可能蹭到边**(宽走廊绕远时才会; 窄通道本来就躲不开,
+        #     那里这条税是常数, 无所谓)。要连拉直一起管就得让 `_line_clear` 也躲边,
+        #     代价是窄通道里再也拉不直(每格一个路点 ⇒ 到位→转身 一轮一次), 更糟。
+        self._margin_map()          # 预热(下面每格一次 `is_rim` 会查它)
         while openq:
             _, gc, cur = heapq.heappop(openq)
             if cur in goalset:
@@ -766,6 +840,8 @@ class TerrainMap:
             for nb, cost in nbs:
                 if not ok(nb, cur) and nb not in _ee:
                     continue
+                if self.is_rim(*nb):
+                    cost += RIM_STEP_PENALTY          # 贴边地皮税(见 RIM_STEP_PENALTY)
                 ng = gc + cost
                 if nb in best and best[nb] <= ng:
                     continue

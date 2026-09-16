@@ -37,6 +37,36 @@ BELT_STAND_PENALTY = 1e6
 #: **比传送带的略小**: 传送带是格属性(必然一直推), 风是体积且会被机关关掉(enabled=false)。
 WIND_STAND_PENALTY = 1e5
 
+#: 选站位时给**贴边格**(紧挨着会掉下去的地方, `TerrainMap.is_rim`)加的距离惩罚。
+#:
+#: 用户 2026-09-17(`s_wonderland_1_5` 实机): "**寻路有问题, 最好边缘有一点距离**"。
+#: 那一关 41x24 格里**危险格 434**(≈44%) —— 平台被 KillPlane 围了一圈, 两个厨师
+#: **摔死 12 次**。`WIND_STAND_PENALTY` 上面那句"被推到边缘掉下去"讲的就是同一个病,
+#: 只是那次只治了风; 而**深渊本身**比风常见得多。
+#:
+#: ⚠ 与上面两条**不同**: 那两个是"站进去会漂"(1e6/1e5, 只要能不站就不站),
+#:   而"贴边"是**程度**问题 —— 站边上不等于会掉。所以这个数取**小得多**的 4.0:
+#:   世界距离是平方, 邻格 1.2 格 ⇒ 差一格才 1.44 ⇒ 4.0 的意思是
+#:   "**宁可多走两格也要站里侧那一格**", 但不会为了躲边把厨师支到半个厨房外。
+#: ⚠ 仍然是**惩罚而不是排除**: 台面就贴着深渊时还是得站上去(`_stand_scan` 的
+#:   `max_di=1` 那一趟本来也只有 4 个正方向可选 —— 能选的里面挑里侧那个)。
+RIM_STAND_PENALTY = 4.0
+
+
+def _is_rim(tm, i: int, j: int) -> bool:
+    """**这一格贴不贴着"会掉下去的地方"** —— `TerrainMap.is_rim` 的**容错读法**。
+
+    ☠ 为什么要转发一层而不是直接 `tm.is_rim(...)`: 本仓 `runtime/` 下几十个离线探针
+      用的是**自己写的假地形**(`_fieldfrontier_probe.py` 的 `FakeTM` 那种), 它们没有
+      `is_rim`。直接调就是 **AttributeError**, 整批探针当场报废 —— 而那些探针是这批
+      改动**唯一**的验收面。取不到 ⇒ 返回 `False`(= "没有贴边这回事") ⇒ 所有贴边判据
+      自动失效、**逐字退回改前行为**, 和 `getattr(km, "items", None)` 那套同一个形状。
+
+    ⚠ **定义只有一处**(`TerrainMap.is_rim`), 这里只转发 + 兜底, 不重写判据。
+    """
+    f = getattr(tm, "is_rim", None)
+    return bool(f(i, j)) if f is not None else False
+
 #: **小物件(掉在地上的料 / 传送带上的料)的落位半径**(格)。
 #:
 #: 病根是**碰撞体大小**, 不是名字。交互判据是"到**碰撞体表面**的距离 < 1.0 且朝向前 180°"
@@ -743,6 +773,15 @@ class Engine:
         #: `navigate_smart` 据此直接放弃这一趟, 不烧 `replans` 那几轮。
         #: 每次 `navigate()` 开头都会复位(见那里), 别读残留值。
         self._last_stuck_no_learn = False
+        #: `_field_dir` 上一次为什么给不出方向 —— 五选一, 由它自己填。
+        #: ☠☠ 为什么要拆(2026-09-17 `s_wonderland_1_5`): 那一局 `[导航] ✗ 步数表也给不出
+        #:   方向` **打了 42 次**, 而它们本来**长得一模一样** —— 可背后的处置完全不同:
+        #:     · 地形不可用 / 连迈一步都没有落点 ⇒ 是**图/位置**的问题, 换目标没用;
+        #:     · 邻格全被闸门挡掉 ⇒ 是**这一格**的问题(危险格/队友挡着/跨不过去);
+        #:     · 真够不着 ⇒ 才是"该换目标"。
+        #:   日志是省掉测试后的唯一线索, 四种糊成一句就只能靠猜。
+        #: 每次 `_field_dir` 返回 `None` 时都会重写, 别读残留值。
+        self._field_none_why = ""
         #: 上一次"卡住"是不是因为**有个厨师站在那一格**(不是墙) —— 存那个厨师的 id。
         #: ☠ 它决定"这一趟还要不要继续": 撞墙要重规划绕开, 撞人只要**再推一会儿**
         #:   (实机 2026-09-16: 队友空转站着不动, P1 的送餐那一趟被当成撞墙中止了)。
@@ -1003,6 +1042,7 @@ class Engine:
           地形版本 `tm.ver` 变了(荷叶/按钮/平台/火)自然重算。
         """
         if tm is None or not getattr(tm, "ok", False):
+            self._field_none_why = "地形不可用(拿不到图)"
             return None
         tgt = tm.cell_of(tx, tz)
         key = (tm.ver, tgt)
@@ -1044,6 +1084,7 @@ class Engine:
                 self._field_frontier_cache = _fc
             _ff = _fc[1]
             if _ff is None:
+                self._field_none_why = "真够不着(我走得到的和到得了目标的, 两块没有交集)"
                 return None                      # 真够不着 ⇒ 上层换目标, 不硬推
             _fcell, dist = _ff
             tx, tz = tm.world_of(*_fcell)
@@ -1069,9 +1110,11 @@ class Engine:
                     if _dn is not None and (cur is None or _dn < cur):
                         cur = _dn
             if cur is None:
+                self._field_none_why = ("连迈一步都没有落点(我和 8 邻格都不在表里 —— "
+                                        "多半被推到界外/不可走区)")
                 return None                      # 连"迈出这一步"都没地方去
             cur += 1
-        best, pick_d, best_dot = None, None, -2.0
+        best, pick_d, best_dot, best_rim = None, None, -2.0, True
         ux, uz = (tx - x), (tz - z)
         _un = (ux * ux + uz * uz) ** 0.5 or 1.0
         for di in (-1, 0, 1):
@@ -1097,15 +1140,27 @@ class Engine:
                 if _bn < 1e-6:
                     continue
                 dot = ((bx - x) * ux + (bz - z) * uz) / (_bn * _un)
-                # 先比步数(越小越靠近目标), 步数相同再比"谁更朝着目标"
-                if pick_d is None or dn < pick_d or (dn == pick_d and dot > best_dot):
-                    best, pick_d, best_dot = n, dn, dot
+                # 先比步数(越小越靠近目标), 步数相同再**优先不贴边**, 最后才比朝向。
+                # ☠ 中间这一档是用户 2026-09-17 要的("最好边缘有一点距离"): 步数并列时
+                #   原来由 `dot`(谁更朝着目标)说了算 —— 而"更朝目标"那一格在宽走廊里
+                #   **往往就是靠边那一格**, 于是路一直贴着深渊走(那一局摔死 12 次)。
+                #   ⚠ 只在**步数并列**时才看它 ⇒ 不会为了躲边绕远(绕远要动 `dist`, 是
+                #     另一回事); 而窄通道里两边都贴边 ⇒ 这一档恒等, 逐字退回 `dot` 定胜负。
+                #   ⚠ `best_rim` 初值 `True` = "还没挑过" —— 第一个候选无论如何都该中选。
+                _rim = _is_rim(tm, *n)
+                if pick_d is None or dn < pick_d \
+                        or (dn == pick_d and (best_rim and not _rim
+                                              or (best_rim == _rim and dot > best_dot))):
+                    best, pick_d, best_dot, best_rim = n, dn, dot, _rim
         if best is None:
+            self._field_none_why = ("步数更小的邻格**全被闸门挡掉**(危险格/动态禁行/"
+                                    "跨步高差/切墙角)")
             return None
         bx, bz = tm.world_of(*best)
         vx, vz = bx - x, bz - z
         vn = (vx * vx + vz * vz) ** 0.5
         if vn < 1e-6:
+            self._field_none_why = "选中的邻格和我在同一个点上(方向算不出来)"
             return None
         return (vx / vn, vz / vn, vn)
 
@@ -1649,8 +1704,9 @@ class Engine:
                         #   而这正是排查"一直撞墙"要数的那件事。现在每次都是一趟的终点,
                         #   次数天然被上层的 `4/4` 重试上限兜住, 不会刷屏。
                         self.kb.release_all()
-                        self.log("[导航] ✗ 步数表也给不出方向(我这一格到不了目标) —— "
-                                 "**不直线硬推**, 这一趟到此为止, 交给上层换目标")
+                        self.log(f"[导航] ✗ 步数表也给不出方向"
+                                 f"({getattr(self, '_field_none_why', '没说')}) —— "
+                                 f"**不直线硬推**, 这一趟到此为止, 交给上层换目标")
                         return False
                     elif self.NAV_MODE == "compare":
                         # 只读对照: **一行行为都不改**, 只把分歧记下来(和 `NEKO_PLAN=shadow` 一个用法)
@@ -2624,6 +2680,11 @@ class Engine:
                 #   实机事故(s_balloon_2_3): 站在风区里被一路推到边缘掉下去。
                 if c in wind:
                     d += WIND_STAND_PENALTY
+                # ☠ **贴边格**(用户 2026-09-17: "最好边缘有一点距离"): 站在会掉下去的
+                #   地方旁边, 被 NPC/风吹一下就下去 —— 与上面两条同一个形状, 但**只是
+                #   排后一点**而不是"尽量不站"(站边上不等于会掉)。见 `RIM_STAND_PENALTY`。
+                if _is_rim(tm, *c):
+                    d += RIM_STAND_PENALTY
                 (blocked if c in avoid else out).append((d, c))
         pool = out or blocked                 # 队友占的那些**排在后面**, 实在没得选才用
         if not pool:
