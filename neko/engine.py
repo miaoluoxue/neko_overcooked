@@ -4375,7 +4375,8 @@ class Engine:
           (见 `op_chop` 的"别白切"注释: 按十几刀、板上一点没变)。
         """
         mate = self._mate(self.state())      # 队友的坐标也在这张图上(见 `_mate_near`)
-        best, best_key = None, None
+        #: 先**只扫不占**(见下面 ☠☠ 那段): `(排序键, 台面)` 的列表, 按优先级+远近排好。
+        cands: list = []
         fallback, fallback_key = None, None  # 被队友占着的那块 —— 兜底用
         for s in (km.of("board") or []):
             on = list(getattr(s, "on", None) or [])
@@ -4398,25 +4399,45 @@ class Engine:
                 if fallback_key is None or key < fallback_key:
                     fallback, fallback_key = s, key
                 continue
-            # ☠☠ **黑板占位**(2026-09-17 按步协作): 切菜板原来是**唯一零保护**的共享资源
-            #   —— 只有上面的 `_mate_near` 软避让(它答的是"**他正站在旁边**"),
-            #   而两个人**同时选中同一块板、同时走过去**这件事它拦不住 ⇒ 白跑一趟 + 一块
-            #   板被两人轮流占。这里用**同一张任务占位表**(资源键 `("__res__",…)`,
-            #   与步键天然不撞车 —— 见 `team.OrderBook.claim_step` 的键空间约定)。
-            #   ⚠ **诚实记一笔**: "两人同时走过去"这个**物理竞态仍在**(探测不出"他正走过来"),
-            #     本处只做到"先到先得 + 尽力错开"; 兜底仍是 `op_chop` 里那句
-            #     "板上是别的料 ⇒ 别白切 ⇒ branch dead"。**别把它当成已解决**。
-            if claim and not self._claim_res("board", s.id, BOARD_CLAIM_TTL):
-                if fallback_key is None or key < fallback_key:
-                    fallback, fallback_key = s, key
-                continue
-            if best_key is None or key < best_key:
-                best, best_key = s, key
+            cands.append((key, s))
+        cands.sort(key=lambda e: e[0])
+        # ⚠ `claim=False`(评分层替队友算)那条路**不占位**(同 `stove_owner` 的纪律)
+        #   ⇒ 直接给最好的那块。
+        if not claim:
+            return cands[0][1] if cands else fallback
+        # ---- ☠☠ **占位只占"真的要用的那一块"** ----
+        #
+        # 这一条是 **bug 修复**(2026-09-17)。原来占位是在**上面那个扫描循环里**做的:
+        # 每一块通过筛选的板**当场被占**, 而函数只 `return best` —— 于是其余那些的占位
+        # **没有任何人释放**(`_release_res("board", …)` 的六个调用点用的都是**被选中
+        # 那块**的 id)⇒ **一个厨师每挑一次菜板, 就把厨房里其余每一块菜板静默锁死
+        # `BOARD_CLAIM_TTL`(25 秒)**, 而他自己不受影响(`claim_step` 的"自己重占 =
+        # 续期"返回 True)—— **只有队友被挡**。用户点名的"**分工挤来挤去**"里
+        # "占位没释放"那一侧, 就是它。
+        # ☠ 而且它**不会**出现在 `[分工] 谁占着` 那行诊断里: 那条只看**任务步键**
+        #   `(槽位, 步号)`, 而这是**资源键** `("__res__", "board", id)` ——
+        #   两套键空间天然不撞车(那是设计对的)。
+        # ⇒ 改成**两趟**: 先扫出候选(排序), 再按顺序**只占第一块占得到的**。
+        #   "占得到"的语义与改前**逐字相同**(按 key 升序的第一块能占到的板)。
+        #
+        # ☠ **黑板占位**(2026-09-17 按步协作): 切菜板原来是**唯一零保护**的共享资源
+        #   —— 只有 `_mate_near` 软避让(它答的是"**他正站在旁边**"),
+        #   而两个人**同时选中同一块板、同时走过去**这件事它拦不住 ⇒ 白跑一趟 + 一块
+        #   板被两人轮流占。这里用**同一张任务占位表**(资源键 `("__res__",…)`,
+        #   与步键天然不撞车 —— 见 `team.OrderBook.claim_step` 的键空间约定)。
+        #   ⚠ **诚实记一笔**: "两人同时走过去"这个**物理竞态仍在**(探测不出"他正走过来"),
+        #     本处只做到"先到先得 + 尽力错开"; 兜底仍是 `op_chop` 里那句
+        #     "板上是别的料 ⇒ 别白切 ⇒ branch dead"。**别把它当成已解决**。
+        for _key, s in cands:
+            if self._claim_res("board", s.id, BOARD_CLAIM_TTL):
+                return s
+            # 占不到(队友先占了)⇒ 记兜底, 试下一块
+            if fallback_key is None or _key < fallback_key:
+                fallback, fallback_key = s, _key
         # ☠ **全被队友占着时退回兜底** —— 否则"唯一一块板有人正在用"会变成
         #   `chop` 不可达 ⇒ 整条链卡死, **比排队更糟**(规则 5)。
         #   和 `_branch_ok` 那个"全划掉就退回不过滤"是同一个道理。
-        #   ⚠ `claim=False`(评分层替队友算)那条路**不占位**(同 `stove_owner` 的纪律)。
-        return best if best is not None else fallback
+        return fallback
 
     def op_chop(self, km, x, z, op: Op, st: dict) -> bool:
         """在切菜板上把东西切到完成。
