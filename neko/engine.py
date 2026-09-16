@@ -6246,10 +6246,23 @@ class Engine:
           而"过期"(`now >= late`)必然更晚(只要 `MARGIN + LEAD > 0`) ⇒ 它一定在池里。
         ⚠ 这里传 `km=None` 给 `_pot_get` —— 强制那一下的判断**不依赖地图新鲜度**
           (账已经记着了, 回不回去是时间问题, 不是世界问题)。
+
+        ☠☠ **冷板凳优先于硬上限**(2026-09-17 `s_mine_2_6` 实机)。这条不是"锦上添花",
+          它是**硬上限唯一的安全阀**: 上面 `_rank_candidates` 之后那句注释声称
+          "强制选中后若 `do_op` 仍失败, 掉进下面原有的失败路径(冷板凳)" ——
+          而**杂活那条路从来没有冷板凳**(只有 `rescue` 有), 于是硬上限每轮都把
+          同一件做不成的杂活再捞回来: 实测 `cook Meat` 因为"没有盘子可取菜"
+          连着重选 **几十轮**、每秒一次, 把半局烧在同一件不可能的动作上。
+          ⇒ 判据与 `_execute_scored`/`_idle_chore` **同一份 key**(`"{action} {target}"`),
+            这样"失败 → 上冷板凳 → 硬上限也捞不回来"是一条闭合的路。
+          ⚠ **只是让位, 不是判死**: 冷板凳 20 秒到点自动回池(`step_benched` 自己会弹),
+            而台账那边 `_pot_valid` 也在同一段时间里把取不到的锅清掉 —— 两条一起兜底。
         """
         for j in range(n_recipe, len(pool)):
             op = pool[j]
             if not getattr(op, "tend", False):
+                continue
+            if self.step_benched(f"{op.action} {op.target}"):
                 continue
             _sid, ent = self._pot_get(None, op.target)
             if ent is not None and self._pot_overdue(ent):
@@ -6930,10 +6943,30 @@ class Engine:
         self.log("[洗盘] 去端脏盘子 %s(%d 个) @(%.1f,%.1f)"
                  % (s0.id, int(s0.n), s0.x, s0.z))
         if not self._approach(km, s0.x, s0.z, want=s0.name):
-            self.log("[洗盘] 走不到脏盘堆")
-            return False
+            # ☠☠ **脏盘叠架在台面上 ⇒ 游戏报的是【那个台面的名字】, 不是叠自己的名字**
+            #   (2026-09-17 `s_mine_2_6` 实机): 站到位(距 1.31 格)了, 游戏说
+            #     `抓取='workstation_plate_return'`, 而我们一直拿 `DirtyPlateStack` 去比
+            #   ⇒ **永远"✗ 不是它"** ⇒ 洗不了盘子 ⇒ 场上 0 个干净盘(日志另一处自认)
+            #   ⇒ `cook` 取菜**没有盘子可接** ⇒ 硬上限每秒重选一次 —— 整局就烧在这条链上。
+            #   这和 `_rescues` 那条"架在台面上的东西, 游戏报的是台面名"是**同一个机制**
+            #   (依据 `ServerAttachStation.cs:107-119` 的转发), 只是那条当时按**锅**修的,
+            #   没回头看**盘叠**。⇒ 换一个问法: **不指定名字**走过去(只要求走到那几格并转身),
+            #   拿到手之后**再问游戏"手上到底是什么"** —— 判据仍然只有游戏一个(规则 2),
+            #   而且这一问比名字比对**强**: 它验的是结果, 不是我们对名字的假设。
+            if not self._approach(km, s0.x, s0.z):
+                self.log("[洗盘] 走不到脏盘堆")
+                return False
         if not self.interact("pickup", verify_hold_change=True):
             self.log("[洗盘] 拿不起脏盘子")
+            return False
+        _st_now = self.state(force=True) or {}
+        _, _, held = self.pos(_st_now)
+        if "stack" not in (held or "").lower():
+            # 上面那条"不指定名字"的路**可能抓错旁边的东西** ⇒ 用游戏报的手持物复核。
+            # ⚠ 判据抄 `map_model` 那条现成的口径(名字里带 `stack` 的是**盘子的来源**,
+            #   不是盘子本身) —— 一处口径, 不另发明一套。
+            self.log(f"[洗盘] ⚠ 抓到的不是脏盘叠(手上={held!r}) —— 放回去, 这一步不算")
+            self._drop_held(_st_now, held)
             return False
         # ② 放到洗手池
         sinks = km.of("wash")
@@ -9890,6 +9923,12 @@ class Engine:
                 #    ☠ **不会连成一串**: 取一次 `_pot_done` 就把账清了 ⇒ 下一轮自然是 None;
                 #      而强制选中后若 `do_op` 仍失败, 掉进下面原有的失败路径(冷板凳),
                 #      且 `_pot_valid` 会在几轮内把"取不到的那口锅"清出台账 ⇒ 不死循环。
+                #    ☠☠ **上面这句"掉进冷板凳"当时是假的**(2026-09-17 `s_mine_2_6`
+                #      实机打回来的): 杂活那条失败路径**只有 `rescue` 上冷板凳**,
+                #      其余的只记"本轮不再选它"就 `continue` —— 而那句撑不过一轮,
+                #      于是硬上限把它每秒捞回来一次, `cook Meat` 连打几十轮。
+                #      ⇒ 现在两处都补齐了: 失败**一律**上冷板凳(见 `_execute_scored` 那条),
+                #        且 `_pot_overdue_pick` **认冷板凳**(否则补了也没人看)。
                 _hard = self._pot_overdue_pick(pool, n_recipe)
                 if _hard is not None:
                     if picked is None or _hard != picked[0]:
@@ -10162,11 +10201,18 @@ class Engine:
                 if is_chore:
                     # ☠ **杂活没做成 ≠ 整单失败**: 一个按钮没按对不值得停机(规则 5 的反面)。
                     #   记进黑板(本轮不再选它)后继续 —— 菜谱该干嘛干嘛。
-                    # ⚠ **`rescue` 额外上冷板凳**: "本轮不再选它"只在本轮有效, 而 `pending`
-                    #   每轮重建 ⇒ 走不到的那口锅下一轮又被选中。实测那口卡在 14/12 秒的锅
-                    #   把半局烧在"走不到旁边(差 1.00 格)"上。
-                    if op.action == "rescue":
-                        self.bench_step(f"rescue {op.target}", "走不到那口锅旁边")
+                    # ☠☠ **每一件杂活都要上冷板凳, 不只是 `rescue`**(2026-09-17
+                    #   `s_mine_2_6` 实机)。上面那句"本轮不再选它"**撑不过一轮**:
+                    #   `pending` 每轮重建, 而 `_pot_overdue_pick` 那条硬上限
+                    #   更是**直接绕过黑板**再把它捞回来 ⇒ 实测
+                    #     `cook Meat`(没有盘子可取菜)每秒重选一次、连打几十轮,
+                    #     `wash dirty_plates0`(够不到脏盘堆)同理 ——
+                    #   半局烧在同一件不可能的动作上, 日志刷屏而位置一动不动。
+                    #   ⚠ 这不是新办法: `_idle_chore` 一直是这么做的(同一份 key),
+                    #     缺的只是**主执行路径**这一处。
+                    #   ⚠ key 与 `_execute_scored`/`_idle_chore`/`_pot_overdue_pick`
+                    #     **逐字一致** —— 四处必须同源, 否则"冷板凳"按下去也没人看。
+                    self.bench_step(f"{op.action} {op.target}", "杂活没做成")
                     self.log(f"[引擎] ⚠ 杂活没做成: {op.action} {op.target} —— 本轮不再选它")
                     continue
                 # ⚠ **指纹里不带下标**: 一旦顺序是动态的, 同一个 bug 两次可能选中不同的槽位,
