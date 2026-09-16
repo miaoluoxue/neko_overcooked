@@ -143,11 +143,15 @@ class Step:
     #:   每个引擎每轮取"分给我、且依赖都已完成"的第一步来做。
     deps: tuple = ()
     why: str = ""
-    #: **这一步的代价** —— 注入的 `check` 报回来的"到站位几格"(`_feasible` 的 `dist`)。
+    #: **这一步的代价** —— 注入的 `check` 报回来的**第三个值**。
     #:
     #: 为什么要它: 没有代价就只能"**谁先试到谁做**"(`for c in chefs: 第一个可行的`) ——
     #: 于是"该让近的人做"这件事**推不出来**, 分工是"可行"而不是"最优"。
-    #: ⚠ 它是**规划那一刻**的距离(执行时要重新接地), 只用来**比大小**, 不作别用。
+    #: ⚠ 它是**规划那一刻**的量, 执行时要重新接地; **只用来比大小**, 不作别用。
+    #: ☠☠ **单位由注入方定, 本模块不管**(2026-09-17): 引擎那边已经从"**格数**"换成了
+    #:   "**秒数**"(`Engine._op_seconds` —— 走路的秒数 + 动作本身的服务时间), 因为
+    #:   "两个厨师各做贪心未必是最优解, 需要**相同时间最高分**的路线"要解的是**时间**。
+    #:   所以这里的日志只写"总代价 N", **不写单位** —— 单位只有一处(引擎那一侧)。
     cost: float = 0.0
     #: **这一步属于哪张单** —— 槽位键(`DishFlow.slot`), 没有才退回菜名。
     #:
@@ -601,7 +605,7 @@ def _plan_one(flow, world: WorldView, check, log=None, notes_out=None) -> Plan |
                 _say(ctx, f"**推不出** {op.target} 怎么拿到 —— 这一单现在无解")
                 return None
             owner, sub = best
-            _say(ctx, f"{op.target}: 选 P{owner+1}(总代价 {best_cost:.1f} 格)")
+            _say(ctx, f"{op.target}: 选 P{owner+1}(总代价 {best_cost:.1f})")
             new = push(sub)
             for _s in sub:
                 _apply_effect(_s.op, _s.chef, held_now, world.chefs)

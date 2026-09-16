@@ -7694,6 +7694,51 @@ class Engine:
         self._ground_kind = kind
         return None, label
 
+    # ---- 规划器的代价尺子(2026-09-17)--------------------------------------
+    #: 一格的世界距离。**游戏事实**(格距 1.2), 不是偏好。
+    CELL_M = 1.2
+    #: **一次切菜要几秒**。☠☠ **这个数我还没标定** —— 日志里只有"需切 N 刀",
+    #:   没给节奏, 所以不假装知道。标定口子: `NEKO_CHOP_SEC`;
+    #:   指纹: `[步骤] 需切 N 刀` 到下一行 `切好了` 之间的时间差(日志有时间戳)。
+    CHOP_SEC = float(os.environ.get("NEKO_CHOP_SEC") or 1.5)
+    #: 一次煮/烤的**兜底**秒数 —— 拿得到游戏报的 `need` 时就用它(执行期才有),
+    #: 规划期只能兜底。口子: `NEKO_COOK_SEC`。
+    COOK_SEC = float(os.environ.get("NEKO_COOK_SEC") or 12.0)
+    #: **代价尺子用秒还是用格**: `sec`(默认) / `cell`(逐字退回老行为, 一键回退)。
+    PLAN_COST_SEC = (os.environ.get("NEKO_PLAN_COST") or "sec").strip().lower() \
+        not in ("cell", "grid", "0", "off", "no", "false")
+
+    def _op_seconds(self, op, cell_dist) -> float:
+        """**这一步大概要几秒** —— 规划器的代价尺子。
+
+        ☠☠ 为什么要换(用户 2026-09-17: "**先换尺子**", 目标是"**相同时间下最高分的路线**"):
+          原来 `Step.cost` 是**走过的格数**(`_feasible` 报回的 `reach.get(cell)`) ⇒
+          **切 7 刀、搅 10 秒、煮 12 秒全都不进代价**(它们的 cost 也只是"走到那个台面的
+          格数") ⇒ 规划器在"先做哪步 / 派给谁"上**根本看不见时间** ——
+          而"两个厨师各做贪心未必是最优解"要解的正是**时间**。
+        ⇒ 尺子 = **走路的秒数**(格 × `CELL_M` / `RUN_SPEED`, 两个都是游戏事实)
+          + **这一步动作本身的服务时间**(切/搅/煮各一份, 见上面三个常数)。
+
+        ⚠ **判据只有这一份**: `planner` **不 import 引擎**(它的文件头写着这条纪律),
+          它拿的就是注入的 `check` 报回来的**第三个值** —— 所以尺子天然落在这一处,
+          不在 `planner.py` 里再写一遍(见 `planner.Step.cost` 的注释)。
+        ⚠ **不含"等待"** —— 煮的 12 秒里人是走开去干别的(引擎本来就这么做, `KIND_DEFER`)。
+          把等待算进代价会**高估**一步的成本; 真正该算的是"**占用这个厨师多久**"。
+          那属于第 2 刀(makespan), 这一刀只把"动作本身要花的时间"补上。
+        ⚠ `NEKO_PLAN_COST=cell` ⇒ **逐字退回老尺子**(只用来对照/回退)。
+        """
+        if not self.PLAN_COST_SEC:
+            return max(0.0, float(cell_dist or 0.0))
+        t = max(0.0, float(cell_dist or 0.0)) * self.CELL_M / max(0.5, RUN_SPEED)
+        a = getattr(op, "action", "")
+        if a == "chop":
+            t += self.CHOP_SEC
+        elif a == "mix":
+            t += self.MIX_TIME
+        elif a == "cook":
+            t += self.COOK_SEC
+        return t
+
     def _op_target_for_score(self, km, st, op, x: float, z: float,
                              tm=None, reach=None, me_back=None):
         """给评分用: 这一步"要去哪儿" —— 返回 `((tx,tz), label)` 或 `(None, 原因)`。
@@ -9877,7 +9922,12 @@ class Engine:
             #   ⚠ 判据仍然只有一份: 这里查的就是 `_rank_candidates` 用的**同一张** `reach`
             #     (从厨师出发的 BFS 步数表), 不自己算几何。
             _cell = r.get("cell")
-            _dist = reach.get(_cell) if _cell is not None else None
+            _cells = reach.get(_cell) if _cell is not None else None
+            # ☠☠ **代价换尺子: 格 → 秒**(2026-09-17, 用户: "先换尺子")。
+            #   规划器拿的就是这个**第三个值**当 `Step.cost` —— 原来给的是格数,
+            #   于是"切 7 刀/搅 10 秒/煮 12 秒"在规划器眼里**都是 0**。
+            #   见 `_op_seconds` 那段(为什么、以及它**不含等待**)。
+            _dist = self._op_seconds(op, _cells) if _cells is not None else None
             if _cell is not None:
                 return True, r.get("why") or "", _dist
             # ☠☠ **只有「真的没有」那一类才剪**(2026-09-17)。
