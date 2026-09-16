@@ -2361,13 +2361,86 @@ class Engine:
     STAND_ORTHO = (os.environ.get("NEKO_STAND_ORTHO") or "1").strip().lower() \
         not in ("0", "off", "no", "false")
 
+    #: **"这一格我马上到, 你别来"** —— 站位格的**预约**(2026-09-17, 用户点名的
+    #: "**两个厨师会去一个地方挤来挤去**")。`0` = 逐字退回改前行为(一键回退)。
+    #:
+    #: ☠☠ **机制本来就有, 只是从来没人说过那句话**:
+    #:   `world.World.reserve()` / `reserved_by_others()` 是一对现成的 API
+    #:   (docstring 原话: "预约一个世界坐标附近的目标格。用于**我要站这里, 你别来**"),
+    #:   `occupied_by_others()` 也早把"队友站的格 + 他预约的格"合在一起返回了 ——
+    #:   而 `reserve()` **在全仓零调用者**。
+    #:   ⇒ `occupied_by_others` 实际只答得了"队友**现在**在哪", 答不了"他**要去**哪"。
+    #:   两个厨师**同时**从远处出发去同一张台面时, 各自算出的站位格**是同一格**
+    #:   (选格口径只看"离我最近") ⇒ 一起走过去 ⇒ 顶在一起 ⇒ 谁也别想干活。
+    #:   这就是实机那句"**看到两个厨师会去一个地方挤来挤去的**"。
+    #:
+    #: ☠ 还有第二条(同一个病的另一半): `_stand_cell` / `_stand_cell_of` **压根没有
+    #:   `avoid` 参数**, 而 `_stand_cells` 有。⇒ `_approach`(取/放)那条路守着
+    #:   "队友站着的格先让开"的纪律, 而 **`navigate_smart` 的"目标格是障碍 ⇒ 挑个
+    #:   站位格"那一支没守** —— 那却是**去任何台面的主干道**(22 个调用点)。
+    #:   ⇒ 本刀把 `avoid` 一路补到 `_stand_cell_of`/`_stand_cell`, 三处避让
+    #:     (`_approach` / `_align_try_other_cells` / `navigate_smart`)**收成同一个口径**
+    #:     (`_avoid_cells`), 不再各写一份。
+    #:
+    #: ⚠ **只是"优先避开", 不是禁行**: 全被占了照常返回一个(同 `_stand_cells` 的纪律)
+    #:   —— "宁可挤一下, 也不要站在那里什么都不做"。
+    #: ⚠ **绝不并进 `_dynamic_blocks`**(A* 的禁行集): 两个人在窄走廊上时那会把路
+    #:   **彻底封死**(本仓被"多禁一格就无解"害过 —— 见 `blocked_by_movers` 那段)。
+    #:   软避让(换一个站位格)+ 已有的 `_note_blocked`/`MATE_STUCK_MAX` 补救够了。
+    CELL_RESERVE = (os.environ.get("NEKO_CELL_RESERVE") or "1").strip().lower() \
+        not in ("0", "off", "no", "false")
+
+    #: 一格预约多久(秒)。**就是"我走过去"这一趟**, 所以取"跨半个厨房的路"那一档。
+    #: ☠ **别照抄 `STEP_CLAIM_TTL`(30)**: 那是"**这一步归我**"(做完整步), 这是
+    #:   "**这一格我马上到**"(一趟路)。取 30 秒会让队友在你放弃之后还让着那格半天。
+    #: ⚠ 也不能太短: 路上被顶一下/等个门就过期了, 于是"预约了等于没预约"。
+    CELL_RESERVE_TTL = float(os.environ.get("NEKO_CELL_TTL") or 8.0)
+
+    def _avoid_cells(self, tm) -> set:
+        """**队友此刻占着的格 + 他马上要去的格** —— 三处避让判据**只此一份**。
+
+        实现在 `World.occupied_by_others`(它一直在, 只是没人喂预约那一半)。
+        ⚠ 拿不到世界/地形(离线探针的 Engine 子不调 `__init__`)⇒ 空集 ⇒ 逐字老行为。
+        """
+        w = getattr(self, "world", None)
+        if w is None or tm is None or not getattr(tm, "ok", False):
+            return set()
+        try:
+            return w.occupied_by_others(getattr(self, "cid", 0), tm)
+        except Exception:                                        # noqa: BLE001
+            return set()
+
+    def _reserve_cell(self, xy) -> None:
+        """**把"我要站这一格"说出去** —— 见 `CELL_RESERVE` 那段。
+
+        ⚠ 只写不读对面: 这是**补偿不是保险**(没有中心节点, 两个人同一瞬间决定同一格时
+          仍然会撞) —— 和 `bind_plate(takeover=True)` 那句注释同一个口气。
+          代价上限是"两人一起做同一处"(不如分开做), **不是死锁**。
+        """
+        if not self.CELL_RESERVE or xy is None:
+            return
+        w = getattr(self, "world", None)
+        if w is None:
+            return
+        try:
+            w.reserve(getattr(self, "cid", 0), xy, self.CELL_RESERVE_TTL)
+        except Exception:                                        # noqa: BLE001
+            pass
+
     def _stand_scan(self, tm, i: int, j: int, cx: float, cz: float,
-                    reach, wind, max_di: int, ortho_only: bool):
+                    reach, wind, max_di: int, ortho_only: bool, avoid=None):
         """目标格 `(i,j)` 周围哪一格最该站 —— **只负责扫描与排序, 不负责选口径**。
 
-        口径在上面的 `STAND_ORTHO` / 调用方给的 `max_di`/`ortho_only` 里。
+        口径在上面的 `STAND_ORTHO` / 调用方给的 `max_di`/`ortho_only` 里;
+        `avoid`(队友占着的格 / 他预约的格)是**排序**的最后一层。
+
+        ⚠ `avoid` 的语义与 `_stand_cells` **逐字相同**: **优先避开**, 但只在还有别的
+          选择时才避开 —— 全被占了就照常返回一个(宁可挤一下, 也别站着什么都不做)。
+        ⚠ `avoid` 为空时与拆分前**逐字相同**(同一套循环序 + 同一套"严格小于"比较 ⇒
+          并列时仍是"先扫到的那个"赢; 这里用稳定排序, 并列保持插入序 ⇒ 等价)。
         """
-        best, best_d = None, None
+        avoid = avoid or ()
+        out, blocked = [], []
         for dj in range(-max_di, max_di + 1):
             for di in range(-max_di, max_di + 1):
                 if di == 0 and dj == 0:
@@ -2393,13 +2466,16 @@ class Engine:
                 #   实机事故(s_balloon_2_3): 站在风区里被一路推到边缘掉下去。
                 if c in wind:
                     d += WIND_STAND_PENALTY
-                if best_d is None or d < best_d:
-                    best_d, best = d, c
-        return best
+                (blocked if c in avoid else out).append((d, c))
+        pool = out or blocked                 # 队友占的那些**排在后面**, 实在没得选才用
+        if not pool:
+            return None
+        pool.sort(key=lambda r: r[0])         # 稳定: 并列保持扫描序(= 老代码的先到先得)
+        return pool[0][1]
 
     def _stand_cell_of(self, tm, tx: float, tz: float, cx: float, cz: float,
                        max_di: int = 2, ortho_only: bool = False, reach=None,
-                       interact: bool = False):
+                       interact: bool = False, avoid=None):
         """`_stand_cell` 的**返回"格子"版** —— 返回 `(i,j)` 或 None。
 
         单独拆出来是给**评分层**用的: 它既要知道"站不站得到"(可达性闸门),
@@ -2413,6 +2489,9 @@ class Engine:
           (`max_di=1, ortho_only=True`)扫一遍并优先用它; 一类格子都不剩才退回调用方给的
           老口径。依据与实机账全在 `STAND_ORTHO` 那段 —— 一句话: **斜角格/隔两格
           被 `GetFacingGridOccupant` 排除在候选之外, 游戏永远不会把放置目标认到那儿**。
+
+        `avoid` —— **队友占着的格 / 他预约的格**(见 `CELL_RESERVE`): 优先避开。
+          ⚠ 语义与 `_stand_cells` 逐字相同(全被占了照常返回一个), 而且**空集时逐字老行为**。
 
         ⚠ **默认 `False` = 逐字老行为**, 而且**故意的**: `_stand_cell_of` 的直接调用方
           (`pass` 的评分闸门、`fetch` 的可达性挑选)问的**不是**"放置目标认不认",
@@ -2443,16 +2522,17 @@ class Engine:
         #   返回的多半是**厨师脚下那一格**(它离厨师 0 格, 距离一比较必然夺冠),
         #   而"原地不动"只有在**正方向**上才成立。
         if (interact and self.STAND_ORTHO) and not (max_di <= 1 and ortho_only):
-            best = self._stand_scan(tm, i, j, cx, cz, reach, wind, 1, True)
+            best = self._stand_scan(tm, i, j, cx, cz, reach, wind, 1, True, avoid=avoid)
             if best is not None:
                 return best
         # 兜底 / `NEKO_STAND_ORTHO=0` 回退档: 老口径(±2 格 + 斜角)。
         # ⚠ 走到这里说明**4 个正方向一格都站不下**(或回退档开着) —— 这时宁可给个
         #   够不着的格, 也不要"没有站位格"(那会把导航变成顶着橱柜推)。
-        return self._stand_scan(tm, i, j, cx, cz, reach, wind, max_di, ortho_only)
+        return self._stand_scan(tm, i, j, cx, cz, reach, wind, max_di, ortho_only,
+                                avoid=avoid)
 
     def _stand_cell(self, tm, tx: float, tz: float, cx: float, cz: float,
-                    max_di: int = 2, ortho_only: bool = False):
+                    max_di: int = 2, ortho_only: bool = False, avoid=None):
         """找一个"能站、够得着目标、且离厨师最近"的格子 —— 该站哪儿去拿东西。
 
         为什么不能直接朝台面坐标走(用户实测指出的问题):
@@ -2469,8 +2549,13 @@ class Engine:
         ☠☠ **这个函数一律带 `interact=True`**(2026-09-17, 用户点名"锅的定位 ①"):
           它唯一的用途就是"**站过去动手**", 因此走 `STAND_ORTHO` 那条更严的口径。
           两个调用方(`navigate_smart` 目标格是障碍时的落位、传送带上等料)都是这一类。
+
+        `avoid` —— **队友占着的格 / 他预约的格**(见 `CELL_RESERVE`: 用户点名的
+          "两个厨师会去一个地方挤来挤去")。调用方传 `Engine._avoid_cells(tm)`。
+          ⚠ 空集 ⇒ 逐字老行为。
         """
-        c = self._stand_cell_of(tm, tx, tz, cx, cz, max_di, ortho_only, interact=True)
+        c = self._stand_cell_of(tm, tx, tz, cx, cz, max_di, ortho_only,
+                                interact=True, avoid=avoid)
         return tm.world_of(*c) if c is not None else None
 
     def _stand_cells(self, tm, tx: float, tz: float, cx: float, cz: float,
@@ -2709,9 +2794,9 @@ class Engine:
             "另一侧"可能排在最后 ⇒ 那一条**仍然靠 `most` 兜住**(默认 7 > 3)。
           ⚠ **脚下这一格跳过** —— 刚才那 `tries` 次已经把它试透了。
           ⚠ 顺序仍按**离当前远近**(`_stand_cells` 已排好): 先去最近的, 省时间。
-        ⚠ 队友站着的格**先让开**(`occupied_by_others`, 同 `_approach`):
-          两个人挤在同一格只会互相推, 而 `_stand_cells` 的纪律是"全被占了照常返回"
-          (宁可挤一下, 也别站着什么都不做)。
+        ⚠ 队友站着的格**先让开**(`_avoid_cells` = 他站的格 + **他马上要去的格**,
+          同 `_approach`; 见 `CELL_RESERVE`): 两个人挤在同一格只会互相推,
+          而 `_stand_cells` 的纪律是"全被占了照常返回"(宁可挤一下, 也别站着什么都不做)。
         ⚠ 只在**落空之后**走这一趟 ⇒ 是**加法**: `ALIGN_TRY_CELLS=0` 就等于没改过。
 
         `also` —— 除 `spot.name` 外还认哪个名字(精确比); 只有一个用法: **锅架在灶上时
@@ -2729,9 +2814,7 @@ class Engine:
         cx, cz, _ = self.pos(st) if st else (None, None, "")
         if cx is None:
             return False
-        avoid = set()
-        if getattr(self, "world", None) is not None:
-            avoid = self.world.occupied_by_others(getattr(self, "cid", 0), tm)
+        avoid = self._avoid_cells(tm)
         # ⚠ `max_di=1` + `ortho_only=True` —— 见 docstring: 只围**那 4 个正方向**,
         #   隔着两格的够不着台面, 斜角的**游戏根本不认**(`s_gridOffsetsXZ` 只有 4 个)。
         cands = self._stand_cells(tm, spot.x, spot.z, cx, cz, max_di=1,
@@ -2745,6 +2828,7 @@ class Engine:
             if tm.cell_of(sx, sz) == here:
                 continue                       # 脚下这一格刚才那 `tries` 次试过了
             tried += 1
+            self._reserve_cell((sx, sz))       # 同 `_approach`: 先声明, 再过去
             self.navigate_smart(km, sx, sz, tight=0.5)
             self.face(spot.x, spot.z)
             st2 = self.state(force=True)
@@ -2962,9 +3046,10 @@ class Engine:
             # 只试"最近那个"是不够的 —— 实测 s_sushi_1_1 拿食材时厨师停在
             # 离箱子 2.24 格的地方(交互半径只有 1.0), 一直在按 pickup 却什么也抓不到。
             # 那个方向的相邻格多半被挡住/够不着, 换个方位站就好了。
-            avoid = set()
-            if self.world is not None:
-                avoid = self.world.occupied_by_others(self.cid, tm)
+            # ☠ `avoid` **走 `_avoid_cells`** —— 它把"队友站的格"和"**他马上要去的格**"
+            #   合在一起(见 `CELL_RESERVE`)。以前这里直接调 `world.occupied_by_others`,
+            #   而那一半(`reserved_by_others`)从来没被喂过 ⇒ 只知道队友**现在**在哪。
+            avoid = self._avoid_cells(tm)
             cands = self._stand_cells(tm, gx, gz, cx, cz, avoid=avoid)
             # ☠ **小物件先试"贴近落位"** —— 理由见 `SMALL_STAND` 那段注释。
             #   放在**试格心之前**: 台面那条路(站格心就贴得到表面)压根不会传 `near` 进来,
@@ -2989,6 +3074,9 @@ class Engine:
                          % (tx, tz, len(cands), len(trial),
                             ((tx - cx) ** 2 + (tz - cz) ** 2) ** 0.5))
                 for (sx, sz) in trial:
+                    # **先说"这一格我马上到", 再走过去** —— 顺序不能反: 反了的话,
+                    # 两个人同时决定同一格时谁都没先声明(见 `_reserve_cell` 的纪律)。
+                    self._reserve_cell((sx, sz))
                     self.navigate_smart(km, sx, sz, tight=min(tight, 0.5))
                     self.face(tx, tz)
                     st2 = self.state(force=True)
@@ -4705,13 +4793,30 @@ class Engine:
             goal_walk = (tm is not None and tm.ok and tm.walkable(*tm.cell_of(tx, tz)))
             if goal_walk:
                 ok = self.navigate(tx, tz, arrive=1.4, tight=tight)
+                # ⚠ **走到一格也要说一声**: 目标格本身可走时也是"我要站这一格" ——
+                #   队友的 `_avoid_cells` 靠它才知道我不是"现在在这儿"而是"正要去那儿"。
+                if ok:
+                    self._reserve_cell((tx, tz))
             else:
                 spot = None
                 st3 = self.state()
                 cx3, cz3, _ = self.pos(st3) if st3 else (None, None, "")
+                # ☠☠ **这一支是"去任何台面的主干道"**(22 个调用点), 而它以前
+                #   **完全不看队友** —— 见 `CELL_RESERVE` 那段: 两个厨师同时去同一张
+                #   台面时, 各自算出的站位格**是同一格**(选格口径只看"离我最近")。
+                _av = self._avoid_cells(tm)
                 if tm is not None and tm.ok and cx3 is not None:
-                    spot = self._stand_cell(tm, tx, tz, cx3, cz3)
+                    spot = self._stand_cell(tm, tx, tz, cx3, cz3, avoid=_av)
+                    # 指纹(用户 ② 的验收面): 只有**队友真的改变了我的选择**时才打一行
+                    # —— 每趟都打会把它淹掉。不看队友再算一次, 差了就说明避让生效了。
+                    if _av and spot is not None:
+                        _plain = self._stand_cell(tm, tx, tz, cx3, cz3)
+                        if _plain is not None \
+                                and tm.cell_of(*_plain) != tm.cell_of(*spot):
+                            self.log("[避让] 队友占着 (%.1f,%.1f) ⇒ 我改站 (%.1f,%.1f)"
+                                     % (_plain[0], _plain[1], spot[0], spot[1]))
                 if spot is not None:
+                    self._reserve_cell(spot)       # **先说"这一格我马上到", 再走过去**
                     ok = self.navigate(spot[0], spot[1], arrive=1.2, tight=tight)
                 else:
                     ok = self.navigate(tx, tz, arrive=1.4, tight=tight)
