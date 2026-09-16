@@ -58,26 +58,54 @@ SCENE_SCREEN = "StartScreen"
 #: (`overcooked_decomp/FrontendCoopTabOptions.cs:44-67`): `LoadLevel("Lobbies", GameState.PartyLobby)`。
 SCENE_LOBBY = "Lobbies"
 
-#: **默认序列** —— `{阶段: [动作, …]}`。动作见 `do` 的约定(`join` / `pad:X` / `kbd:X` / `wait`)。
+#: **默认序列** —— `{阶段: [动作, …]}`。
 #:
-#: ☠ **这是按逆向文档推的, 实机第一次跑很可能要微调** —— 改 `NEKO_WATCH_AUTO_SEQ` 即可:
-#:     `NEKO_WATCH_AUTO_SEQ=screen=join,DR,A;lobby=A,A`
+#: ☠ **这里写的是"裸键"** —— 到底走虚拟手柄还是键盘, 由 `NEKO_WATCH_AUTO_INPUT`
+#:   决定(`norm_seq` 给它们补前缀)。**序列本身不绑定输入后端** —— 换后端不用改序列。
+#:
 #: 依据:
-#:   · 主界面(StartScreen): 先补 P2(`join` —— A 是"加入下一个玩家"), 再切到 Coop/Party
-#:     标签, 再确认(`A`)。
-#:     ☠☠ **切标签用 `DR`(方向键右), 不是 `RB`** —— 2026-09-17 实机: 用户报"**按 RB 没用**"。
+#:   · 主界面(StartScreen): 先补 P2(`join`), 再切到 Coop/Party 标签, 再确认。
+#:     ☠ `join` **必须走虚拟手柄** —— 那是加入流程唯一的入口(见模块头), 所以它是
+#:       一个**独立动作**, 不是按键, 不受 `AUTO_INPUT` 影响。
+#:     ☠ **切标签用 `D`/`RIGHT`, 不是肩键** —— 2026-09-17 实机: 用户报"**按 RB 没用**"。
 #:       依据 `PlayerInputLookup.cs:612-616`: 前端的移动输入是
 #:       `MovementX = AmbiPadValue.StickX + DPadX` —— **只有摇杆和十字键, 没有肩键**。
-#:       肩键是主机手柄的习惯, PC 的合并键盘映射里根本没有它。
 #:   · 大厅(Lobbies): `UISelectNotStart` 的**键盘分支硬编码含 `Space`**
-#:     (`PlayerInputLookup.cs:482-489`), 而手柄上是确认键 ⇒ 用 `A` 一脉相承。
+#:     (`PlayerInputLookup.cs:482-489`) ⇒ 键盘上确认键就是 `SPACE`。
 #:     单人合作时 `AllUsersSelected()` 直接为真(`ServerLobbyFlowController.cs:641-667`)
-#:     ⇒ **一次确认就该进图**; 第二个 `A` 是给**加载界面的厨师选择**那一屏准备的
+#:     ⇒ **一次确认就该进图**; 第二个是给**加载界面的厨师选择**那一屏准备的
 #:     (`LobbyUIController.cs:257-271` 的"开始"也是同一个键)。
+#: ⚠ **用户 2026-09-17: "那用键盘, 键盘有效"** ⇒ `NEKO_WATCH_AUTO_INPUT` 默认 `kbd`。
 DEFAULT_SEQ = {
-    STAGE_SCREEN: ["join", "pad:DR", "pad:A"],
-    STAGE_LOBBY: ["pad:A", "pad:A"],
+    STAGE_SCREEN: ["join", "D", "SPACE"],
+    STAGE_LOBBY: ["SPACE", "SPACE"],
 }
+
+#: 不是按键的动作 —— `norm_seq` 不给它们补前缀。
+PLAIN_ACTS = ("join", "wait")
+
+
+def norm_seq(seq, prefix: str = "pad:"):
+    """把序列里的**裸键**补上输入后端前缀(`pad:` / `kbd:`)。
+
+    纯函数。规则与 `parse_seq` **同一份**(`parse_seq` 解析完直接调它) ——
+    "同一件事两处各写一份"本仓栽过两次, 所以补前缀这件事只有一个实现。
+      · `join` / `wait` 原样(它们不是按键);
+      · 已经带 `:` 的(如 `kbd:SPACE`)**不覆盖** —— 允许在一个序列里混用两种后端;
+      · 其余一律补 `prefix`。
+    """
+    if not seq:
+        return {}
+    out = {}
+    for k, acts in (seq or {}).items():
+        lst = []
+        for a in (acts or []):
+            a = str(a).strip()
+            if not a:
+                continue
+            lst.append(a if (":" in a or a in PLAIN_ACTS) else prefix + a)
+        out[k] = lst
+    return out
 
 
 def stage(st: dict) -> str:
@@ -98,13 +126,13 @@ def stage(st: dict) -> str:
     return STAGE_OTHER
 
 
-def parse_seq(spec: str):
-    """`"screen=join,RB,A;lobby=A,A"` ⇒ `{"screen": ["join","pad:RB","pad:A"], …}`。
+def parse_seq(spec: str, prefix: str = "pad:"):
+    """`"screen=join,D,SPACE;lobby=SPACE" ` ⇒ `{"screen": ["join","kbd:D","kbd:SPACE"], …}`。
 
     纯函数(离线可验)。规则:
       · `;` 分阶段, `=` 分"阶段名 / 动作表", `,` 分动作;
-      · 动作里**不带 `:`** 的一律当**手柄键**并补上 `pad:`(`A` 比 `pad:A` 好写太多);
-      · `join` / `wait` 原样保留(它们不是按键);
+      · **裸键补 `prefix`**(由 `NEKO_WATCH_AUTO_INPUT` 决定是 `pad:` 还是 `kbd:`);
+      · `join` / `wait` 原样保留(它们不是按键); 带 `:` 的**不覆盖**(允许混用);
       · 空串 / 解析不出 ⇒ 返回 `None`, 调用方**退回默认序列**(配置写错不该让功能消失)。
     """
     if not spec or not str(spec).strip():
@@ -118,23 +146,21 @@ def parse_seq(spec: str):
         name = name.strip()
         if not name:
             continue
-        lst = []
-        for a in acts.split(","):
-            a = a.strip()
-            if not a:
-                continue
-            lst.append(a if (":" in a or a in ("join", "wait")) else "pad:" + a)
+        lst = [a.strip() for a in acts.split(",") if a.strip()]
         if lst:
             out[name] = lst
-    return out or None
+    return norm_seq(out, prefix) or None
 
 
 class AutoLevel:
     """进关状态机。**I/O 全部注入** —— `do(动作)` 由调用方实现, 本类只决定"该做什么"。"""
 
     def __init__(self, seq=None, tries: int = 3, gap: float = 1.5,
-                 settle: float = 8.0, log=print):
-        self.seq = dict(seq or DEFAULT_SEQ)
+                 settle: float = 8.0, prefix: str = "pad:", log=print):
+        #: ☠ **在这里归一化, 不指望调用方记得** —— 序列可以写成裸键(见 `DEFAULT_SEQ`),
+        #:   由 `prefix` 落定走哪条输入。`norm_seq` 幂等(带 `:` 的不动), 所以传进来
+        #:   已经归一化过的也安全。
+        self.seq = norm_seq(seq or DEFAULT_SEQ, prefix)
         self.tries = max(1, int(tries))
         self.gap = float(gap)
         #: ☠☠ **走完一遍序列之后, 先等这么久再看"阶段变没变"**(秒)。

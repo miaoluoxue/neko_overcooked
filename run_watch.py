@@ -194,13 +194,33 @@ CHILD = (os.environ.get("NEKO_WATCH_CHILD") or "run_engine.py").split()
 #   "**盲发按键 + 看落到哪一屏**", 每一步都打 `[进关] ▶ …`, 卡在哪一眼看得见。
 
 def parse_seq(spec: str):
-    """转发 `auto_level.parse_seq`。
+    """转发 `auto_level.parse_seq`（补上本机选定的输入后端前缀）。
 
     ⚠ 做成**模块级函数**是为了让探针能直接喂字符串 —— `AUTO_SEQ` 是 import 时读的
       环境变量, 探针改不动它(和 `_argv_of` 当初提出来是同一个理由)。
     """
     from auto_level import parse_seq as _p
-    return _p(spec)
+    return _p(spec, prefix=AUTO_KEY_PREFIX)
+
+
+def norm_seq(seq):
+    """把**裸键序列**补上本机选定的输入后端前缀(`NEKO_WATCH_AUTO_INPUT`)。"""
+    from auto_level import norm_seq as _n
+    return _n(seq, prefix=AUTO_KEY_PREFIX)
+
+
+#: **序列里的裸键走哪条输入** —— `kbd`(默认) / `pad`。
+#:
+#: ☠☠ 用户 2026-09-17: "**那用键盘, 键盘有效**" ⇒ 默认 `kbd`。
+#:   两条路的**代价不一样**, 别随手换:
+#:     · `kbd` —— 走 `SendInput`, **只发给前台窗口** ⇒ 每次发键前必须
+#:       `activate_game()`(见 `do_auto`)。前端 UI 的确认键在键盘上**硬编码是 `Space`**
+#:       (`PlayerInputLookup.cs:482-489`), 所以这条路的键名是 `SPACE`/`D`/`RIGHT`;
+#:     · `pad` —— 走真 InControl 设备, **不看焦点**, 但实测在菜单里**没反应**
+#:       (那个虚拟手柄可能还没被分配给玩家)。
+#: ⚠ `join`(补 P2)**永远是虚拟手柄** —— 那是加入流程唯一的入口, 不受这个开关管。
+AUTO_INPUT = (os.environ.get("NEKO_WATCH_AUTO_INPUT") or "kbd").strip().lower()
+AUTO_KEY_PREFIX = "kbd:" if AUTO_INPUT.startswith("kbd") else "pad:"
 
 
 #: **总开关**(默认 `0` = 关)。开着时: 主界面加入 → 切 Party/Coop → 大厅选主题 → 进图。
@@ -654,13 +674,18 @@ def main() -> int:
     w = Watcher(get_state=get_state, start_engine=start_engine,
                 stop_engine=stop_engine, join_lobby=join_lobby, log=log)
     if AUTO:
-        from auto_level import AutoLevel as _AutoLevel
-        w.auto = _AutoLevel(seq=AUTO_SEQ, tries=AUTO_TRIES, gap=AUTO_GAP,
-                            settle=AUTO_SETTLE, log=log)
+        from auto_level import AutoLevel as _AutoLevel, DEFAULT_SEQ as _DEF_SEQ
+        # ⚠ `AutoLevel` **自己会归一化**(裸键 → 按 `prefix` 补后端), 所以这里直接喂
+        #   默认序列或用户写的序列都行。
+        w.auto = _AutoLevel(seq=(AUTO_SEQ or _DEF_SEQ),
+                            tries=AUTO_TRIES, gap=AUTO_GAP,
+                            settle=AUTO_SETTLE, prefix=AUTO_KEY_PREFIX, log=log)
         w.auto_do = do_auto
         log(f"[看护] **全自动进关已开** —— 主界面加入 → 切 Party → 大厅选主题 → 进图")
-        log(f"[看护]   序列 = {AUTO_SEQ or '(默认)'}  每步 {AUTO_GAP:.1f}s, "
-            f"走完一遍等 {AUTO_SETTLE:.0f}s, 每阶段最多重来 {AUTO_TRIES} 遍")
+        log(f"[看护]   序列 = {AUTO_SEQ or norm_seq(_DEF_SEQ)}"
+            f"   裸键走 **{AUTO_INPUT}**(`NEKO_WATCH_AUTO_INPUT`; join 永远走虚拟手柄)")
+        log(f"[看护]   每步 {AUTO_GAP:.1f}s, 走完一遍等 {AUTO_SETTLE:.0f}s, "
+            f"每阶段最多重来 {AUTO_TRIES} 遍")
         log(f"[看护]   ⚠ 阶段判据只有 scene/inRound(读不到'选中哪个标签页'), "
             f"所以是盲发按键 —— 卡住就看 `[进关] ▶ …` 那几行对着改 "
             f"`NEKO_WATCH_AUTO_SEQ`")
