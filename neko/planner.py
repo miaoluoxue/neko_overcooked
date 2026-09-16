@@ -149,6 +149,18 @@ class Step:
     #: 于是"该让近的人做"这件事**推不出来**, 分工是"可行"而不是"最优"。
     #: ⚠ 它是**规划那一刻**的距离(执行时要重新接地), 只用来**比大小**, 不作别用。
     cost: float = 0.0
+    #: **这一步属于哪张单** —— 槽位键(`DishFlow.slot`), 没有才退回菜名。
+    #:
+    #: ☠☠ 为什么必须有它(2026-09-17 跨单合并计划): 合并之后**一份计划里有好几张单的步**,
+    #:   而下游判"这一步做完了没"(`Engine._plan_next`)和"这一步是不是排给我的"
+    #:   (`Engine._plan_bonus`)**原来只看 `(action, 归一化 target)`** ——
+    #:   **两张单完全可以有同名同步的步骤**(实测订单栏同时挂 5 张 `Sushi_Fish`),
+    #:   于是"A 单的 `fetch Rice` 做完了"会把"B 单的 `fetch Rice`"一起判成做完了,
+    #:   奖励分也会加错那一张单的步。这正是本仓"**订单没有 id、只有名字**"那条账的
+    #:   第五处(前四处: 锅台账归属 / 传球台账清空 / `_flow_completed_by` / 计划黑板键)。
+    #: ⚠ 口径**必须与 `Engine._plan_key` 逐字一致**(`slot or name`) —— 两边要能对上,
+    #:   否则归属过滤会静默筛空。空串 = 老调用方(离线探针的假 `Flow` 没有 `slot`)。
+    slot: str = ""
 
     def __str__(self) -> str:
         return "P%d %s %s" % (self.chef + 1, self.op.action, self.op.target)
@@ -156,6 +168,8 @@ class Step:
 
 @dataclass
 class Plan:
+    #: ⚠ **展示用**的名字。跨单合并之后它可能是**好几张单**拼起来的
+    #:   (`"A + B + C"`) —— 想判"这份计划覆盖哪几张单"要看 `slots`, **别解析它**。
     flow: str = ""
     steps: list = field(default_factory=list)
     #: **这份计划依赖了哪些世界事实** —— "P2 背着出 X 的背包" / "mix1 可达" 这类。
@@ -165,27 +179,61 @@ class Plan:
     cost: float = 0.0
     notes: list = field(default_factory=list)
 
+    @property
+    def slots(self) -> tuple:
+        """**这份计划覆盖了哪几张单** —— 槽位键的元组(按首次出现去重)。
+
+        ☠ 它是 `Engine._plan_flow` 做归属过滤的依据: 合并计划覆盖 3 张单 ⇒ 收窄闸门
+          就该放行**这 3 张单**的候选, 而不是只放行第一张(老行为的后果是
+          "计划活着的时候跨单池每轮都被压回一张单" ⇒ `COOP_ORDERS` 静默失效)。
+
+        ☠☠ **是"算出来的", 不是"存下来的"** —— 本仓规矩 1(一个事实只有一处)。
+          存一份字段就要在 `_plan_one` 和 `plan` 两处填, 而它**完全由 `Step.slot`
+          决定** ⇒ 两份迟早对不上; 对不上的症状是**静默**的(收窄放行了错误的单)。
+        ⚠ 空元组 = 老计划/离线桩(它们的 `_Step` 没有 `slot`)⇒ 读的人**退回**
+          原来那个键(`_plan_cur_key`), 那是老语义。
+        """
+        return tuple(dict.fromkeys(s.slot for s in self.steps if s.slot))
+
     def steps_of(self, chef: int) -> list:
         """分给某个厨师的那些步(按计划内顺序)。"""
         return [s for s in self.steps if s.chef == chef]
 
-    def ready_for(self, chef: int, done: set) -> Step | None:
-        """**这个厨师下一步该做哪个** —— 分给他、且依赖都已完成的第一步。
+    def ready_all_for(self, chef: int, done: set) -> list:
+        """**这个厨师现在能动手的所有步** —— 分给他、且依赖都已完成的那些。
+
+        ☠☠ 为什么是**列表**而不是"第一步"(跨单合并计划, 2026-09-17):
+          合并计划是**几条链的并集**, 而链与链之间**没有依赖边** ——
+          拿"第一个就绪的"会让执行层**一路串行做完第一张单**才开始第二张
+          (`ready_for` 是按 `steps` 顺序扫的, 而第一张单整条链都排在前面)。
+          那等于把跨单并行**又**掐掉了, 只是换了个地方掐。
+          ⇒ 每个厨师手上的**每条链的链首**都该是就绪的, 由执行层的评分
+          (距离/时钟分/步级占位)去挑先做哪个 —— 那才是"计划影响排序, 不接管执行"。
+
+        ⚠ 单张单时结果与老的 `ready_for` **逐字等价**(一条链只有一个链首):
+          返回长度 0 或 1, 且第一个就是老写法会返回的那一个。
 
         `done` = 已完成/已作废的 step 下标集合。
         """
-        for i, s in enumerate(self.steps):
-            if i in done or s.chef != chef:
-                continue
-            if all(d in done for d in s.deps):
-                return s
-        return None
+        return [s for i, s in enumerate(self.steps)
+                if i not in done and s.chef == chef
+                and all(d in done for d in s.deps)]
+
+    def ready_for(self, chef: int, done: set) -> Step | None:
+        """**这个厨师下一步该做哪个** —— 分给他、且依赖都已完成的第一步。
+
+        ⚠ 保留给老调用方(离线探针 + 日志)。跨单合并计划下**执行层不该用它**
+          —— 理由见 `ready_all_for`。
+        """
+        _r = self.ready_all_for(chef, done)
+        return _r[0] if _r else None
 
     def __str__(self) -> str:
         out = [f"【{self.flow}】计划 {len(self.steps)} 步, 估代价 {self.cost:.1f}"]
         for i, s in enumerate(self.steps):
             dep = ("  ←依赖 " + ",".join(str(d) for d in s.deps)) if s.deps else ""
-            out.append(f"  {i}. {s}{dep}   {s.why}")
+            sl = f"[{s.slot}] " if s.slot else ""
+            out.append(f"  {i}. {sl}{s}{dep}   {s.why}")
         for a in self.assumptions:
             out.append(f"  ⚠ 假设: {a}")
         return "\n".join(out)
@@ -457,19 +505,42 @@ def _solve_have_inner(ctx: _Ctx, chef: int, item: str) -> list | None:
     return None
 
 
-def plan(flow, world: WorldView, check, log=None) -> Plan | None:
-    """把一条 `DishFlow` 推成**一份带分工与依赖的计划**; 推不出来返回 `None`。
+def _slot_of(flow) -> str:
+    """`flow` 的槽位键 —— **口径必须与 `Engine._plan_key` 逐字一致**(`slot or name`)。
+
+    ⚠ 两处**是同一件事的两份字面**(planner 不该 import engine, engine 也不该被
+      planner 反向依赖)。改动任何一边, 另一边必须跟着改 —— 对不上的后果是
+      "归属过滤把候选筛空", 而它是**静默**的(日志上只看到收窄没命中)。
+    """
+    return str(getattr(flow, "slot", "") or "") or str(getattr(flow, "name", "") or "")
+
+
+def _plan_one(flow, world: WorldView, check, log=None) -> Plan | None:
+    """把**一条** `DishFlow` 推成**一份带分工与依赖的计划**; 推不出来返回 `None`。
 
     ☠ **推不出来 ≠ 不做这一单**。调用方的处置是**退回现有的贪心路径**(那才是"绝不停机"),
     不是放弃。规划器只是个更强的"选哪个", 不是唯一的活路。
+
+    ⚠ **这一份是"单张单"那条老路径, 行为要与加跨单合并之前逐字相同** ——
+      跨单那条走 `plan()`, 它只是把本函数的结果拼起来。48 个离线探针钉的就是这里。
     """
     ctx = _Ctx(world=world, check=check, log=log)
     steps: list = []
     assumptions: list = []
+    _slot = _slot_of(flow)
 
     def push(new: list) -> list:
-        """把一批 `Step` 并进计划, 返回它们在 `steps` 里的下标。"""
+        """把一批 `Step` 并进计划, 返回它们在 `steps` 里的下标。
+
+        ☠ **就地盖 `slot` 章**(`Step.slot` 的注释解释了为什么必须有它)。
+          在这一处盖而不是在每个 `Step(...)` 构造点盖: 构造点有六处, 漏一处就是
+          "那一步永远判不出归属" —— 而症状是**静默**的(那一张单的步会被当成别的单的)。
+        ⚠ 改的是 `solve_have` memo 里的对象, 但**一份计划只服务一张单** ⇒ 盖的是同一个值,
+          幂等。☠ **跨单合并时不能共享 `_Ctx` 正是这个原因**(见 `plan()` 的注释)。
+        """
         base = len(steps)
+        for _s in new:
+            _s.slot = _slot
         steps.extend(new)
         return list(range(base, len(steps)))
 
@@ -575,3 +646,75 @@ def plan(flow, world: WorldView, check, log=None) -> Plan | None:
                 assumptions=sorted(set(assumptions)),
                 # 代价 = 各步"到站位几格"之和(不是步数) —— 步数不反映远近。
                 cost=sum(s.cost for s in steps), notes=list(ctx.notes))
+
+
+def plan(flows, world: WorldView, check, log=None) -> Plan | None:
+    """**把一张单、或者一池单**推成一份带分工与依赖的计划; 推不出来返回 `None`。
+
+    两种入参(**用户 2026-09-17 选的形状: "只覆盖到池、不在规划期排人"**):
+      · **单个 flow** ⇒ 逐字走 `_plan_one`(老路径, 一行行为都不变);
+      · **一串 flow** ⇒ 每条各推一份, 拼成**一份合并计划**(见下)。
+
+    ☠☠ **为什么要能合并**(这是"跨单合作"的核心): 执行层的候选池是**跨订单**的
+      (`Engine.execute` 把最多 `COOP_ORDERS` 张单拼起来, `engine.py:9391-9438`),
+      而规划器原来只覆盖**最紧急那一张** ⇒ `_rank_candidates` 的收窄闸门
+      (`engine.py:7636-7660`)每轮把池**压回一张单**, `COOP_ORDERS` 静默失效。
+      计划覆盖到池之后, 收窄放行的是**这几张单**的候选, 池才是真的池。
+
+    ☠☠ **合并 = 无交并(disjoint union), 不建跨单依赖边**: 几条链本来就互相独立,
+      而跨单的协作由**执行层共享的那个池**表达(评分 + 步级占位去错开两个人) ——
+      那正是用户定的形状("可能不需要按订单分配…可以两个脚本做订单的一部分")。
+      ⇒ 每一条**逐字等于**它单独推出来的那一份(这一点由探针 ① 钉死)。
+
+    ☠☠ **每条单各建一个 `_Ctx`, 绝不共享 `memo`**: `solve_have` 的记忆化存的是
+      **`Step` 对象**, 而 `push()` 把它们**原样**并进 `steps`, 之后"链式依赖"那一段
+      (`_plan_one` 结尾的 `steps[i].deps = ...`)**就地改写 `deps`**
+      ⇒ 共享 memo 会让两张单改到**同一批对象**
+      (一张单改完另一张看到的依赖就错了)。各建一份的代价只是"同一份料搜两遍",
+      而 `check` 那一侧本来就是无状态的。
+
+    ☠ **某一条推不出 ⇒ 跳过它、不放弃整份**: 推不出解的单本来就要退回贪心路径,
+      没理由因此把**别的单**的计划也扔掉(老行为下那几张单本来就没有计划)。
+      全都不推不出 ⇒ 返回 `None`, 调用方照旧退回贪心(那是"绝不停机")。
+    """
+    if not isinstance(flows, (list, tuple)):
+        return _plan_one(flows, world, check, log=log)
+    _fs = [f for f in flows if f is not None]
+    if not _fs:
+        return None
+    if len(_fs) == 1:
+        return _plan_one(_fs[0], world, check, log=log)      # ⚠ 老路径, 别在这儿加东西
+
+    steps: list = []
+    assumptions: list = []
+    notes: list = []
+    names: list = []
+    dropped: list = []
+    for f in _fs:
+        _nm = str(getattr(f, "name", "") or "") or "?"
+        sub = _plan_one(f, world, check, log=log)
+        if sub is None:
+            # ⚠ **不 `return None`** —— 见上面那条 ☠。它只是不进这份合并计划。
+            dropped.append(_nm)
+            continue
+        # ☠ **`deps` 要整体偏移**, 而且要**造新的 `Step`**: 老对象的下标是
+        #   "在它自己那份计划里"的位置, 直接并进来会**指到别的单的步上**。
+        base = len(steps)
+        for s in sub.steps:
+            steps.append(Step(chef=s.chef, op=s.op,
+                              deps=tuple(d + base for d in s.deps),
+                              why=s.why, cost=s.cost, slot=s.slot))
+        assumptions.extend(sub.assumptions or [])
+        notes.extend(sub.notes or [])
+        names.append(_nm)
+    if not steps:
+        return None                          # 一条都推不出 ⇒ 与单张单同一个处置
+    if dropped:
+        _msg = (f"⚠ {' / '.join(dropped)} 推不出解 —— **不进这份合并计划**"
+                f"(它们这一轮照旧走评分那条路)")
+        notes.append(_msg)
+        if log is not None:
+            log(f"[规划] {_msg}")
+    return Plan(flow=" + ".join(names), steps=steps,
+                assumptions=sorted(set(assumptions)),
+                cost=sum(s.cost for s in steps), notes=notes)

@@ -115,6 +115,13 @@ SCORE_DRIVES_MODE = (os.environ.get("NEKO_SCORE") or "1").strip().lower() not in
 #:   `"0"`     —— **一键回退**: 规划器一行都不跑, 行为与加它之前**逐字相同**。
 #:                 行为不对时**先试这个**(比 `NEKO_COOP=0` 更靠内一层)。
 #:
+#: ☠☠ **计划覆盖的是整个订单池**(2026-09-17 跨单合并计划), 不是最紧急那一张。
+#:   为什么必须扩: 收窄闸门按"计划覆盖哪几张单"放行候选, 而计划只覆盖一张
+#:   ⇒ **每轮把跨单池压回一张单**, `COOP_ORDERS` **静默失效**(不报错, 只是那几张单
+#:   只剩一张在跑)。形状是用户定的: **只覆盖到池、不在规划期排人** ——
+#:   "谁做哪一步"仍旧交给执行层的评分 + 步级占位。见 `_plan_tick` / `planner.plan`。
+#:   ⚠ 它**不是**另一个开关: 池的上限仍是 `NEKO_COOP_ORDERS`, 且与 `execute()` 同一道门。
+#:
 #: ⚠ 它是**旁路**: 规划器抛异常只打一行日志, **绝不影响主流程**(那是"绝不停机"的一部分)。
 PLAN_MODE = (os.environ.get("NEKO_PLAN") or "on").strip().lower()
 PLAN_MODE = {"1": "on", "yes": "on", "true": "on", "off": "0", "no": "0",
@@ -7633,24 +7640,66 @@ class Engine:
         #   ⇒ 这一步把"计划说不是我的"变成**硬闸门**。
         #   ⚠ **软闸门, 不是硬锁**: 计划那一步**这一轮做不到**(世界变了/冷板凳上)就
         #     退回整池 —— 那正是"绝不停机"。硬锁会让一条过期的计划把整局锁死。
-        _pn = self._plan_next(ops, pending)
-        if _pn is not None:
-            # ☠☠ **只收窄"计划那张单"的步**(2026-09-17 三层合流)。
+        _pns = self._plan_next_all(ops, pending, slot_of)
+        if _pns:
+            # ☠☠ **只收窄到"计划覆盖的那几张单"**(2026-09-17 三层合流 → 跨单合并计划)。
             #   池跨单之后, `(action, target)` 匹配会把**别的单**里长得一样的那步
             #   一起收进来(两张单完全可以有同名同步的步骤 —— 实测订单栏同时挂 5 张
-            #   `Sushi_Fish`)⇒ 收窄之后池里混着两张单的步, 而计划只覆盖其中一张。
+            #   `Sushi_Fish`)⇒ 不加归属过滤就会**把别的单的步也当成计划排的**。
             #   ⚠ 归属用 `_plan_flow`(**按槽位键对**), **不靠菜名**。
             #   ⚠ 对不上 ⇒ `_pf is None` ⇒ 不做归属过滤(退回老行为, 不会筛空)。
+            #
+            # ☠☠ **2026-09-17 跨单合并计划: 这一道不再是"把池压回一张单"的帮凶。**
+            #   改之前 `_pf` 是**一张单**(计划只覆盖最紧急那张)⇒ 计划活着的每一轮
+            #   都把跨单池压回单张单, `COOP_ORDERS` 静默失效。
+            #   现在 `_pf` 是**一组槽位键**(`Plan.slots` = 计划覆盖的那几张单)⇒
+            #   放行的就是**池里属于这几张单**的候选 —— 池才是真的池。
+            #   单张单时 `_pf` 里就一个键, 与老行为**逐字相同**。
             _pf = self._plan_flow(flow_of)
+
+            def _slot_ok(i, s):
+                """池里第 `i` 个候选与计划里第 `s` 步**是不是同一步**。
+
+                ☠ **同名多单必须靠 `Step.slot` 分开**(不能只比 `(action, target)`) ——
+                  否则 A 单的 `fetch Rice` 会把 B 单那一步也放行。
+                ⚠ `getattr`: 离线桩的 `_Step` 没有 `slot` 字段; 缺了 ⇒ 退回"只看
+                  action/target", 那正是老行为, 桩不会炸(`_coop_pool_probe` §6)。
+                """
+                if ops[i].action != s.op.action:
+                    return False
+                if self._norm(ops[i].target) != self._norm(s.op.target):
+                    return False
+                _s_slot = str(getattr(s, "slot", "") or "")
+                if not _s_slot or flow_of is None or i >= len(flow_of):
+                    return True                # 退回老行为(只有单池/桩才会走到)
+                return _s_slot == self._plan_key(flow_of[i])
+
+            # ☠☠ **可达性逐条判, 不是"全部可达才收窄"**(跨单合并计划, 2026-09-17)。
+            #   老写法 `if _hit and all(info[i]["cell"] is not None for i in _hit)`
+            #   在 `_hit` 只有一条时**逐字等价**(一条不可达 ⇒ 两版都不收窄), 而
+            #   合并计划下 `_hit` 会横跨好几张单 ⇒ **只要有一张单那一步此刻不可达,
+            #   整份计划就被静默忽略** —— 三张单的计划于是几乎永远不生效。
+            #   ⇒ 把不可达的那几条**剔掉**, 剩下的照常收窄; 一条不剩才退回整池
+            #     (那正是"绝不停机": 计划收窄不了就照老路走)。
             _hit = [i for i in pending if i < n_recipe
                     and (_pf is None
                          or (flow_of is not None and i < len(flow_of)
-                             and flow_of[i] is _pf))
-                    and ops[i].action == _pn.op.action
-                    and self._norm(ops[i].target) == self._norm(_pn.op.target)]
-            if _hit and all(info[i]["cell"] is not None for i in _hit):
+                             and self._plan_key(flow_of[i]) in _pf))
+                    and info[i]["cell"] is not None
+                    and any(_slot_ok(i, s) for s in _pns)]
+            if _hit:
+                # ⚠ 前缀 `只做计划排给我的那一步` **是实机 grep 的指纹**(README
+                #   "递归规划器的日志指纹"), 别改它 —— 只往后加诊断信息。
+                # ☠ 跨单之后"那一步"可能是**好几条**(每个厨师每条链一个链首),
+                #   所以这里把**收窄到几条**也打出来: 实机一眼能看出跨单有没有生效。
+                _miss = [s for s in _pns
+                         if not any(_slot_ok(i, s) for i in _hit)]
                 self.log(f"[规划] ⤵ 只做计划排给我的那一步: "
-                         f"{_pn.op.action} {_pn.op.target}")
+                         + ", ".join(f"{s.op.action} {s.op.target}" for s in _pns)
+                         + f"  → 收窄到 {len(_hit)} 条候选"
+                         + (f"(覆盖 {len(_pf)} 张单)" if _pf and len(_pf) > 1 else "")
+                         + (f"  ⚠ 另有 {len(_miss)} 条此刻够不着, 这一轮先放下"
+                            if _miss else ""))
                 # ⚠ 只收窄 `pending` —— `info` **不用重建**(它本来就是按原 `pending` 算的,
                 #   而 `_hit` 是它的子集)。`recipe`/`chores` 在函数开头就算好了, 不受影响。
                 # ☠☠ **杂活必须留着**(2026-09-17): 收窄原来把 `pending` 整个换成 `_hit`,
@@ -7716,7 +7765,12 @@ class Engine:
             # ☠ **只加不减**, 且 `NEKO_PLAN != "on"` 时恒为 0(老路径一行不生效)。
             #   加在 `raw` 上而不是改 `scoring.score` 的签名 —— `scoring.py` 是**纯函数模块**
             #   (它的纪律是"能脱离游戏肉眼核对"), 不该为了这个多一个参数。
-            _pb = self._plan_bonus(r["op"])
+            # ☠ **带上这个候选属于哪张单** —— 合并计划里同时有 A 单和 B 单的
+            #   `fetch Rice`, 不给槽位键的话 A 单那一步会替 B 单的候选白加 8 分。
+            #   ⚠ 四个平行表**只覆盖菜谱段**(杂活段不 pad)⇒ 这个守卫必须有。
+            _pb = self._plan_bonus(
+                r["op"],
+                slot_of[i] if (slot_of is not None and i < len(slot_of)) else "")
             if _pb:
                 raw[-1] += _pb
             sigs.append(f"{r['op'].action} {r['op'].target}")
@@ -8873,9 +8927,18 @@ class Engine:
         """
         return _PlanView(self)
 
-    def _plan_ctx(self, flow, km, st):
-        """建**(世界视图, 注入的检查器)**。**只读**, 一行状态都不改。"""
+    def _plan_ctx(self, flows, km, st):
+        """建**(世界视图, 注入的检查器)**。**只读**, 一行状态都不改。
+
+        `flows` —— **单个 flow 或一串 flow**(跨单合并计划, 2026-09-17)。
+        单张单时与加合并之前**逐字相同**(离线探针就是拿单个 flow 调的)。
+        ⚠ 世界视图**只建一份**: 货源/背包/手持都是**全局事实**, 不属于任何一张单。
+        """
         from planner import Source, WorldView
+        _fs = list(flows) if isinstance(flows, (list, tuple)) else [flows]
+        _fs = [f for f in _fs if f is not None]
+        if not _fs:
+            return None, None
         chef_ids = [c.id for c in (km.chefs or [])]
 
         # ---- 货源析取: "这份料能怎么拿到" ----
@@ -8912,11 +8975,17 @@ class Engine:
             if p.spawn:
                 add(p.spawn, Source("pack", p.name, chef=wearer))
 
-        # ---- 加工产出来源: 从**本单自己的链**上取(不重推配方树 —— 那是 `derive()` 的活) ----
+        # ---- 加工产出来源: 从**链上**取(不重推配方树 —— 那是 `derive()` 的活) ----
+        # ☠☠ **要并上池里每一张单的链**(2026-09-17 跨单合并计划)。只取第一张的话,
+        #   第二张单的 `cook`/`mix` 上游**推不出来** ⇒ 那份计划的第 5 步起全是
+        #   "留给执行层"的空话(`planner._solve_have_inner` 的 ④ 分支找不到就返回 None)。
+        #   ⚠ 这条是**放宽**而不是收紧: `made_by` 只回答"这道工序产得出它吗",
+        #     而工序本身是**设备语义**、与哪张单无关。
         made_by: dict = {}
-        for o in (getattr(flow, "ops", None) or []):
-            if o.action in ("chop", "cook", "mix") and o.target:
-                made_by.setdefault(self._norm(o.target), []).append(o.action)
+        for _f in _fs:
+            for o in (getattr(_f, "ops", None) or []):
+                if o.action in ("chop", "cook", "mix") and o.target:
+                    made_by.setdefault(self._norm(o.target), []).append(o.action)
 
         # ☠☠ **正在煮的那些当"事实"喂进去**(2026-09-17 三层的接缝) —— 开火台账
         #   (`_pot_*`, "放完就走"那套)与递归规划器**今天完全不相干**, 于是计划会推
@@ -8964,7 +9033,22 @@ class Engine:
                 rc = None
             views[c.id] = (c.x, c.z, c.held or "", getattr(c, "back", "") or "", rc)
 
-        ops_all = list(getattr(flow, "ops", None) or [])
+        # ---- 候选 op 属于**哪一张单** —— 身份(`id()`)对照, 落不到的退回第一张 ----
+        # ☠☠ **为什么要按单分开建 `scratch`, 而不是把几张单的 `ops` 拼成一份**
+        #   (2026-09-17 跨单合并计划): `_op_actionable` 的 `OP_PREREQ` 扫描会从 `idx-1`
+        #   **往回**找"最近的那个同名前置"(`engine.py:7204-7217`), 而它**明确拒绝跨订单**
+        #   —— 那条注释里的实测账就是: A 单结尾的 `fetch X` 拦住 B 单开头的 `chop X`
+        #   ⇒ B 那一步**永远不可做**。拼成一份 scratch 就是**把那个 bug 重新引进来**。
+        #   ⇒ 按候选所属那张单建, `_feasible` 看到的步骤表与**执行层给它的**是同一个范围。
+        # ⚠ 规划器**自己合成**的 op(`fetch`/`pass`/`wear`)不在任何单的 `ops` 里 ⇒ 落回
+        #   第一张。它们无害: `OP_PREREQ` 只管 `cook`/`mix`/`assemble`, 那三类**根本不进**;
+        #   而 `_op_actionable` 的 `flow` 形参经核实**只出现在签名那一行**(纯摆设)。
+        _owner = {}
+        _ops_of = {}
+        for _f in _fs:
+            _ops_of[id(_f)] = list(getattr(_f, "ops", None) or [])
+            for _o in _ops_of[id(_f)]:
+                _owner[id(_o)] = _f
         mate = self._mate(st)
 
         def check(op, chef, assume_held=None):
@@ -8987,7 +9071,9 @@ class Engine:
                 held = assume_held
             # 假设步骤表: 把这一步接到链尾, 前面的都当"还没做完" ——
             # 于是 `OP_PREREQ` 那道闸门**按假设判**, 而且执行层用的是**同一份实现**。
-            scratch = ops_all + [op]
+            # ☠ **按候选所属那张单建**(见上面 `_owner` 那段)—— 单张单时与老代码逐字相同。
+            _f_con = _owner.get(id(op)) or _fs[0]
+            scratch = _ops_of[id(_f_con)] + [op]
             idx = len(scratch) - 1
             steps = list(range(len(scratch)))
             # ☠☠ **`back=` 不能漏**(2026-09-17 修): 规划器问的是"**P2** 能不能从 P1
@@ -8995,7 +9081,7 @@ class Engine:
             #   永远算出"那是 P1 自己背的" ⇒ "队友替我掏"那条路恒推不出来。
             #   这里把**被评估那个厨师**的背传下去。
             r = self._feasible(km, st, op, idx, cx, cz, held, tm, reach,
-                               scratch, steps, flow, mate=mate, strict=True,
+                               scratch, steps, _f_con, mate=mate, strict=True,
                                steps=steps, back=back)
             # ☠☠ **格距必须自己查 `reach` —— `_feasible` 返回的 `dist` 是个占位 `None`。**
             #   真正的格距是 `_rank_candidates` **事后**填的:
@@ -9026,24 +9112,32 @@ class Engine:
         return str(getattr(flow, "slot", "") or "") or str(getattr(flow, "name", "") or "")
 
     def _plan_flow(self, flow_of):
-        """当前那份计划**属于哪张单** —— 拿**黑板键**对, **不靠菜名**。
+        """当前那份计划**覆盖了池里的哪几张单** —— 返回**槽位键的集合**, 或 `None`。
 
-        ☠☠ 为什么要它(2026-09-17 三层合流): `_plan_next` 只回一个 `Step`, 而 `Step`
-          里**没有**"我属于哪张单"。池跨单之后 `_hit` 是按 `(action, 归一化 target)`
-          匹配的 —— 而**两张单完全可以有同名同步的步骤**(实测订单栏同时挂 5 张
-          `Sushi_Fish`), 于是"计划排给我的那一步"会把**别的单**里长得一样的那步
-          一起收进来 ⇒ 收窄之后**池里混着两张单的步**, 而计划只覆盖其中一张。
-        ⚠ 判据用 `_plan_key`(槽位键)对 —— 本仓"订单没有 id、只有名字"那条账已记过四次。
-        ⚠ 对不上(计划过期/池里那张单已经下架)⇒ 返回 `None` ⇒ 调用方**不做归属过滤**
+        ☠☠ 为什么要它(2026-09-17 三层合流): `_plan_next` 回的 `Step` 里原来**没有**
+          "我属于哪张单"。池跨单之后 `_hit` 是按 `(action, 归一化 target)` 匹配的 ——
+          而**两张单完全可以有同名同步的步骤**(实测订单栏同时挂 5 张 `Sushi_Fish`),
+          于是"计划排给我的那一步"会把**别的单**里长得一样的那步一起收进来。
+
+        ☠☠ **2026-09-17 跨单合并计划: 返回值从"一张单"变成"一组槽位键"**。
+          理由: 计划现在**覆盖整个池**(`Plan.slots` 是那几张单的槽位键), 而收窄闸门
+          的语义是"**只放行计划覆盖到的那几张单**" ⇒ 它天生就是个集合运算。
+          老行为(计划只覆盖一张)在这一版下**逐字复现**: 集合里就一个元素。
+
+        ⚠ `Plan.slots` 空(老计划/离线桩的 `_Plan` 没有这个字段)⇒ **退回** `_plan_cur_key`
+          —— 那个键仍然是"我发布时用的键", 与老代码**同一个语义**。
+        ⚠ 交集为空(计划过期/池里那几张单都下架了)⇒ 返回 `None` ⇒ 调用方**不做归属过滤**
           (退回老行为, 不会把候选筛空)。
         """
-        _k = getattr(self, "_plan_cur_key", "")
-        if not _k or not flow_of:
+        if not flow_of:
             return None
-        for _f in flow_of:
-            if self._plan_key(_f) == _k:
-                return _f
-        return None
+        _want = set(getattr(getattr(self, "_plan", None), "slots", ()) or ()) \
+            or {getattr(self, "_plan_cur_key", "")}
+        _want.discard("")
+        if not _want:
+            return None
+        _got = {self._plan_key(_f) for _f in flow_of if self._plan_key(_f) in _want}
+        return _got or None
 
     def _plan_tick(self, flow, km, st) -> None:
         """算一份计划并按开关处置 —— `shadow` 只打日志, `on` 另外把它交给评分层。
@@ -9053,6 +9147,11 @@ class Engine:
         还是"执行做不到"。所以先只打日志, 和现成的 `[引擎] ▶ 第N步 …` 并排看。
 
         ⚠ **它是旁路**: 抛异常只打一行日志, **绝不影响主流程**(那是"绝不停机"的一部分)。
+
+        ☠☠ **`flow` 只是"退路", 不是"计划的范围"**(跨单合并计划, 2026-09-17):
+          本函数**自己建订单池**、把计划覆盖到池里的 `COOP_ORDERS` 张单(见下面那段)。
+          `flow`(调用方给的"最紧急那张")在**建不出池**时兜底 —— 单张单/单人时
+          逐字等于加合并之前。
         """
         if PLAN_MODE not in ("shadow", "on"):
             return
@@ -9067,11 +9166,40 @@ class Engine:
         _calc_at = now          # ☠ **这份计划算出来的时刻** —— 上黑板时当版本号用,
                                 #   读的人拿它判新鲜度(`_plan_ts`)。它和 `_plan_at`
                                 #   (**我**上次算的时刻, 管节流)是**两个**时间戳。
+        # ☠☠ **计划要覆盖整个池, 不是最紧急那一张**(跨单合并计划, 2026-09-17)。
+        #   为什么: 执行层的候选池是跨订单的(`execute()` 拼 `ops` + 四条平行表),
+        #   而收窄闸门(`_rank_candidates`)按"计划覆盖哪几张单"放行候选 ——
+        #   计划只覆盖一张 ⇒ **每轮把池压回一张单** ⇒ `COOP_ORDERS` 静默失效。
+        # ⚠ 门与 `execute():9392` **同一份判据**(`COOP` + 有黑板): 计划覆盖的单
+        #   必须与执行层实际拼进池的单是同一批, 否则收窄会去放行池里**没有**的单,
+        #   而池里**有**的那些反倒被筛掉。
+        # ⚠ `_order_pool` 有缓存(`_pool_key`) ⇒ 这一趟不重算 `derive`。
+        # ⚠ 取不到池/池里只有一张 ⇒ 退回"就这一张单" —— **逐字等于加合并之前**。
+        _fs = [flow] if flow is not None else []
+        if COOP and self.board is not None:
+            try:
+                _pool = self._order_pool(st)
+            except Exception:                                      # noqa: BLE001
+                _pool = []
+            if len(_pool) > 1:
+                # ☠☠ **`flow` 必须留在第一位** —— 黑板键取的是 `_plan_key(flow)`
+                #   (下面发布那儿), 而两个引擎**必须发布/读回同一个键**才不分叉
+                #   (`team.publish_plan` 的注释: 分叉的代价是**死锁**)。
+                #   `flow` 是 `Engine.plan()` 给的"最紧急那张", 而 `_order_pool` 按 `t`
+                #   排序 —— 两边**可能**在分档边界上落到不同的单上, 所以这里显式
+                #   把它钉在首位, 而不是听天由命。
+                _k0 = self._plan_key(flow) if flow is not None else ""
+                _rest = [e[3] for e in _pool[:COOP_ORDERS]
+                         if e[3] is not None and self._plan_key(e[3]) != _k0]
+                _fs = (([flow] if flow is not None else []) + _rest)[:COOP_ORDERS]
+        if not _fs:
+            self._plan = None
+            return
         try:
             import planner
-            world, check = self._plan_ctx(flow, km, st)
+            world, check = self._plan_ctx(_fs, km, st)
             with self._plan_view():
-                p = planner.plan(flow, world, check, log=None)
+                p = planner.plan(_fs, world, check, log=None)
         except Exception as e:                                     # noqa: BLE001
             self.log(f"[规划] ⚠ 算崩了(不影响主流程): {e!r}")
             self._plan = None
@@ -9100,25 +9228,40 @@ class Engine:
         self._plan = p
         if PLAN_MODE != "shadow":
             return
+        # 日志抬头: **覆盖了几张单**要看得见 —— 它是"跨单有没有真的生效"的唯一现场证据
+        #   (`NEKO_PLAN=shadow` 时紧挨着 `[订单] 池里 N 张单`, 两行一比就知道对不对上)。
+        _head = (f"池里 {len(_fs)} 张单({p.flow})" if len(_fs) > 1 else p.flow) \
+            if p is not None else " + ".join(
+                str(getattr(f, "name", "") or "?") for f in _fs)
         if p is None:
-            self.log(f"[规划] {flow.name}: **推不出解** —— "
-                     f"这一单在当前世界里没有一条能走通的链路")
+            self.log(f"[规划] {_head}: **推不出解** —— "
+                     f"当前世界里没有一条能走通的链路")
             return
         # 日志形状: **一行看全 + 我这个厨师"下一步应为"单列一行**。
         #   为什么要单列 `下一步应为` —— 紧挨着的下一行就是 `[引擎] ▶ 第N步 …`(评分层
         #   实际选的)。两行一对比,**分歧当场可见**, 不用人去读整张计划表。
-        self.log(f"[规划] {flow.name}: 推出 {len(p.steps)} 步(每步的依赖见括号)")
+        self.log(f"[规划] {_head}: 推出 {len(p.steps)} 步(每步的依赖见括号)")
+        _many = len(_fs) > 1
         for i, s in enumerate(p.steps):
             dep = ("  ←" + ",".join(str(d) for d in s.deps)) if s.deps else ""
             # ☠ **"探测期判不可行"的步要当场标出来** —— 那些步**没被验证过**,
             #   计划只给了它们一个"分工", 能不能做要执行期才知道。不标的话读日志的人
             #   (和写规划器的人)会把"计划推出来了"误当成"这条链验过了"。
             mark = "  ⚠未验证" if "探测期判不可行" in (s.why or "") else ""
+            # ⚠ 跨单时**每步要标它属于哪张单** —— 不然同名多单的计划读起来是一团
+            #   (`Step.slot` 的注释解释了为什么归属必须显式)。
+            _sl = f" [{getattr(s, 'slot', '')}]" if _many and getattr(s, "slot", "") else ""
             self.log(f"[规划]   {i}. P{s.chef+1} {s.op.action} {s.op.target}{dep}"
-                     + (f"   [{s.op.pin_src}]" if s.op.pin_src else "") + mark)
-        nxt = p.ready_for(self.cid, set())
+                     + (f"   [{s.op.pin_src}]" if s.op.pin_src else "") + _sl + mark)
+        # ☠ **`ready_all_for`, 不是 `ready_for`** —— 合并计划是几条链的并集,
+        #   每条链各有一个链首, 只打第一个会把"我其实有好几条路可以起手"藏起来
+        #   (那正是跨单并行能不能发生的关键)。执行层用的也是这一个。
+        _nxts = p.ready_all_for(self.cid, set())
         self.log(f"[规划]   ★ 我(P{self.cid+1})下一步应为: "
-                 + (f"{nxt.op.action} {nxt.op.target}" if nxt else "(没有分给我的步)"))
+                 + (", ".join(f"{s.op.action} {s.op.target}"
+                              + (f"[{getattr(s, 'slot', '')}]"
+                                 if _many and getattr(s, "slot", "") else "")
+                              for s in _nxts) if _nxts else "(没有分给我的步)"))
         for a in (p.assumptions or [])[:4]:
             self.log(f"[规划]   ⚠ 依赖: {a}")
 
@@ -9317,27 +9460,73 @@ class Engine:
     def _plan_next(self, ops, pending):
         """**计划说"我"下一步该做什么** —— 没有计划/过期/我的步都做完了 ⇒ `None`。
 
+        ⚠ **保留回一个 `Step`(不是列表)** —— `_planctx_probe` §⑨ 钉的就是这个形状
+          (`n0.op.action == "fetch"` / `n2 is None`)。跨单要的那一份走
+          `_plan_next_all`, 本函数是它取第一个的薄封装。
+        """
+        _l = self._plan_next_all(ops, pending)
+        return _l[0] if _l else None
+
+    def _plan_next_all(self, ops, pending, slot_of=None):
+        """**计划说"我"现在能动手的是哪几步** —— 没有计划/过期/我的步都做完了 ⇒ 空列表。
+
         `done` 怎么算: ☠ **用 `(action, 归一化 target)` 判"还在不在待办里"**, 不用步号 ——
           计划是几秒前算的, 世界已经变过, 步号对不上。某一对 `(action, target)` 已经
           不在 `pending` 里 ⇒ 那一步(不管计划里排给谁)**做完了**。
         ⚠ 不认识的步骤(`wear`/`pass` 这类不在菜谱里的)天然算"做完了" ⇒ 不会把计划
           卡在一条永远不会从 `pending` 里消失的步上。那两类由**现成的机制**管
           (`_wear_backpack` 每次 `execute()` 都跑; `pass` 走传递台账)。
+
+        ☠☠ **返回列表, 不是单步**(跨单合并计划, 2026-09-17): 合并计划是**几条链的并集**,
+          每条链各有一个链首 ⇒ "我现在能动手的"天生是**一组**。只回第一个的话, 执行层
+          会一路串行做完第一张单才开始第二张 —— 跨单并行还是被掐掉, 只是换了个地方掐
+           (`planner.Plan.ready_all_for` 的注释里有完整推理)。
+        ⚠ 单张单时**逐字等价于老的"回一个 `Step | None`"**: 一条链只有一个链首,
+          列表长度 0 或 1。老调用方拿 `if _pn is not None:` 判的, 空列表也是假值 ⇒ 不炸。
+
+        ☠☠ **`slot_of` 加进来是为了把 `done` 判准**(可选尾参, **不能**变成必传 ——
+          `_planctx_probe` §⑨ 就是拿**两个实参**调的)。池跨单之后 `alive` 里
+          同时有 A 单和 B 单的 `fetch Rice`, 而 `(action, target)` 这**一对**分不出
+          是谁的 ⇒ "A 单的取完了"会把"B 单的还没取"一起判成做完了。带上槽位键
+          (`(槽位, action, target)` 三元组)才分得开 —— 那就是本仓
+          "订单没有 id、只有名字"那条账的第五处。
+        ⚠ 不传 `slot_of`(单池/老调用方)⇒ **逐字退回**二元组, 老行为一行不变。
+        ⚠ `Step.slot` 空(离线桩的 `_Step`)⇒ 那一步也退回二元组判 —— 桩不会因为
+          多了个字段就炸。
         """
         p = getattr(self, "_plan", None)
         if p is None or PLAN_MODE != "on":
-            return None
+            return []
         # ☠ **判新鲜度用 `_plan_ts`(计划自己的算出时刻), 不用 `_plan_at`** ——
         #   从黑板读回来的那份如果拿"我读到的时刻"判, 就**永远不会过期**。
         if time.time() - getattr(self, "_plan_ts", 0.0) > PLAN_TTL:
-            return None                        # 过期 ⇒ 当没有计划(动态地图那条)
-        alive = {(ops[j].action, self._norm(ops[j].target))
-                 for j in pending if 0 <= j < len(ops)}
-        done = {i for i, s in enumerate(p.steps)
-                if (s.op.action, self._norm(s.op.target)) not in alive}
-        return p.ready_for(self.cid, done)
+            return []                          # 过期 ⇒ 当没有计划(动态地图那条)
+        # ☠☠ **两张表都要建, 而且要按"这一步有没有 `slot`"分别查** —— 不能
+        #   "有 `slot_of` 就统一查三元组": 计划里**没有 `slot` 的步**(老计划/
+        #   离线桩的 `_Step`)拿二元组去查三元组表 ⇒ **恒不命中** ⇒ 那些步全被判成
+        #   "做完了" ⇒ `ready_all_for` 回空 ⇒ **计划静默消失**(不报错, 只是不生效)。
+        _alive_pair = {(ops[j].action, self._norm(ops[j].target))
+                       for j in pending if 0 <= j < len(ops)}
+        # ⚠ `j < len(slot_of)` 的守卫**必须有** —— 四条平行表只覆盖菜谱段,
+        #   而 `pending` 含杂活下标; 漏了就是 `IndexError` ⇒ **厨师线程死**
+        #   (`runtime/_coop_pool_probe.py` 的文件头记的就是这件事)。
+        _alive_slot = None
+        if slot_of is not None:
+            _alive_slot = {((str(slot_of[j]) if j < len(slot_of) else ""),
+                            ops[j].action, self._norm(ops[j].target))
+                           for j in pending if 0 <= j < len(ops)}
+        done = set()
+        for i, s in enumerate(p.steps):
+            _sl = str(getattr(s, "slot", "") or "")
+            _a, _t = s.op.action, self._norm(s.op.target)
+            if _sl and _alive_slot is not None:
+                if (_sl, _a, _t) not in _alive_slot:
+                    done.add(i)
+            elif (_a, _t) not in _alive_pair:
+                done.add(i)
+        return p.ready_all_for(self.cid, done)
 
-    def _plan_bonus(self, op) -> float:
+    def _plan_bonus(self, op, slot="") -> float:
         """**这一步是不是递归计划排给我的** —— 是就加一点分, 否则 **0**。
 
         为什么是"影响排序"而不是"接管执行"(独立审查给的方向, 我采纳):
@@ -9351,6 +9540,14 @@ class Engine:
         ⚠ `NEKO_PLAN != "on"` 时**恒为 0** ⇒ 老路径一行都不生效。
         ⚠ 计划**过期**也返回 0(见 `PLAN_TTL`) —— 这正是"动态地图"那条的落地:
           世界变了就让计划自己失效, 而不是拿旧计划硬套。
+
+        ☠☠ **`slot` = 这个候选属于哪张单**(可选尾参, 跨单合并计划 2026-09-17)。
+          合并计划里同时有 A 单和 B 单的 `fetch Rice`, 而 `(action, target)` 这一对
+          **分不出是谁的** ⇒ A 单那一步会替 B 单的候选白加 8 分(实测订单栏同时挂
+          5 张同名单)。带上槽位键才分得开 —— 本仓"订单没有 id、只有名字"的第五处。
+        ⚠ **两边都有 `slot` 才按槽位比**(`slot` 空 / 计划里那步的 `slot` 空 ⇒ 退回
+          二元组)。这样老调用方(`_planctx_probe` §⑧ 就是拿**一个实参**调的)与
+          离线桩**逐字退回老行为**。
         """
         if PLAN_MODE != "on":
             return 0.0
@@ -9360,7 +9557,11 @@ class Engine:
         if time.time() - getattr(self, "_plan_ts", 0.0) > PLAN_TTL:
             return 0.0                     # 过期 ⇒ 当作没有计划(下一轮会重算)
         n = self._norm(op.target)
+        _slot = str(slot or "")
         for s in p.steps_of(self.cid):
+            _s_slot = str(getattr(s, "slot", "") or "")
+            if _slot and _s_slot and _s_slot != _slot:
+                continue                   # 别的单的同名同步 —— 不是我这一步
             if s.op.action == op.action and self._norm(s.op.target) == n:
                 return PLAN_FOLLOW_BONUS
         return 0.0
@@ -10370,7 +10571,9 @@ class Engine:
 
         为什么能拿到"不是当前那单"的菜谱: `state.details` 报的是**整关菜谱池**
         (`StateCollector.cs:364-385`), 不是只有当前单 ⇒ 任意一张挂单都推得出来。
-        (`Engine.plan()` 早就在做同一条链, 只是它只挑最紧急那一单。)
+        (`Engine.plan()` 早就在做同一条链, 只是它只挑最紧急那一单 —— 那是**展示用**的
+         "这一轮先打哪张单"; ☠ **规划器不一样**: `_plan_tick` 从 2026-09-17 起拿**整池**
+         (见那边的注释), 因为收窄闸门是按"计划覆盖哪几张单"放行候选的。)
 
         ⚠ `derive` 不便宜, 而这是每 0.5 秒的循环 ⇒ **缓存**(`_all_flows` 共用这一份,
           它是本函数的投影 —— 两处**同一次 derive**, 不重复算)。
@@ -11481,9 +11684,12 @@ class Engine:
                     self.log("[键位] dll 未提供 player 字段, 改用实测探测")
                     self.probe_bindings()
 
-            # **影子模式**: 算一份递归计划, 只打日志, 一行行为都不改(`NEKO_PLAN=shadow`)。
+            # **递归规划器**: `on` = 接管"选哪个"(软闸门 + 奖励分); `shadow` = 只打日志。
             #   放在 `execute()` **之前** —— 那一刻 `km`/`st`/`flow` 都在手上, 而且
             #   紧挨着下面那批 `[评分] …` 日志, 便于并排对照。
+            # ⚠ `flow` 只是**退路**: `_plan_tick` 从 2026-09-17 起**自己建订单池**、
+            #   把计划覆盖到池里的 `COOP_ORDERS` 张单(跨单合并计划)。这里传的
+            #   "最紧急那张"在建不出池时兜底, 并且**钉在池的第一位**(黑板键用它)。
             self._plan_tick(flow, km, st)
             if self.execute(flow):
                 self.log(f"[引擎] ★ 完成 {name}")
