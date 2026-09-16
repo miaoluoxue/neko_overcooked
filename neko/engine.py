@@ -5594,7 +5594,11 @@ class Engine:
           **键在不在**(旧 dll 没有这个字段 ⇒ 放行), 别用"空不空"当判据。
         """
         h = (self.chef(st) or {}).get("heldhas") or ""
-        return {self._norm(p) for p in h.split("+") if p.strip()}
+        # ☠ **同 `_plate_contents_on`: 把"容器自己"剔掉** —— 空盘报的是它自己的名字
+        #   (`equipment_plate_01`), 不剔的话 `_deliver_plate` 会以为手上那盘里
+        #   "装着别的东西", 而 `_dish_matches` 也就永远不成立。
+        own = self._norm((self.chef(st) or {}).get("held") or "")
+        return {self._norm(p) for p in h.split("+") if p.strip()} - {own}
 
     @staticmethod
     def _onhas_raw(s) -> str:
@@ -5623,15 +5627,32 @@ class Engine:
         return " ".join(out) if out else "(空)"
 
     def _plate_contents_on(self, s: Station) -> set:
-        """台面上那个盘子里装了什么(插件读的 onhas)。用来判断"并盘到底成功没有"。"""
-        out = set()
+        """台面上那个盘子里装了什么(插件读的 onhas)。用来判断"并盘到底成功没有"。
+
+        ☠☠ **必须把"盘子自己"剔掉**(2026-09-17 实机 `s_balloon_2_3` 整局报废打回来的)。
+          游戏自己的 `ServerIngredientContainer` 里**装的就是这个容器 item 本身**
+          (`ItemKnowledge.AppendNodeName` 对物品叶子取 `m_itemOrderNode.name`) ⇒
+          **空盘**报出来的内容是 `"equipment_plate_01"` —— **它自己的名字**。
+          于是:
+            `_plate_contents_on(空盘)` = `{'equipmentplate01'}`
+            ⇒ `_dish_foreign(那盘, 本单)` = `{'equipmentplate01'}` **非空**
+            ⇒ 被判成"**这盘是别的单的菜**" ⇒ `_skip_already_on_spot` **跳过每一组
+              `assemble`** ⇒ 菜永远拼不起来 ⇒ 一整局 0 分。
+          实测日志原话:
+            `台面 counter13 跳过这 3 步(fetch Pasta 起) —— Pasta 加进去会串进别的菜
+             (盘里=['equipmentplate01'], 本单要=['pasta','prawn','uncookedfish'])`
+          ⚠ 这跟 `_dish_matches` 的集合判据**无关** —— 判据没错, 是**喂给它的集合脏了**。
+          ⚠ 这关的盘子prefab 叫 `equipment_plate_01` 才显形; 别的关可能恰好没暴露。
+        """
+        out, own = set(), set()
         for i, o in enumerate(s.on or []):
             if not is_plate(o, s.tag_of(i)):
                 continue
+            own.add(self._norm(o))       # ☠ 盘子的"内容物"里含它自己 —— 记下来待会儿剔
             for part in (s.has_of(i) or "").split("+"):
                 if part.strip():
                     out.add(self._norm(part))
-        return out
+        return out - own
 
     def _wear_backpack(self, km: KitchenMap, x: float, z: float) -> bool:
         """**先把背包背上** —— DLC09 那关的**前置条件**, 不是普通杂活。
