@@ -5143,7 +5143,7 @@ class Engine:
                 continue
         return out
 
-    def _fire_targets(self) -> list:
+    def _fire_targets(self, km=None) -> list:
         """场上正在烧的东西 —— **带名字/类型**(灭火时要打出来)。
 
         为什么非要有名字(实机 2026-09-14 `s_summer_1_4`): `dyn.fires` 里既有
@@ -5151,17 +5151,41 @@ class Engine:
         (那一关 11 处里 8 处是 `FireWorkHazard`)——
         只报坐标的话, "喷了没反应"分不清是"没对准"还是"这东西根本灭不掉",
         而这两种情形的处置完全相反(前者要调站位, 后者要换目标)。
+
+        ☠☠ **锅/灶台着火不在 `dyn.fires` 里**(2026-09-17 用户: "**锅起火的话不会灭火**,
+          地上的火已经验证过了还可以") ⇒ 只靠插件那张表, 锅烧起来了脚本**看不见**,
+          `extinguish` 连"有火"都不知道, 那一锅就一直烧到报废。
+        ⚠ 而**这份数据我们本来就有**: `km.cooking` 的每个条目带 `burning`
+          (`_pot_valid` 判"糊了/过了"用的就是它)。⇒ 用**锅自己的坐标**补一条,
+          名字/类型标清楚是"锅着火" —— 于是 `extinguish` 那一整套
+          (走过去 → 面向 → 喷 0.9s → 确认) **原样适用**, **一行插件代码都不用改**。
+        ⚠ `km=None`(老调用方)⇒ 逐字退回"只看 `dyn.fires`"的老行为。
         """
         try:
             dyn = self.bridge.get_dyn()
         except Exception as e:
+            # ☠ **插件读失败 ≠ 没有锅着火** —— 这两条来源是**独立的**:
+            #   `dyn.fires` 来自桥, 锅那条来自 `km.cooking`。原来这里 `return []`,
+            #   于是插件抖一下就把锅那一路一起丢了(= 锅烧着也当没火)。
+            #   ⇒ 记一笔, 继续往下走去补锅那条。
             self.log(f"[灭火] 读火失败: {e}")
-            return []
+            dyn = None
         out = []
         for f in (dyn or {}).get("fires") or []:
             try:
                 out.append({"x": float(f.get("x") or 0), "z": float(f.get("z") or 0),
                             "name": f.get("name") or "", "type": f.get("type") or ""})
+            except (TypeError, ValueError):
+                continue
+        # ---- 锅/灶台着火: 从 `km.cooking` 的 `burning` 补 ----
+        for ck in (getattr(km, "cooking", None) or ()):
+            try:
+                if not getattr(ck, "burning", False):
+                    continue
+                out.append({"x": float(getattr(ck, "x", 0) or 0),
+                            "z": float(getattr(ck, "z", 0) or 0),
+                            "name": getattr(ck, "name", "") or "锅",
+                            "type": "CookingBurn"})
             except (TypeError, ValueError):
                 continue
         return out
@@ -5229,7 +5253,9 @@ class Engine:
         tried = set()          # 喷过没反应的那些(坐标取整), 免得在它身上反复耗时间
         t0 = _t.time()
         while _t.time() - t0 < budget:
-            fires = self._fire_targets()
+            # ☠ 传 `km` —— 锅/灶台着火**不在插件那张火表里**, 得从 `km.cooking`
+            #   的 `burning` 补(见 `_fire_targets` 的 ☠☠)。不传 = 看不见锅着火。
+            fires = self._fire_targets(km)
             if not fires:
                 break
             cx, cz, _ = self.pos(self.state() or {})
@@ -7722,8 +7748,16 @@ class Engine:
             #   执行跑去了那块板"(这项目已经栽过好几次)。
             b = self._pick_board(km, x, z, op.target, claim=False)   # 评分: 不占位
             if b is None:
-                return self._no_target(self.GROUND_BUSY,
-                                       "没有能用的切菜板(都被占着?)")
+                # ☠☠ **别再说"都被占着"**(2026-09-17, 用户: "感觉板子都只会选一个死脑筋硬钻,
+                #   但是还有其他板子啊")。实机 `s_mine_2_6`: board0 被判死(`走不到旁边`)、
+                #   board1 被判死(`对不齐台面`)之后, 这里打的是"**(都不存在或被别人的东西
+                #   占着)**" —— **板在、也没被占**, 只是**刚划掉、25 秒才回池**。
+                #   那句话会把人带去查"谁占着板", 而真凶是**那两个失败原因本身**。
+                #   ⇒ 把三种可能**都列出来**, 别替读者下结论。
+                return self._no_target(
+                    self.GROUND_BUSY,
+                    "没有能用的切菜板(被别人的东西占着 / **刚划掉还没回池**(25s) / "
+                    "这块料这关没有)**—— 看上面那几行 `[分支] … 先划掉 25 秒` 是哪一条**")
             return (b.x, b.z), b.id
         if a == "mix":
             # ⚠ **搅拌台不是切菜板**: 去的是 `MixingStation`(`sem == "mix"`)。
