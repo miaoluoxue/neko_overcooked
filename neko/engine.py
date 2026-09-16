@@ -4374,6 +4374,41 @@ class Engine:
                 return []
         return pts
 
+    def _has_pilot_console(self, km) -> bool:
+        """这一关有没有**遥感控制台**(能开动平台的那个工位)。
+
+        判据来自插件: 工位报 `pilots`(它控制的那台机关的名字) 或 `session`(正在被驾驶)。
+        ⚠ 老 dll 两个字段都没有 ⇒ 恒 `False` ⇒ 调用方**逐字退回老行为**。
+        """
+        if km is None:
+            return False
+        try:
+            for s in km.stations.values():
+                if getattr(s, "pilots", "") or getattr(s, "session", False):
+                    return True
+        except Exception:                                         # noqa: BLE001
+            return False
+        return False
+
+    def _goal_in_reach(self, tm, reach, tx: float, tz: float) -> bool:
+        """**目标旁边站得到吗** —— 判据和 `_stand_cell` 同一套: 目标格本身,
+        或它的**正交相邻格**里有"可走且可达"的。
+
+        ⚠ 斜角**不算**(1.70 格 > 交互半径 1.0 —— 见 `_stand_cell_of` 的注释)。
+        ⚠ 判不了(地形没起来)⇒ 回 `True`(= "够得着"): 这一问只用来决定**要不要去开桥**,
+          问了不该开桥的关卡是纯浪费, 所以拿不准时**别去开**。
+        """
+        if tm is None or not getattr(tm, "ok", False):
+            return True
+        i, j = tm.cell_of(tx, tz)
+        if (i, j) in reach and tm.walkable(i, j):
+            return True
+        for di, dj in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            c = (i + di, j + dj)
+            if tm.walkable(*c) and c in reach:
+                return True
+        return False
+
     def navigate_smart(self, km: KitchenMap, tx: float, tz: float,
                        tight: float = 0.8, replans: int = 3) -> bool:
         """带寻路的导航。
@@ -4431,6 +4466,37 @@ class Engine:
                 if p:
                     return p
                 return plan_path(x, z, tx, tz, self._obstacles(km) | (blocked or set()))
+
+            # ☠☠ **该开桥吗 —— 判据是「可达性」, 不是「有没有路点」**(2026-09-17, 用户:
+            #   "这一关是遥感关，但是脚本不会控制遥感" + "和遥感互动随后按方向键即可控制平台移动")。
+            #
+            #   原来 `pilot_bridge` **只**在"三条规划路全失败"(`if not pts:`)时才试。
+            #   而**遥感关**里地图**根本看不见那台平台**(它不占格子 —— 见 `navigate_smart`
+            #   docstring 里那段 ⚠), 于是地图**永远以为对岸是连通的** ⇒ `pts` 非空
+            #   ⇒ **桥那条路一次都不会被敲**。
+            #   实测 `MovingPlatform4`: 两个厨师的可达格都是 `59/160`、每一个货源都判
+            #   `够不着`、`[规划] 推不出解`, 而日志里**没有** `地形 A* 无解` 那行、
+            #   **也没有**任何 `[搭桥]`/`[遥感]` —— 整局在沟边顶着, 一次桥都没试过。
+            #
+            #   ⇒ 改成问**"我到得了目标旁边吗"**: 到不了、而这关**有遥感控制台**、
+            #     而 `bridge_cells` 说"把某一格变可走就通了" ⇒ **先开桥**。
+            #     (`bridge_cells` 返回空 = 单格当桥救不了 ⇒ `pilot_bridge` 立刻返回,
+            #      只多一行日志, 所以对**非遥感关**几乎不要钱。)
+            if attempt == 0 and not getattr(self, "_in_bridge", False) \
+                    and tm is not None and tm.ok and self.session_station(st) is None \
+                    and self._has_pilot_console(km):
+                _reach0 = tm.distances_from(x, z, at_y=self.chef_y(st),
+                                            extra_edges=tedges)
+                if not self._goal_in_reach(tm, _reach0, tx, tz):
+                    self.log("[导航] ⚠ 目标 (%.1f,%.1f) **够不着**, 而这一关有遥感控制台"
+                             " —— 先试**用平台搭桥**" % (tx, tz))
+                    if self.pilot_bridge(km, st, tm, (tx, tz)):
+                        tm = self.terrain(force=True)   # 桥搭好了, 重取图重规划
+                        st = self.state(force=True) or st
+                        x, z, _ = self.pos(st)
+                        if x is None:
+                            return False
+                        continue
 
             pts = _plan(blk)
             if not pts and blk:
