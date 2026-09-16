@@ -2325,31 +2325,48 @@ class Engine:
             return False
         return h == w or h.startswith(w)
 
-    def _stand_cell_of(self, tm, tx: float, tz: float, cx: float, cz: float,
-                       max_di: int = 2, ortho_only: bool = False, reach=None):
-        """`_stand_cell` 的**返回"格子"版** —— 返回 `(i,j)` 或 None。
+    #: **站位格要不要收成"游戏真会认的那 4 格"**(2026-09-17, 用户点名的"锅的定位 ①")。
+    #:
+    #: `0` = 逐字退回老口径(±2 格 + 斜角, 纯按"离厨师最近"挑) —— 本仓一键回退的惯例。
+    #:
+    #: ☠☠ **老口径为什么是错的**(反编译定案, 规则 1):
+    #:   游戏的**放置目标** `m_iHandlePlacement` 只有一个来源 —— `PlayerControls.cs:763-768`
+    #:     `ScanForObject(m_colliders, …)` 挑出**一个**物体, 再由
+    #:     `GetControllingPlacementHandler_Client` 解出句柄;
+    #:   而那个数组里"台面是怎么进来的"在 `InteractWithItemHelper.cs:165-215`:
+    #:     `GetCollidersInArc` 末尾把 `GetFacingGridOccupant(…)` **塞进第一个空位**。
+    #:   ⇒ 台面**只有靠 `GetFacingGridOccupant` 才可能成为放置目标**。
+    #:   而它的候选集是 `s_gridOffsetsXZ`(`InteractWithItemHelper.cs:20-26`),
+    #:   **只有 4 个正方向** `(±1,0) / (0,±1)` —— 从**厨师所在那一格**数起。
+    #:   ⇒ **斜角的格、隔两格的格, 游戏永远不会把它们认成放置目标**:
+    #:     厨师站在斜角上时, 目标台面落在偏移 `(±1,±1)` —— 那张表里没有,
+    #:     `m_iHandlePlacement` 只能指向**某个正方向上的邻居**(= 日志里的
+    #:     `游戏说会放到 'workstation_plate_return'`)。
+    #:   ⇒ 还有一条同样要命: `_stand_cell_of` 的候选里**包含厨师自己脚下那一格**
+    #:     (只跳过 `di==0 and dj==0` = **目标**那格, 不是厨师那格) —— 而它离厨师 0 格,
+    #:     距离一比较**必然夺冠**。于是一个**斜着**走向灶台的厨师会被指向
+    #:     "原地站着别动", 然后对着斜角按放置 ⇒ 必然判给隔壁。
+    #:   ⇒ 这两条合起来就是实机那句
+    #:     `⚠ 站到了, 但游戏说目标是隔壁那个台子`, 也正是"换边能救回一些"的来源:
+    #:     `_align_try_other_cells` 用的是 `max_di=1` 且**显式跳过脚下那格** ⇒ 它能走对,
+    #:     而**第一次**的选择(`navigate_smart` → `_stand_cell`)从来没走对过。
+    #:
+    #: ⚠ **只对"站过去动手"那一类生效**(`interact=True`, 目前唯一入口是 `_stand_cell`)。
+    #:   `_stand_cell_of` 的直接调用方问的是另一件事("我走得到它旁边吗"), 口径本来就不同
+    #:   —— 尤其 `pass` 那条**刻意**允许 Δ≤2 格。别把默认翻过来, 见 `_stand_cell_of` 的注释。
+    #:
+    #: ⚠ **是"先收紧、收不紧再退回老口径", 不是"一律收紧"**:
+    #:   4 个正方向全不可走/不可达时(实测有这种台面)照旧按老口径返回一个,
+    #:   否则会把"旁边站得下"变成"没有站位格" —— 那是**新的失败点**, 本仓的纪律是不制造它。
+    STAND_ORTHO = (os.environ.get("NEKO_STAND_ORTHO") or "1").strip().lower() \
+        not in ("0", "off", "no", "false")
 
-        单独拆出来是给**评分层**用的: 它既要知道"站不站得到"(可达性闸门),
-        又要知道"是哪一格"才能去距离表里查步数。只拿世界坐标是查不到的。
+    def _stand_scan(self, tm, i: int, j: int, cx: float, cz: float,
+                    reach, wind, max_di: int, ortho_only: bool):
+        """目标格 `(i,j)` 周围哪一格最该站 —— **只负责扫描与排序, 不负责选口径**。
 
-        `reach` 可以传一份**预算好的** `{cell: 步数}`(`TerrainMap.distances_from`)。
-        不传就按老样子自己跑一次 BFS —— 语义与拆分前**逐字一致**。
-        评分层一次决策传两份(我一份、队友一份), 于是 BFS 次数从 2×候选数 降到 2。
+        口径在上面的 `STAND_ORTHO` / 调用方给的 `max_di`/`ortho_only` 里。
         """
-        if tm is None or not tm.ok:
-            return None
-        if reach is None:
-            # ⚠ **`st` / `km` 必须自己取**: 这里原来直接引用了 `st` 和 `km`, 而它们
-            #   **既不是参数也不是局部变量** —— 那是必然的 `NameError`, 调用点没有一个
-            #   try 兜着, 于是整个"走到台面旁边"的路径全瘫(实测: `_approach` 一进去就炸)。
-            #   症状像 §5.2 记的那种"改调用处时误伤": `at_y=` / `extra_edges=` 是后加的,
-            #   参数没跟着穿进来。自己取一帧最省事(`state()` 吃 TTL 缓存, 几乎不要钱)。
-            st = self.state()
-            km = self.map(st) if st else None
-            reach = tm.reachable_from(cx, cz, at_y=self.chef_y(st),
-                                      extra_edges=self._travel_edges(km, tm))
-        i, j = tm.cell_of(tx, tz)
-        wind = self._wind_cells()          # 一次算好, 别在双循环里反复取
         best, best_d = None, None
         for dj in range(-max_di, max_di + 1):
             for di in range(-max_di, max_di + 1):
@@ -2380,6 +2397,60 @@ class Engine:
                     best_d, best = d, c
         return best
 
+    def _stand_cell_of(self, tm, tx: float, tz: float, cx: float, cz: float,
+                       max_di: int = 2, ortho_only: bool = False, reach=None,
+                       interact: bool = False):
+        """`_stand_cell` 的**返回"格子"版** —— 返回 `(i,j)` 或 None。
+
+        单独拆出来是给**评分层**用的: 它既要知道"站不站得到"(可达性闸门),
+        又要知道"是哪一格"才能去距离表里查步数。只拿世界坐标是查不到的。
+
+        `reach` 可以传一份**预算好的** `{cell: 步数}`(`TerrainMap.distances_from`)。
+        不传就按老样子自己跑一次 BFS —— 语义与拆分前**逐字一致**。
+        评分层一次决策传两份(我一份、队友一份), 于是 BFS 次数从 2×候选数 降到 2。
+
+        ☠☠ `interact=True` —— **"这一趟是要站过去与它交互"**, 于是先按**游戏自己的口径**
+          (`max_di=1, ortho_only=True`)扫一遍并优先用它; 一类格子都不剩才退回调用方给的
+          老口径。依据与实机账全在 `STAND_ORTHO` 那段 —— 一句话: **斜角格/隔两格
+          被 `GetFacingGridOccupant` 排除在候选之外, 游戏永远不会把放置目标认到那儿**。
+
+        ⚠ **默认 `False` = 逐字老行为**, 而且**故意的**: `_stand_cell_of` 的直接调用方
+          (`pass` 的评分闸门、`fetch` 的可达性挑选)问的**不是**"放置目标认不认",
+          而是"我走得到它旁边吗" —— 那两个口径**本来就不一样**:
+            · `pass`: **丢过去**是抛掷, 射程比交互半径大, 所以 `max_di=2`(Δ≤2 格)
+              **是刻意留的**(`_splitkitchen_probe.py` §2/§3b 钉着这个语义);
+            · `fetch`: 真要动手时还会走 `_approach`(取一圈候选 → 逐个 `face` + 问游戏),
+              执行侧本来就有兜底。
+          ⇒ 别顺手把默认翻过来: 那会让 `pass` 的距离闸门从 Δ≤2 缩成 Δ≤1,
+            整条传球线凭空变远一格(`_splitkitchen_probe.py` 当场打红)。
+        """
+        if tm is None or not tm.ok:
+            return None
+        if reach is None:
+            # ⚠ **`st` / `km` 必须自己取**: 这里原来直接引用了 `st` 和 `km`, 而它们
+            #   **既不是参数也不是局部变量** —— 那是必然的 `NameError`, 调用点没有一个
+            #   try 兜着, 于是整个"走到台面旁边"的路径全瘫(实测: `_approach` 一进去就炸)。
+            #   症状像 §5.2 记的那种"改调用处时误伤": `at_y=` / `extra_edges=` 是后加的,
+            #   参数没跟着穿进来。自己取一帧最省事(`state()` 吃 TTL 缓存, 几乎不要钱)。
+            st = self.state()
+            km = self.map(st) if st else None
+            reach = tm.reachable_from(cx, cz, at_y=self.chef_y(st),
+                                      extra_edges=self._travel_edges(km, tm))
+        i, j = tm.cell_of(tx, tz)
+        wind = self._wind_cells()          # 一次算好, 别在双循环里反复取
+        # ☠☠ **先按游戏自己的口径扫一遍**(见 `STAND_ORTHO` 那段): 只有正方向那 4 格
+        #   可能被 `GetFacingGridOccupant` 认成放置目标。扫到了就用它 —— 这时候老口径
+        #   返回的多半是**厨师脚下那一格**(它离厨师 0 格, 距离一比较必然夺冠),
+        #   而"原地不动"只有在**正方向**上才成立。
+        if (interact and self.STAND_ORTHO) and not (max_di <= 1 and ortho_only):
+            best = self._stand_scan(tm, i, j, cx, cz, reach, wind, 1, True)
+            if best is not None:
+                return best
+        # 兜底 / `NEKO_STAND_ORTHO=0` 回退档: 老口径(±2 格 + 斜角)。
+        # ⚠ 走到这里说明**4 个正方向一格都站不下**(或回退档开着) —— 这时宁可给个
+        #   够不着的格, 也不要"没有站位格"(那会把导航变成顶着橱柜推)。
+        return self._stand_scan(tm, i, j, cx, cz, reach, wind, max_di, ortho_only)
+
     def _stand_cell(self, tm, tx: float, tz: float, cx: float, cz: float,
                     max_di: int = 2, ortho_only: bool = False):
         """找一个"能站、够得着目标、且离厨师最近"的格子 —— 该站哪儿去拿东西。
@@ -2394,12 +2465,16 @@ class Engine:
         (交互半径 1.0, 格距 1.2 —— 站在相邻格刚好够得着)。
 
         返回 (世界x, 世界z) 或 None。**选择逻辑全在 `_stand_cell_of`**, 这里只转坐标。
+
+        ☠☠ **这个函数一律带 `interact=True`**(2026-09-17, 用户点名"锅的定位 ①"):
+          它唯一的用途就是"**站过去动手**", 因此走 `STAND_ORTHO` 那条更严的口径。
+          两个调用方(`navigate_smart` 目标格是障碍时的落位、传送带上等料)都是这一类。
         """
-        c = self._stand_cell_of(tm, tx, tz, cx, cz, max_di, ortho_only)
+        c = self._stand_cell_of(tm, tx, tz, cx, cz, max_di, ortho_only, interact=True)
         return tm.world_of(*c) if c is not None else None
 
     def _stand_cells(self, tm, tx: float, tz: float, cx: float, cz: float,
-                     max_di: int = 2, avoid=None) -> list:
+                     max_di: int = 2, avoid=None, ortho_only: bool = False) -> list:
         """目标的**所有**能站相邻格, 按离厨师远近排序。
 
         为什么要"所有"而不是"最近那个": 实测拿食材时厨师停在离箱子 2.24 格处
@@ -2408,6 +2483,12 @@ class Engine:
         avoid: 队友当前占的格子(双人时由共享世界给出)。**优先避开** ——
         两个人抢同一个站位会互相推挤, 表现为"两个人都卡住"。但只在还有别的选择时
         才避开: 全被占了就照常返回(宁可挤一下, 也不要站在那里什么都不做)。
+
+        `ortho_only=True` —— **只要正方向那 4 格**(见 `STAND_ORTHO` 那段的反编译依据:
+          `GetFacingGridOccupant` 的候选集 `s_gridOffsetsXZ` 只有 4 个正方向) ⇒
+          斜角/隔两格的格子**游戏永远不会把放置目标认到那儿**, 拿它们当候选是纯浪费
+          (`_align_try_other_cells` 以前一圈 8 个里有 4 个是这种, 白走 4 趟)。
+        ⚠ 默认 `False` = 逐字老行为; 只有明确"这趟是要去交互"的调用方才传 `True`。
         """
         if tm is None or not tm.ok:
             return []
@@ -2424,6 +2505,8 @@ class Engine:
             for di in range(-max_di, max_di + 1):
                 if di == 0 and dj == 0:
                     continue
+                if ortho_only and (di != 0 and dj != 0):
+                    continue          # 斜角: 不在 `s_gridOffsetsXZ` 里, 游戏不认
                 c = (i + di, j + dj)
                 if not tm.walkable(*c) or c not in reach:
                     continue
@@ -2509,7 +2592,7 @@ class Engine:
     ALIGN_TRY_CELLS = (os.environ.get("NEKO_ALIGN_TRY_CELLS") or "1").strip().lower() \
         not in ("0", "off", "no", "false")
 
-    def _align_for_place(self, spot, tries: int = 8) -> bool:
+    def _align_for_place(self, spot, tries: int = 8, also: str = "") -> bool:
         """朝 `spot` 挪到**游戏说"放置目标就是它"**为止。返回是否对齐。
 
         ☠☠ **两段式**(2026-09-17, 用户点名的"锅的定位不是很好"):
@@ -2517,6 +2600,13 @@ class Engine:
              **一步都没变**;
           ② 原地挪不出来 ⇒ **换一个相邻站位格再问**(`_align_try_other_cells`)。
           要第 ② 段的理由见那个函数的注释 —— 一句话: **老行为换不了边**。
+
+        `also` —— **除了 `spot` 自己, 还认哪个名字**(精确比, 同下面那条纪律)。
+          存在的理由只有一个: **锅架在灶台上时, 游戏报的可能是锅自己的名字**
+          (`ServerAttachStation.CanHandlePickup` 把放置**转发**给 `m_item` ——
+           依据见 `_place_target_ok` 那段, 它一度因为"只认灶台"把整单打死)。
+          ⚠ **不给 `also` 时逐字老行为**; 多一个可接受的名字**只会放宽、不会收紧**
+            ⇒ 天然的加法, 不需要单独开关。
 
         ☠ 为什么必须确认(实测 `s_wonderland_1_5`, 整局报废):
           导航只保证"站到了旁边", `face` 只保证"面朝那边" —— 而**两个台子挨得近时**,
@@ -2532,6 +2622,7 @@ class Engine:
         want = self._fresh_station_name(spot)
         if not want:
             return True                      # 不知道期望名字时只能放行(老 dll)
+        wants = (want, also) if (also and also != want) else (want,)
         for k in range(tries):
             st = self.state(force=True)
             if not st or not st.get("inRound"):
@@ -2545,7 +2636,9 @@ class Engine:
             #   那条宽松规则是为"计划里写裸名"留的; 而**放置目标两侧的名字都来自游戏自己**
             #   (`go.name` 对 `go.name`) ⇒ "一方没编号"只可能是**两个不同的物体**
             #   (同类型台面里第一个叫裸名、第二个叫 `(2)`) ⇒ 编号就是身份。
-            if ph and ph == want:
+            #   ⚠ `wants` 里两个名字**都是游戏自己报过的**(`_fresh_station_name` 取的是 km 的
+            #     活名字, `also` 由调用方从同一帧 km 里取) —— 放宽到"两个都认"没有违反这条。
+            if ph and ph in wants:
                 return True
             cx, cz, _ = self.pos(st)
             if cx is None:
@@ -2567,14 +2660,15 @@ class Engine:
                 key_up(key)
             time.sleep(0.12)
         # ---- ☠ 原地挪不出来 ⇒ **换一个相邻站位格再问游戏**(见那个函数的注释) ----
-        if self.ALIGN_TRY_CELLS and self._align_try_other_cells(spot, want):
+        if self.ALIGN_TRY_CELLS and self._align_try_other_cells(spot, want, also=also):
             return True
         st = self.state(force=True)
         self.log("[步骤] ⚠ 挪了 %d 次, 游戏仍说放置目标是 %r(期望 %r) —— **不再按下去**"
                  % (tries, (self.chef(st) or {}).get("placeh") or "", want))
         return False
 
-    def _align_try_other_cells(self, spot, want: str, most: int = 7) -> bool:
+    def _align_try_other_cells(self, spot, want: str, most: int = 7,
+                               also: str = "") -> bool:
         """**换一个相邻站位格, 再问一次游戏"放置目标是它吗"**。
 
         ☠☠ 为什么必须有它(用户 2026-09-17 点名"锅的定位不是很好"; 实机 `s_sushi_1_3`):
@@ -2598,19 +2692,30 @@ class Engine:
 
         ⚠ **判据仍然只有一份**: 够不够得着永远由**游戏报的 `placeh`** 说了算,
           这里只负责换**起点**。一行几何都不自己算(同 `_align_for_place` 的纪律)。
-        ☠☠ **`max_di=1` + `most=7` = "围着这台子转一圈"**, 而且**是有界的**:
-          台面是一格, 相邻格**恰好 8 个**; 跳掉脚下那一格 ⇒ 最多 7 次, 一次不多。
+        ☠☠ **`max_di=1` + `ortho_only=True` = "围着这台子转那 4 个正方向"**,
+          而且**是有界的**: 台面是一格, **游戏认的正方向恰好 4 个**; 跳掉脚下那一格
+          ⇒ 最多 3 次, 一次不多。
           ⚠ **不能沿用 `_stand_cells` 的 `max_di=2`**: 那会连"隔着两格"的格子一起
             返回(5×5 去掉中心 = 24 个), 而**隔两格根本够不着台面**(交互半径 1.0,
-            格距 1.2) —— 拿它当候选是纯浪费, 还会把真正相邻的那几个挤到 `most` 之外。
+            格距 1.2) —— 拿它当候选是纯浪费。
+          ☠ **斜角那 4 格也不要了**(2026-09-17 反编译定案, 见 `STAND_ORTHO` 那段):
+            `GetFacingGridOccupant` 的候选集 `s_gridOffsetsXZ`
+            (`InteractWithItemHelper.cs:20-26`)**只有 4 个正方向** ⇒ 站在斜角上时
+            目标台面落在偏移 `(±1,±1)`, **游戏永远不会把它认成放置目标**。
+            改前一圈 8 个里**有 4 个是注定失败的**, `most=7` 只是把它们都白走一遍;
+            实测指纹就是每换一次打一行 `↻ 换到 (x,z) 再问: 游戏仍说 '' ✗`。
+            现在候选池 = 真正可能成功的 4 格(去掉脚下 ⇒ ≤3 次), 快且不再骗人。
           ⚠ 也不要"只试最近的 3 个": 实测排序里最近的正是**背后那几格**, 而要找的
-            "另一侧"排在第 4~7 位 ⇒ 试 3 个**永远试不到**。
+            "另一侧"可能排在最后 ⇒ 那一条**仍然靠 `most` 兜住**(默认 7 > 3)。
           ⚠ **脚下这一格跳过** —— 刚才那 `tries` 次已经把它试透了。
           ⚠ 顺序仍按**离当前远近**(`_stand_cells` 已排好): 先去最近的, 省时间。
         ⚠ 队友站着的格**先让开**(`occupied_by_others`, 同 `_approach`):
           两个人挤在同一格只会互相推, 而 `_stand_cells` 的纪律是"全被占了照常返回"
           (宁可挤一下, 也别站着什么都不做)。
         ⚠ 只在**落空之后**走这一趟 ⇒ 是**加法**: `ALIGN_TRY_CELLS=0` 就等于没改过。
+
+        `also` —— 除 `spot.name` 外还认哪个名字(精确比); 只有一个用法: **锅架在灶上时
+          游戏报的可能是锅的名字**, 见 `_align_for_place` 的同名参数。
         """
         if not want or spot is None:
             return False
@@ -2627,8 +2732,11 @@ class Engine:
         avoid = set()
         if getattr(self, "world", None) is not None:
             avoid = self.world.occupied_by_others(getattr(self, "cid", 0), tm)
-        # ⚠ `max_di=1` —— 见 docstring: 只围**相邻那一圈**, 隔着两格的够不着台面。
-        cands = self._stand_cells(tm, spot.x, spot.z, cx, cz, max_di=1, avoid=avoid)
+        # ⚠ `max_di=1` + `ortho_only=True` —— 见 docstring: 只围**那 4 个正方向**,
+        #   隔着两格的够不着台面, 斜角的**游戏根本不认**(`s_gridOffsetsXZ` 只有 4 个)。
+        cands = self._stand_cells(tm, spot.x, spot.z, cx, cz, max_di=1,
+                                  avoid=avoid, ortho_only=True)
+        wants = (want, also) if (also and also != want) else (want,)
         here = tm.cell_of(cx, cz)
         tried = 0
         for (sx, sz) in cands:
@@ -2644,7 +2752,7 @@ class Engine:
             # ☠ 与 `_align_for_place` **同一条判据**(精确比, 连实例号) —— 别在这儿
             #   换一个宽松的比法, 那正是那里注释里记着的实机翻车(`countertop_01_standard_wood`
             #   裸名 vs `(2)`, 宽松比判"对上了" ⇒ 按下去 placeCanHandle=false ⇒ 整单放弃)。
-            if ph and ph == want:
+            if ph and ph in wants:
                 self.log("[步骤] ↻ 原地挪不出来, 换到 (%.1f,%.1f) 再问: 游戏说放置目标=%r ✓"
                          % (sx, sz, ph))
                 return True
@@ -6004,12 +6112,30 @@ class Engine:
             #   ok=True —— 东西放上了柜台, 引擎却以为进锅了, 后面全错。
             #   宁可这一步失败(execute 会重试, 每次重新导航 = 再给一次机会),
             #   也不要放错地方还报成功。
-            ok_place, who = self._place_target_ok(stove, pot, want_pot)
-            if not ok_place:
-                self.log(f"[步骤] ⚠ 站位不对: 游戏说会放到 {who!r}, 而不是 "
-                         f"{stove.name!r}" + (f" / 锅 {pot!r}" if (want_pot and pot) else "")
-                         + " —— 不按, 免得放错地方还报成功")
-                return False
+            #
+            # ☠☠ **先走 `_align_for_place`(2026-09-17, "锅的定位 ①" 的下锅那一半)** ——
+            #   原来这里**只是看一眼就 return False**, 而这一步是**唯一**没走
+            #   "站到相邻格 → 问游戏 → 换边"那条标准路的地方: `_take_from_pot`(取菜)、
+            #   `op_chop`/`op_assemble`/`op_deliver` 全都走 `_align_for_place`。
+            #   实机账(2026-09-17 `s_balloon_2_3`):
+            #     `⚠ 站位不对: 游戏说会放到 'workstation_plate_return', 而不是
+            #       'workstation_cooker_01 (4)' / 锅 'utensil_frying_pan_01 (1)'`
+            #   —— 而同一份日志里 `_take_from_pot` 那半用的是 `↻ 换到 … 再问` 那条路。
+            #   ⇒ 下锅这一步**一次都不换边**, 于是"换边能救回一些"救不到它。
+            #   ⚠ `also=pot`: 锅架在灶上时游戏报的可能是**锅自己的名字**
+            #     (`ServerAttachStation` 把放置转发给 `m_item`, 见 `_place_target_ok` 那段) ——
+            #     不传它会把"游戏说会放到锅"判成没对齐, 反而把整单卡死(那正是 2026-09-15
+            #     收窄成"只认锅"时踩过的反面)。**这一步与老判据完全同义, 只是多绕两圈**。
+            #   ⚠ `_place_target_ok` **照旧留着当第二道**: `_align_for_place` 在
+            #     "游戏没报目标(`''`)"时**不放行**(它会去换边), 而老判据在那里是**放行**的
+            #     —— 两条一起用 ⇒ 逐字保住老行为, 只多出"换边"这一种新可能。
+            if not self._align_for_place(stove, also=(pot if (want_pot and pot) else "")):
+                ok_place, who = self._place_target_ok(stove, pot, want_pot)
+                if not ok_place:
+                    self.log(f"[步骤] ⚠ 站位不对: 游戏说会放到 {who!r}, 而不是 "
+                             f"{stove.name!r}" + (f" / 锅 {pot!r}" if (want_pot and pot) else "")
+                             + " —— 不按, 免得放错地方还报成功")
+                    return False
             if not self.interact("pickup", verify_hold_change=True):   # 手上的东西必须脱手
                 self.log("[步骤] ⚠ 东西没放上去(锅/灶台没接住)")
                 return False
