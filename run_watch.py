@@ -209,7 +209,16 @@ AUTO = (os.environ.get("NEKO_WATCH_AUTO") or "0") not in ("0", "", "false", "Fal
 #: 每个动作之间等多久(秒)。太短游戏还没反应过来就按下一个, 太长又白等。
 AUTO_GAP = float(os.environ.get("NEKO_WATCH_AUTO_GAP") or 1.5)
 #: 同一阶段**整个序列**最多重来几遍。跑完还不变就停手打警告(别把界面按乱)。
-AUTO_TRIES = int(os.environ.get("NEKO_WATCH_AUTO_TRIES") or 3)
+#: ⚠ 2026-09-17 实机后从 3 降到 **2** —— 有 `AUTO_SETTLE` 之后重来的代价变高了。
+AUTO_TRIES = int(os.environ.get("NEKO_WATCH_AUTO_TRIES") or 2)
+#: ☠☠ **走完一遍序列后, 先等这么久再看"阶段变没变"**(秒)。
+#:
+#: 为什么必须有(实机打回来的): 原来走完一遍就立刻判"没变"⇒重来, 而**中间步骤本来就不
+#: 改变 `scene`**(切标签只是移动光标), 按完之后**游戏还要好几秒才加载完**。实测:
+#:     `[进关] ⚠ screen 阶段按了 3 遍还是没动 —— 停手`
+#:     `[进关] 阶段 → lobby(scene='Lobbies' …)`      ← **紧接着就变了**
+#: ⇒ 那 3 遍里同一个 `A` 被按了 3 次, 而它其实第 1 次就成了。
+AUTO_SETTLE = float(os.environ.get("NEKO_WATCH_AUTO_SETTLE") or 8.0)
 #: 用哪个虚拟手柄(0/1)。与 `join_player` 的默认值一致。
 AUTO_PAD = int(os.environ.get("NEKO_WATCH_AUTO_PAD") or 1)
 #: **换序列**(不用改代码): `NEKO_WATCH_AUTO_SEQ=screen=join,RB,A;lobby=A,A`。
@@ -646,11 +655,12 @@ def main() -> int:
                 stop_engine=stop_engine, join_lobby=join_lobby, log=log)
     if AUTO:
         from auto_level import AutoLevel as _AutoLevel
-        w.auto = _AutoLevel(seq=AUTO_SEQ, tries=AUTO_TRIES, gap=AUTO_GAP, log=log)
+        w.auto = _AutoLevel(seq=AUTO_SEQ, tries=AUTO_TRIES, gap=AUTO_GAP,
+                            settle=AUTO_SETTLE, log=log)
         w.auto_do = do_auto
         log(f"[看护] **全自动进关已开** —— 主界面加入 → 切 Party → 大厅选主题 → 进图")
-        log(f"[看护]   序列 = {AUTO_SEQ or '(默认)'}  "
-            f"每步间隔 {AUTO_GAP:.1f}s, 每阶段最多重来 {AUTO_TRIES} 遍")
+        log(f"[看护]   序列 = {AUTO_SEQ or '(默认)'}  每步 {AUTO_GAP:.1f}s, "
+            f"走完一遍等 {AUTO_SETTLE:.0f}s, 每阶段最多重来 {AUTO_TRIES} 遍")
         log(f"[看护]   ⚠ 阶段判据只有 scene/inRound(读不到'选中哪个标签页'), "
             f"所以是盲发按键 —— 卡住就看 `[进关] ▶ …` 那几行对着改 "
             f"`NEKO_WATCH_AUTO_SEQ`")

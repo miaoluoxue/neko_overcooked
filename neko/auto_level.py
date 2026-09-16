@@ -61,17 +61,21 @@ SCENE_LOBBY = "Lobbies"
 #: **默认序列** —— `{阶段: [动作, …]}`。动作见 `do` 的约定(`join` / `pad:X` / `kbd:X` / `wait`)。
 #:
 #: ☠ **这是按逆向文档推的, 实机第一次跑很可能要微调** —— 改 `NEKO_WATCH_AUTO_SEQ` 即可:
-#:     `NEKO_WATCH_AUTO_SEQ=screen=join,RB,A;lobby=A,A`
+#:     `NEKO_WATCH_AUTO_SEQ=screen=join,DR,A;lobby=A,A`
 #: 依据:
 #:   · 主界面(StartScreen): 先补 P2(`join` —— A 是"加入下一个玩家"), 再切到 Coop/Party
-#:     标签(`RB` 肩键, OC2 前端的标签惯例), 再确认(`A`);
+#:     标签, 再确认(`A`)。
+#:     ☠☠ **切标签用 `DR`(方向键右), 不是 `RB`** —— 2026-09-17 实机: 用户报"**按 RB 没用**"。
+#:       依据 `PlayerInputLookup.cs:612-616`: 前端的移动输入是
+#:       `MovementX = AmbiPadValue.StickX + DPadX` —— **只有摇杆和十字键, 没有肩键**。
+#:       肩键是主机手柄的习惯, PC 的合并键盘映射里根本没有它。
 #:   · 大厅(Lobbies): `UISelectNotStart` 的**键盘分支硬编码含 `Space`**
 #:     (`PlayerInputLookup.cs:482-489`), 而手柄上是确认键 ⇒ 用 `A` 一脉相承。
 #:     单人合作时 `AllUsersSelected()` 直接为真(`ServerLobbyFlowController.cs:641-667`)
 #:     ⇒ **一次确认就该进图**; 第二个 `A` 是给**加载界面的厨师选择**那一屏准备的
 #:     (`LobbyUIController.cs:257-271` 的"开始"也是同一个键)。
 DEFAULT_SEQ = {
-    STAGE_SCREEN: ["join", "pad:RB", "pad:A"],
+    STAGE_SCREEN: ["join", "pad:DR", "pad:A"],
     STAGE_LOBBY: ["pad:A", "pad:A"],
 }
 
@@ -128,21 +132,37 @@ def parse_seq(spec: str):
 class AutoLevel:
     """进关状态机。**I/O 全部注入** —— `do(动作)` 由调用方实现, 本类只决定"该做什么"。"""
 
-    def __init__(self, seq=None, tries: int = 3, gap: float = 1.5, log=print):
+    def __init__(self, seq=None, tries: int = 3, gap: float = 1.5,
+                 settle: float = 8.0, log=print):
         self.seq = dict(seq or DEFAULT_SEQ)
         self.tries = max(1, int(tries))
         self.gap = float(gap)
+        #: ☠☠ **走完一遍序列之后, 先等这么久再看"阶段变没变"**(秒)。
+        #:
+        #: 为什么必须有(2026-09-17 实机打回来的): 原来走完一遍就立刻判"没变"⇒重来,
+        #: 而**中间步骤本来就不改变 `scene`**(切标签只是移动光标), 而且按完之后
+        #: **游戏要好几秒才加载完**。实测日志:
+        #:     `[进关] ⚠ screen 阶段按了 3 遍还是没动 —— 停手`
+        #:     `[进关] 阶段 → lobby(scene='Lobbies' …)`      ← **紧接着就变了**
+        #: ⇒ 那 3 遍里同一个 `A` 被按了 3 次, 而它其实第 1 次就成了。
+        #: ⚠ 这个值和看护的轮询间隔(`NEKO_WATCH_INTERVAL`, 默认 2.5s)是**两回事**:
+        #:   那个决定"多久看一眼状态", 这个决定"按完之后给游戏多少时间反应"。
+        self.settle = float(settle)
         self.log = log
         self._stage = ""
         self._i = 0
         self._round = 0
         self._at = 0.0
+        self._settle_until = 0.0
+        self._waited_logged = False
         self._warned = False
 
     # ---- 内部 ----
     def _enter(self, s: str) -> None:
         self._stage, self._i, self._round, self._warned = s, 0, 0, False
         self._at = 0.0                      # 立刻做第一步, 不等
+        self._settle_until = 0.0
+        self._waited_logged = False
 
     # ---- 主入口 ----
     def tick(self, st: dict, do, now: float = None) -> None:
@@ -181,7 +201,16 @@ class AutoLevel:
             return
 
         if self._i >= len(steps):
-            # 整条序列走完了、而阶段**没变** ⇒ 这一遍没奏效。
+            # ☠☠ **走完一遍 ⇒ 先等 `settle` 秒再看**(实机打回来的, 见 `settle` 的注释)。
+            #   中间步骤不改变 `scene`, 而且按完之后游戏要加载 —— 立刻判"没变"就重来,
+            #   会把同一个键**连按好几遍**。
+            if now < self._settle_until:
+                if not self._waited_logged:
+                    self._waited_logged = True
+                    self.log(f"[进关] ⏳ {s} 这一遍按完了 —— **等 {self.settle:.0f} 秒**"
+                             f"看阶段变不变(加载要时间, 立刻重来会连按同一个键)")
+                return
+            # settle 过了、阶段还没变 ⇒ 这一遍没奏效。
             if self._round + 1 >= self.tries:
                 if not self._warned:
                     self._warned = True
@@ -191,11 +220,16 @@ class AutoLevel:
                 return
             self._round += 1
             self._i = 0
+            self._settle_until = 0.0
+            self._waited_logged = False
             self.log(f"[进关] ↻ {s} 阶段**没变化** —— 重来第 {self._round + 1}/{self.tries} 遍")
 
         a = steps[self._i]
         self._i += 1
         self._at = now + self.gap
+        if self._i >= len(steps):
+            # 刚做完**最后一步** ⇒ 进入等待期(下一次 tick 起算, 这里先记个底)
+            self._settle_until = self._at + self.settle
         self.log(f"[进关] ▶ {s}: {a}   (第 {self._i}/{len(steps)} 步)")
         try:
             do(a)
