@@ -9852,8 +9852,11 @@ class Engine:
         try:
             import planner
             world, check = self._plan_ctx(_fs, km, st)
+            # ☠ `_notes` = 规划器的**剪枝理由**出口(见 `planner.plan` 的 `notes_out`)。
+            #   只有"推不出解"那一支会打它 —— 成功时不打(免得每 6 秒刷一屏)。
+            _notes: list = []
             with self._plan_view():
-                p = planner.plan(_fs, world, check, log=None)
+                p = planner.plan(_fs, world, check, log=None, notes_out=_notes)
         except Exception as e:                                     # noqa: BLE001
             self.log(f"[规划] ⚠ 算崩了(不影响主流程): {e!r}")
             self._plan = None
@@ -9890,6 +9893,18 @@ class Engine:
         if p is None:
             self.log(f"[规划] {_head}: **推不出解** —— "
                      f"当前世界里没有一条能走通的链路")
+            # ☠☠ **把"每条支为什么被剪"打出来**(2026-09-17)。
+            #   这些理由一直都在(`ctx.notes`), 只是**随函数返回被 GC 扔掉** ——
+            #   于是 `推不出解` 是一句**不可诊断**的话。而 `planner._ok` 又把
+            #   "检查器抛的任何异常"一律变成"这条支不可能"(`planner.py:292`)
+            #   ⇒ **一次崩溃和"真的不可能"在日志上长得一模一样**。没有这一节,
+            #   下一个人只能靠猜。
+            #   ⚠ 上限 24 条: 一池三张单时理由能上百行, 打满是刷屏; 头几条就够定性
+            #     (通常**全被同一个原因剪掉**, 那正是要找的那个)。
+            for _l in _notes[:24]:
+                self.log(f"[规划]   ⛔ {_l}")
+            if len(_notes) > 24:
+                self.log(f"[规划]   … 另有 {len(_notes) - 24} 条剪枝理由未列出")
             return
         # 日志形状: **一行看全 + 我这个厨师"下一步应为"单列一行**。
         #   为什么要单列 `下一步应为` —— 紧挨着的下一行就是 `[引擎] ▶ 第N步 …`(评分层

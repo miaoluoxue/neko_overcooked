@@ -515,7 +515,7 @@ def _slot_of(flow) -> str:
     return str(getattr(flow, "slot", "") or "") or str(getattr(flow, "name", "") or "")
 
 
-def _plan_one(flow, world: WorldView, check, log=None) -> Plan | None:
+def _plan_one(flow, world: WorldView, check, log=None, notes_out=None) -> Plan | None:
     """把**一条** `DishFlow` 推成**一份带分工与依赖的计划**; 推不出来返回 `None`。
 
     ☠ **推不出来 ≠ 不做这一单**。调用方的处置是**退回现有的贪心路径**(那才是"绝不停机"),
@@ -525,6 +525,13 @@ def _plan_one(flow, world: WorldView, check, log=None) -> Plan | None:
       跨单那条走 `plan()`, 它只是把本函数的结果拼起来。48 个离线探针钉的就是这里。
     """
     ctx = _Ctx(world=world, check=check, log=log)
+    # ☠ **把 `ctx.notes` 接到调用方给的列表上**(2026-09-17) —— 见 `plan()` 的 `notes_out`。
+    #   一行的代价, 换来的是: 整个递归里那十几处 `ctx.notes.append(...)`
+    #   **一处都不用改**, 而且**每一条 return 路径**(包括"推不出解"那些 `return None`)
+    #   都自动带上理由 —— 不用逐处 `extend`(那才是会漏的写法)。
+    #   `notes_out is None`(默认)⇒ 逐字老行为, 48 个离线探针一个都不受影响。
+    if notes_out is not None:
+        ctx.notes = notes_out
     steps: list = []
     assumptions: list = []
     _slot = _slot_of(flow)
@@ -648,8 +655,16 @@ def _plan_one(flow, world: WorldView, check, log=None) -> Plan | None:
                 cost=sum(s.cost for s in steps), notes=list(ctx.notes))
 
 
-def plan(flows, world: WorldView, check, log=None) -> Plan | None:
+def plan(flows, world: WorldView, check, log=None, notes_out=None) -> Plan | None:
     """**把一张单、或者一池单**推成一份带分工与依赖的计划; 推不出来返回 `None`。
+
+    ⚠ **`notes_out`(可选)**: 给一个 list, 本函数会把**每一条剪枝理由**写进去
+      (`P{chef+1} 取不到 {item}({s.ref}): {why}` / `check 抛异常(…)` / `环:` / `深度到顶` …),
+      **成功失败都写**。默认 `None` ⇒ 逐字老行为。
+      ☠☠ **为什么必须有这个出口**(2026-09-17): 以前这些理由**只活在 `ctx.notes` 里,
+      随函数返回被 GC 扔掉** —— 于是 `[规划] … 推不出解` 是一句**不可诊断**的话,
+      而 `_ok` 又把"检查器抛的任何异常"一律变成"这条支不可能"(`planner.py:292`)
+      ⇒ **一次崩溃和"真的不可能"在日志上长得一模一样**。要分清两者, 只有把理由带出来。
 
     两种入参(**用户 2026-09-17 选的形状: "只覆盖到池、不在规划期排人"**):
       · **单个 flow** ⇒ 逐字走 `_plan_one`(老路径, 一行行为都不变);
@@ -678,12 +693,13 @@ def plan(flows, world: WorldView, check, log=None) -> Plan | None:
       全都不推不出 ⇒ 返回 `None`, 调用方照旧退回贪心(那是"绝不停机")。
     """
     if not isinstance(flows, (list, tuple)):
-        return _plan_one(flows, world, check, log=log)
+        return _plan_one(flows, world, check, log=log, notes_out=notes_out)
     _fs = [f for f in flows if f is not None]
     if not _fs:
         return None
     if len(_fs) == 1:
-        return _plan_one(_fs[0], world, check, log=log)      # ⚠ 老路径, 别在这儿加东西
+        return _plan_one(_fs[0], world, check, log=log,
+                         notes_out=notes_out)   # ⚠ 老路径, 别在这儿加东西
 
     steps: list = []
     assumptions: list = []
@@ -692,7 +708,7 @@ def plan(flows, world: WorldView, check, log=None) -> Plan | None:
     dropped: list = []
     for f in _fs:
         _nm = str(getattr(f, "name", "") or "") or "?"
-        sub = _plan_one(f, world, check, log=log)
+        sub = _plan_one(f, world, check, log=log, notes_out=notes)
         if sub is None:
             # ⚠ **不 `return None`** —— 见上面那条 ☠。它只是不进这份合并计划。
             dropped.append(_nm)
@@ -708,6 +724,11 @@ def plan(flows, world: WorldView, check, log=None) -> Plan | None:
         notes.extend(sub.notes or [])
         names.append(_nm)
     if not steps:
+        # ☠ 一条都推不出 ⇒ **把理由带回调用方** —— 这一句是"推不出解"可诊断的出口。
+        #   ⚠ 上面各条 `_plan_one(...)` 是**直接写进 `notes`** 的(同一个 list),
+        #     所以只在 `notes_out` 是**另一个** list 时才需要搬一次(否则会重复)。
+        if notes_out is not None and notes_out is not notes:
+            notes_out.extend(notes)
         return None                          # 一条都推不出 ⇒ 与单张单同一个处置
     if dropped:
         _msg = (f"⚠ {' / '.join(dropped)} 推不出解 —— **不进这份合并计划**"
