@@ -10189,6 +10189,19 @@ class Engine:
             return f"② 有单({names})但订单池构建失败: {e!r}"
         if not pool:
             return f"② 有单({names})但推不出菜谱(订单池是空的)"
+        # ---- ③★ **最先问的一句: 我出得去吗** ----
+        # ☠☠ 2026-09-17 实机 `s_summer_1_1`: P2 那一局 `我的可达格 0/103` —— **一个格都
+        #   到不了**, 整局一步没动(`静止` 一路涨到 25.8s), 而这里原来只报
+        #   "**分工把池子占满了**"(那时 `1/24` 步被队友占着) ⇒ **把人直接带偏**。
+        #   一个格都到不了时, "谁占着哪一步"**根本不重要**。
+        # ⚠ 判据用**能走到几个格**(`distances_from` 的长度), 与评分那行 `我的可达格 N/M` 同源。
+        #   判不了(取不到地图/地形)⇒ 回 `None` ⇒ **跳过这一支, 照旧往下走老逻辑**(不误报)。
+        _rn = self._reach_count()
+        if _rn is not None and _rn[0] <= 1:
+            return (f"③★ **我被困住了**: 我的可达格只有 **{_rn[0]}/{_rn[1]}**"
+                    f" —— **一步都走不出去**, 与分工/占位**无关**"
+                    f"(地图把我围死了, 或起点落在不可走区; "
+                    f"该由队友/人类把料送过来, 或者先想办法挪出去)")
         # ---- ③ ----
         parts, taken, total = [], 0, 0
         for slot, name, _t, flow in pool[:COOP_ORDERS]:
@@ -10215,6 +10228,32 @@ class Engine:
                      f"(料够不着/没设备/走不到), 不是分工的问题")
         return (f"③ 有单({names})、菜谱也推得出, 但**一步都做不了** —— "
                 + " | ".join(parts) + _tail)
+
+    def _reach_count(self):
+        """**我现在到得了几个格**(可达格数, 全部可走格数) —— 判不了返回 `None`。
+
+        用途只有一个: `_no_order_why` 里"**我是不是被困住了**"那一问(见那里的 ☠☠)。
+        实测 `s_summer_1_1`: P2 是 `0/103` —— 一个格都到不了, 而旧诊断把它报成
+        "分工把池子占满了" ⇒ 把人带偏。
+
+        ⚠ 判据与评分那行 `我的可达格 N/M` **同源**(都是 `distances_from` + `walkable`),
+          不另算一套几何。`None` = 判不了(没地图/地形没起来/不知道自己在哪) ⇒ 调用方跳过。
+        """
+        try:
+            st = self.state()
+            km = self.map(st) if st else None
+            tm = self.terrain()
+            cx, cz, _ = self.pos(st) if st else (None, None, "")
+            if (not st or km is None or tm is None or not getattr(tm, "ok", False)
+                    or cx is None):
+                return None
+            reach = tm.distances_from(cx, cz, at_y=self.chef_y(st),
+                                      extra_edges=self._travel_edges(km, tm))
+            total = sum(1 for i in range(tm.w) for j in range(tm.h)
+                        if tm.walkable(i, j))
+            return (len(reach), total)
+        except Exception:                                         # noqa: BLE001
+            return None
 
     def _idle_chore(self, km, st) -> bool:
         """**一张单都领不到时, 去干一件杂活** —— 救锅最优先。
