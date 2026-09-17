@@ -6358,6 +6358,19 @@ class Engine:
         """
         if not target:
             return False
+        # ☠☠ **先现读一次状态**(2026-09-17, 实机 `s_wonderland_1_2`)。
+        #   传进来的 `st`/`km` 是**这一步开始时**的, 而 `op_fetch` 在中间已经
+        #   **走过去把料拿起来了**(`_approach` 一走就是几秒、好几格) ——
+        #   于是下面 `self.pos(st)` 量出来的是**这一步开始时**的距离, 不是**现在**的。
+        #   代价(实机): 真实 1.49 格 —— 本该走"就在旁边, 抱着走更省事"那条 `return`
+        #   —— 旧坐标算成 23.0 格 ⇒ **白丢一份 Orange 落到 6 格开外**;
+        #   而且 `before` 也拿旧图取 ⇒ 落点差集会把**早就躺在那儿的**料当新落点记进预置表。
+        #   ⚠ 日志里那句"实测射程 26.7 格"是**同一个原因**(`flew` 同样从旧坐标量):
+        #     **投掷本身是对的** —— 从真实位置朝意图点丢约 6 格, 落点正是记下的那个。
+        #     所以别去查"游戏是不是把料丢飞了", 先看这里的 `st` 新不新。
+        #   `force=True`: 要的是"走到之后"的世界, 共享缓存那帧 TTL 内的不算数。
+        st = self.state(force=True) or st
+        km = self.map(st) or km
         nxt = None
         for o in (getattr(flow, "ops", None) or []):
             if getattr(o, "target", "") == target and o.action in ("cook", "chop", "mix"):
