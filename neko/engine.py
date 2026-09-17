@@ -4868,6 +4868,25 @@ class Engine:
             if not self._get_plate_for_pot(km, x, z, plate_type, taking=op.target):
                 self.log("[步骤] ⚠ 没有盘子可取菜 —— 停在这里, 锅不动")
                 return False
+            # ★★ **拿到盘子就回锅边等**(用户 2026-09-18: "**等锅的时候拿着满足条件的
+            #    盘子去锅旁边等**")。
+            #    ☠ 为什么要专门走这一趟: 盘子来源可能在厨房另一头, 而**熟了之后**那趟
+            #      回程是 `_take_from_pot` 里才走的 ⇒ 那段路整个花在**焦窗**上
+            #      (`_cook` 的等待上限就是 `2*need + 6`) —— 走到锅边时菜可能已经过了线。
+            #      ⇒ 把这段路提前到"**还在煮**"的时候走掉: 等待期间人就在锅边,
+            #        熟了抬手就取。
+            #    ⚠ **走不回去不算这一步失败**: 锅还在煮, `_take_from_pot` 自己会再导航一次
+            #      (它那三次重试就是"走过去 + 对准 + 按") —— 这里只是**提前把路走掉**,
+            #      所以只记日志, 不 return。
+            _st_h = self.state(force=True)
+            _km_h = self.map(_st_h) if _st_h else None
+            if _km_h is not None:
+                if self.navigate_smart(_km_h, stove.x, stove.z, tight=0.8):
+                    self.log(f"[步骤] 拿着盘子回锅边等 {op.target} 熟({stove.id}) —— "
+                             f"熟了抬手就取")
+                else:
+                    self.log(f"[步骤] ⚠ 拿着盘子走不回锅边({stove.id}) —— 先在这儿等, "
+                             f"取菜那一步会再导航一次")
 
         # 4) 盯着进度: 直到状态变 Cooked(刚熟) 立刻取下; 着了火就失败
         t0 = time.time()
