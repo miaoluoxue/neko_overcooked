@@ -41,6 +41,33 @@ from collections import deque
 CH_FREE = "."
 CH_PLATFORM = "P"
 CH_TRAVELATOR = "T"
+
+
+class EdgeRules:
+    """给寻路/泛洪的**额外边规则** —— 一个通道表达两件事: **加边** / **禁边**。
+
+    ☠ 为什么合成一个参数而不是再加一个平行参数: `extra_edges` 已经传遍全仓 9 个调用点,
+      再加一个平行的"禁边表"= 迟早有一处漏传 —— 而漏传的后果是**工具静默地什么都没做**
+      (本仓栽过: 漏传传送门边, 可达少算 15 格, 而日志里一个字都没有)。
+      传 `dict` 或 `None` ⇒ **老行为逐字不变**(只有额外边); 传本对象 ⇒ 多认一份 `no`。
+
+    `extra` —— `{格: [格, ...]}`, "到了这一格也就到了那些格"(传送门 / 顺流整段)。
+    `no`    —— `{(frm, to), ...}`, **禁掉的边**(如"顶着强传送带逆流")。
+               ⚠ 是**有向**的: 只禁这一个方向, 反方向照旧。
+    """
+
+    __slots__ = ("extra", "no")
+
+    def __init__(self, extra=None, no=None):
+        self.extra = extra or {}
+        self.no = no or set()
+
+
+def _rules(ex) -> tuple:
+    """把 `extra_edges` 参数归一化成 `(extra, no)` —— 两种写法都吃。"""
+    if isinstance(ex, EdgeRules):
+        return ex.extra, ex.no
+    return (ex or {}), ()
 # 绝对不能踏进去的格子
 CH_BLOCKED = "#"      # 占用物
 CH_FIRE = "F"         # 火焰
@@ -686,6 +713,7 @@ class TerrainMap:
         start = self.cell_of(sx, sz)
         goal_cell = self.cell_of(tx, tz)
         blk = blocked or ()
+        _ex, _no = _rules(extra_edges)
 
         reach = None
         if use_reach:
@@ -747,7 +775,8 @@ class TerrainMap:
             dirs = ((1, 0), (-1, 0), (0, 1), (0, -1))
             if diagonal:
                 dirs = dirs + ((1, 1), (1, -1), (-1, 1), (-1, -1))
-            _ee = (extra_edges or {}).get(cur, ())
+            _ee = [t for t in _ex.get(cur, ())
+                   if not (_no and (cur, t) in _no)]     # 禁边: 这一步不许走
             nbs = []
             for dx, dz in dirs:
                 diag = (dx != 0 and dz != 0)
@@ -764,6 +793,8 @@ class TerrainMap:
             # 额外边(传送门 + 地面传送带): 从这一格可以直接"到"对端那一格。
             nbs += [(t, 1.0) for t in _ee]
             for nb, cost in nbs:
+                if _no and (cur, nb) in _no:
+                    continue                # ☠ 禁边(如逆着强传送带) —— 别给一条走不通的路
                 if not ok(nb, cur) and nb not in _ee:
                     continue
                 ng = gc + cost
@@ -885,7 +916,7 @@ class TerrainMap:
         start = self.cell_of(x, z)
         if not self.inside(*start):
             return {}
-        ex = extra_edges or {}
+        ex, _no = _rules(extra_edges)
         dist = {start: 0}
         queue = deque([start])
         while queue:
@@ -895,6 +926,8 @@ class TerrainMap:
             # 传送门不是"走过去", 是"在这一点被送到别处", 所以只能是额外的边,
             # 不能靠高度/邻接表达。
             for t in ex.get((i, j), ()):
+                if _no and ((i, j), t) in _no:
+                    continue                # 禁边: 这一步不许走(有向)
                 if t not in dist:
                     dist[t] = d + 1
                     queue.append(t)
@@ -902,6 +935,8 @@ class TerrainMap:
                 nb = (i + di, j + dj)
                 if nb in dist:
                     continue
+                if _no and ((i, j), nb) in _no:
+                    continue                # ☠ 禁边: 逆着强传送带的那一步不算"到得了"
                 if not self.walkable(nb[0], nb[1], allow_platform, allow_travelator):
                     continue
                 # **高度按"边"判**: 从当前格迈到它这一步的落差 ≤ 厨师的步长。

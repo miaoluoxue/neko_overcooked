@@ -929,7 +929,7 @@ def conveyor_arrows(tm, dyn) -> dict:
     return out
 
 
-def conveyor_edges(tm, dyn) -> dict:
+def conveyor_edges(tm, dyn, long_ride: bool = True) -> dict:
     """**地面传送带把你往哪送** —— `{格: [落点格]}`, 喂给泛洪/A* 的 `extra_edges`。
 
     和传送门边同一套机制(都是"到了这一格, 就也能到那一格"), 但**语义不一样**:
@@ -953,25 +953,107 @@ def conveyor_edges(tm, dyn) -> dict:
     out = {}
     if tm is None or not getattr(tm, "ok", False):
         return out
-    for c in (dyn or {}).get("conveyors") or []:
-        if c.get("type") != "Travelator":
-            continue                      # 台面传送带推的是物品, 不推人
-        sx = float(c.get("stepx") or 0)
-        sz = float(c.get("stepz") or 0)
-        if abs(sx) < 0.05 and abs(sz) < 0.05:
-            continue                      # 停着的带子不推人
-        k = (1 if sx > 0 else -1, 0) if abs(sx) >= abs(sz) \
-            else (0, 1 if sz > 0 else -1)
-        src = tm.cell_of(float(c.get("x") or 0), float(c.get("z") or 0))
-        if not tm.inside(*src):
-            continue
-        dst = (src[0] + k[0], src[1] + k[1])
-        if not tm.inside(*dst) or not tm.walkable(*dst):
-            continue                      # 尽头不能站 → 不给边(那是"会死", 不是"能去")
-        lst = out.setdefault(src, [])
-        if dst not in lst:
-            lst.append(dst)
+    bv = belt_vel(tm, dyn)
+    for src, v in bv.items():
+        vx, vz = v
+        k = (1 if vx > 0 else -1, 0) if abs(vx) >= abs(vz)             else (0, 1 if vz > 0 else -1)
+        # ☠☠ **"一段"= 连着几格同向同速的带子, 不是"沿这个轴一路铺过去"**。
+        #   一格一个预制件(`Travelator.Start` 用 `StaticGridLocation.m_gridIndex`,
+        #   一个 Travelator 占一格), 所以一条长带子在 `dyn.conveyors` 里是**好几条记录**
+        #   —— 判据必须是"下一格也是带子, **而且速度一模一样**"。
+        #   ⚠ 第一版没查这个, 于是边会**沿着轴铺过普通地板** —— 那是把距离表压扁
+        #     (一行格子全变成 1 步), 而带子根本没到那儿。
+        # ☠ ① **带子一定把站在它上面的人推出这一格** —— 哪怕下一格不是带子
+        #   (那是"出口", 人照样被送出去一格)。
+        # ☠ ② 之后**只有当下一格还是同一条带子**(同向**同速**, 见上面那条注释)时才接着给,
+        #   一直给到整段的尽头 —— 于是"进口那格 → 整段的任意一格"都是**一步**:
+        #   这就是"**顺着传送带方向移动不花代价**(带子替你走)"。
+        #   ⚠ 尽头不能站(水/空洞/障碍)就**停在那里** —— 那是"会死", 不是"能去"。
+        #   ⚠ 逐格地给也"对"(泛洪照样连通), 但**代价不一样**: A* 是等权最短路,
+        #     逐格的边和走路同价 ⇒ 规划器没有任何理由去"顺流", 也就没有"免费传送"。
+        cur = src
+        lst = []
+        while True:
+            nxt = (cur[0] + k[0], cur[1] + k[1])
+            if not tm.inside(*nxt) or not tm.walkable(*nxt):
+                break
+            if nxt not in lst:
+                lst.append(nxt)
+            if not long_ride:
+                break                       # ☠ 老行为(`NEKO_BELT=0`): 只把**自己那一格**
+                #   的人送出去, 不替整条带子给捷径
+            if bv.get(nxt) != v:
+                break                       # 不是同一条带子 ⇒ 送完这一步就停
+            if nxt in out and src in out[nxt]:      # 带子绕回来 ⇒ 收手, 别无限走
+                break
+            cur = nxt
+        if lst:
+            out[src] = lst
     return out
+
+
+def _travelator_vel(c: dict):
+    """一条 `dyn.conveyors` 记录 → **它推人的世界速度 `(vx, vz)`**; 不推人的 ⇒ `None`。
+
+    ☠☠ **全仓唯一一份解析** —— `conveyor_edges`(连通边)与 `belt_vel`(逐格速度)都吃它。
+      两份实现迟早会漂, 而方向符号一漂就是"补偿朝反方向"这种最难查的病。
+
+    依据(反编译, 规则 1):
+      · `Travelator.cs:11-18`   `m_speed`(public, 世界单位/秒) / `m_directionXZ`(private)
+      · `Travelator.cs:167-175` `GetTravelDirection()`:
+            `Leftwards => transform.right`, `Rightwards => -transform.right`
+      · `Travelator.cs:134`     `GetSurfaceVelocity() = m_speed × 方向`
+      · 插件 `InteractiveScan.ConveyorExtra` 已经把 `speed`(u/s) 与 `stepx/stepz`
+        (轴向单位步长)报出来了 ⇒ 这里只剩"归一化到网格轴"这一件事。
+    ⚠ `ConveyorStation`(台面传送带)**推的是物品**, 不推人 ⇒ `None`, 别混。
+    """
+    if (c or {}).get("type") != "Travelator":
+        return None
+    if not c.get("on", True):
+        return None                       # 关掉的带子不推人
+    sp = float(c.get("speed") or 0.0)
+    if sp <= 0.0:
+        return None                       # 停着的带子不推人
+    sx = float(c.get("stepx") or 0)
+    sz = float(c.get("stepz") or 0)
+    if abs(sx) < 0.05 and abs(sz) < 0.05:
+        return None
+    if abs(sx) >= abs(sz):
+        return (sp if sx > 0 else -sp, 0.0)
+    return (0.0, sp if sz > 0 else -sp)
+
+
+def belt_vel(tm, dyn) -> dict:
+    """**地面传送带把站在这一格的人往哪推**: `{(i,j): (vx, vz)}`(世界单位/秒)。
+
+    与 `wind_cells` **同一个形状、同一个用途**(都是"站在这里会被推"), 所以移动层的
+    补偿可以直接把两者**相加** —— 依据是它们走**同一条位移通道**:
+      · `Travelator.cs:134` `GetSurfaceVelocity() = m_speed × 方向`
+      · `SurfaceMovable.cs:42`  `Update()` **无条件每帧**算, 与有没有输入无关
+      · `RigidbodyMotion.cs:43` `Movement(v,dt)` → `MovePosition(pos + v·dt)`
+      · 风走的同一条路(`ClientPlayerControlsImpl_Default.cs:902-906`) —— 见 `wind_cells`
+
+    **为什么带速用几何投影、风却优先问游戏**(不是双标):
+      · 风要"多股求和 + 层掩码过滤 + 体积形状", 几何推不出来 ⇒ 必须问游戏;
+      · 带子是**一格一个预制件上的常数**(`m_speed`), 没有求和、没有掩码 ⇒ 投影即精确值;
+        而且插件**没有**报"脚下带速"这个字段(只有 `wind`)。
+      ⚠ 已知近似: `Travelator.CalculateVelocityAtPoint` 在**贴近边界**时会改用旁边那条
+        带子的速度(`CalculateForBorders`, 换带时过渡平滑用)。我们按"站的那一格"算,
+        差别是边界上几帧, 不影响路径形状。
+    """
+    out = {}
+    if tm is None or not getattr(tm, "ok", False):
+        return out
+    for c in (dyn or {}).get("conveyors") or []:
+        v = _travelator_vel(c)
+        if v is None:
+            continue
+        cell = tm.cell_of(float(c.get("x") or 0), float(c.get("z") or 0))
+        if not tm.inside(*cell):
+            continue
+        out[cell] = v
+    return out
+
 
 
 def wind_cells(tm, dyn) -> dict:

@@ -21,10 +21,10 @@ import time
 
 from bridge.keyboard_input import KeyboardPlayer, PLAYER1, PLAYER2, ensure_focus, game_focused, panic_pressed
 from map_model import (KitchenMap, Station, is_plate, is_pot, is_extinguisher,
-                       teleport_edges, conveyor_edges, wind_cells)
+                       teleport_edges, conveyor_edges, wind_cells, belt_vel)
 #: 地面传送带的字符。**从 terrain 导进来而不是抄一份** ——
 #: "判定和显示只能有一条规则", 抄一份迟早会漂(这一轮已经栽过好几次)。
-from terrain import CH_TRAVELATOR
+from terrain import CH_TRAVELATOR, EdgeRules
 
 #: 选站位时给**传送带格**加的距离惩罚 —— 只是排到所有非传送带格之后,
 #: 不是排除(旁边只有带子时还是得站上去)。取个远大于地图尺寸的数:
@@ -177,6 +177,13 @@ PREPOSE_TTL = float(os.environ.get("NEKO_PREPOSE_TTL") or 60.0)
 #: 冷板凳到期后它又会回到候选里(失败往往是暂时的: 东西被队友拿走了、路被 NPC 堵了)。
 #: ⚠ 和 `IDLE_WAIT` 的分工: 这个管"这一步做不成", 那个管"一件事都做不成"。
 STEP_COOLDOWN = float(os.environ.get("NEKO_STEP_COOLDOWN") or 20.0)
+
+#: **地面传送带那一族的开关**(`NEKO_BELT=0` 一键回退)。2026-09-18 加的, 一次管三件:
+#:   · **位置补偿** —— 站在带子上时把带速并进"外部速度"一起算(`navigate`)
+#:   · **逆流禁边** —— 带速 ≥ 厨师速度时, 逆着它那一步从图里剪掉(`_belt_blocked_edges`)
+#:   · **顺流整段边** —— 沿一条带子走算**一步**(带子替你走, `conveyor_edges(long_ride=)`)
+#: 关掉 = 逐字退回"带子只是能走的一格 + 站位躲着它"的老行为。
+BELT_ON = (os.environ.get("NEKO_BELT") or "1").strip().lower()     not in ("0", "off", "no", "false", "none")
 
 #: **"这一支刚试过、不行" 记多久**(秒)。`NEKO_BRANCH_TTL` 可调, `0` = 不记。
 #:
@@ -861,6 +868,22 @@ class Engine:
                         self._wind_fb_told = True
                         self.log("[风] ⚠ 插件没报 `wind` 字段(旧 DLL?) —— "
                                  "本局退回几何投影(体积→格), 补偿会偏保守")
+                # ☠☠ **地面传送带**: 它和风走**同一条位移通道**
+                #   (`RigidbodyMotion.Movement` → `MovePosition(pos + v·dt)`, 见 `belt_vel`),
+                #   所以这里**矢量相加**, 再一起喂下面的补偿 —— 补偿公式一行都不用改。
+                #   ⇒ 这就是"**位置补偿**": 净值 = `R·û' + W`, 解出来的摇杆方向让
+                #      **净值**朝目标, 带子把人顺着它自己的方向送的这一段**已经算进去了**。
+                _blt = self._belt_at(tm, x, z)
+                if _blt is not None:
+                    if _blt != getattr(self, "_belt_told", None):
+                        self._belt_told = _blt
+                        self.log(f"[带] 脚下是地面传送带 —— 被推 "
+                                 f"({_blt[0]:.2f},{_blt[1]:.2f}) u/s "
+                                 f"(厨师 {self.chef_speed(st):.1f}) —— 已并进补偿")
+                    wnd = _blt if wnd is None else (wnd[0] + _blt[0], wnd[1] + _blt[1])
+                else:
+                    self._belt_told = None
+
                 # 厨师此刻的**真实**控制增益 R(= RunSpeed × MovementScale), 不是 self.speed。
                 _R = self.chef_speed(st)
                 # 把风沿"目标方向"分解: `a` = 纵向分量(正 = 顺风), `b²` = 横向分量²。
@@ -880,7 +903,7 @@ class Engine:
                     #   ⚠ 只看**沿目标方向**的分量 —— 侧风只是让人走斜, 那不叫走不到。
                     if _R + _a <= 0.0:
                         self.kb.release_all()
-                        self.log(f"[风] ⚠ 逆风太强 —— 沿目标方向最大净速度只有 "
+                        self.log(f"[风/带] ⚠ 逆流太强(风或地面传送带)—— 沿目标方向最大净速度只有 "
                                  f"{_R + _a:.2f} u/s(厨师 {_R:.1f}, "
                                  f"风 ({wnd[0]:.2f},{wnd[1]:.2f})), 这个方向到不了, 放弃")
                         return False
@@ -1153,7 +1176,7 @@ class Engine:
                     if _R + _w_axis <= 0.0:
                         # 这根轴逆风顶不动 —— 换轴是上层的事, 这一步先认输(别把超时耗光)
                         self.kb.release_all()
-                        self.log(f"[风] ⚠ 按 {d} 这根轴逆风顶不动"
+                        self.log(f"[风/带] ⚠ 按 {d} 这根轴逆流顶不动(风或地面传送带)"
                                  f"(沿该轴最大净速度 {_R + _w_axis:.2f} u/s, 厨师 {_R:.1f}), "
                                  f"放弃这一步")
                         return False
@@ -3006,15 +3029,56 @@ class Engine:
             self.log(f"[边] 传送门边构造失败: {e}")
         try:
             dyn = self.bridge.get_dyn() or {}
-            for k, vs in conveyor_edges(tm, dyn).items():
+            for k, vs in conveyor_edges(tm, dyn, long_ride=BELT_ON).items():
                 lst = ed.setdefault(k, [])
                 for t in vs:
                     if t not in lst:
                         lst.append(t)
         except Exception as e:
             self.log(f"[边] 传送带边构造失败: {e}")
-        self._travel_cache = (tm, ed)
-        return ed
+        # ☠☠ **再给一份"禁边"**(2026-09-18, 用户点的"寻路边规则"): 逆着**强**传送带的
+        #   那一步直接剪掉 —— 见 `_belt_blocked_edges`。和 `extra` 合成一条通道,
+        #   免得再加一个平行参数(漏传一次就静默失效, 见 `terrain.EdgeRules` 的注释)。
+        rules = EdgeRules(ed, self._belt_blocked_edges(tm))
+        self._travel_cache = (tm, rules)
+        return rules
+
+    def _belt_blocked_edges(self, tm, r: float = None) -> set:
+        """**逆着强传送带走的那一步, 禁掉** —— 用户 2026-09-18 定的"寻路边规则"。
+
+        判据与移动层**同一份物理**(见 `wind_aim`): 净值 = `R·û' + W`, 想逆流 ⇒
+        `a = -|W|` ⇒ `R + a ≤ 0 ⟺ R ≤ |W|` ⇒ **任何**摇杆方向都推不出朝上游的净速度。
+        这种边交给规划器, 只会画出一条走不通的路, 然后执行层每轮超时/翻方向 ⇒ 白烧。
+
+        ⚠ **有向**: 只禁"带子格 → 它的上游邻格"; 从上游**踏进**带子那一步照旧允许
+          (能站上去, 只是接着会被推回来 —— 那叫"走不远", 不叫"不能去")。
+        ⚠ `r` 默认 `RUN_SPEED`(游戏标定的 4.0): 也就是说**默认带速 1 u/s 的关卡
+          一条边都不会被禁** —— 那是对的, 4 u/s 的厨师顶得动 1 u/s 的带子(反编译
+          `Travelator.cs:134` 默认 `m_speed=1`)。只有关卡把带速调到 ≥4 才会生效。
+        ⚠ 实时被压制到更慢(R<4)时这条规则**偏松** —— 那种情况由 `navigate` 里
+          用实时 R 算的 `R+a≤0` 闸门兜住; 两道闸门同源, 只是一个用标定值、一个用实时值。
+        """
+        no = set()
+        if not BELT_ON or tm is None or not getattr(tm, "ok", False):
+            return no
+        rr = float(RUN_SPEED if r is None else r)
+        try:
+            cells = belt_vel(tm, self._dyn())
+        except Exception as e:                                     # noqa: BLE001
+            self.log(f"[带] 取传送带失败: {e}")
+            return no
+        for (i, j), (vx, vz) in cells.items():
+            if abs(vx) >= abs(vz):
+                if abs(vx) < rr:
+                    continue
+                up = (i - (1 if vx > 0 else -1), j)          # 逆流方向
+            else:
+                if abs(vz) < rr:
+                    continue
+                up = (i, j - (1 if vz > 0 else -1))
+            if tm.inside(*up):
+                no.add(((i, j), up))
+        return no
 
     def _dyn(self, ttl: float = 1.0) -> dict:
         """机关表(`dyn`), 带短 TTL —— 一帧里好几个地方要用, 别各取各的。"""
@@ -3061,6 +3125,31 @@ class Engine:
         if not w:
             return None
         return w.get(tm.cell_of(x, z))
+
+    def _belt_at(self, tm, x: float, z: float):
+        """**脚底下那条地面传送带此刻推人的速度** —— `(vx, vz)`(世界单位/秒)或 None。
+
+        按格查(`belt_vel` 已经把每条带子投到它占的那一格上), 判据用**当前位置**、
+        每轮重取 —— 和 `_wind_at` 同一个形状(它俩进的是同一条位移通道)。
+
+        ⚠ 按 `(地形对象, dyn 对象)` 缓存: `_dyn()` 自带 1 秒 TTL 且返回**同一个对象**,
+          所以这张表最多每秒重算一次。带子的 `on`/速度会被机关改, 不能永久缓存。
+        """
+        if not BELT_ON or tm is None or not getattr(tm, "ok", False) or x is None:
+            return None
+        try:
+            dyn = self._dyn()
+        except Exception:                                          # noqa: BLE001
+            return None
+        c = getattr(self, "_belt_cells_cache", None)
+        if c is None or c[0] is not tm or c[1] is not dyn:
+            try:
+                c = (tm, dyn, belt_vel(tm, dyn))
+            except Exception as e:                                 # noqa: BLE001
+                self.log(f"[带] 取传送带失败: {e}")
+                return None
+            self._belt_cells_cache = c
+        return c[2].get(tm.cell_of(x, z))
 
     def _wind_of(self, st: dict) -> tuple:
         """**游戏自己报的**这个厨师此刻身上的风力 —— 返回 `((vx, vz) | None, 可不可信)`。
@@ -3628,7 +3717,10 @@ class Engine:
                 # **传送门那格要"挤进去"而不是"走到"** —— 它是障碍格,
                 # `navigate` 的"到目标附近"永远不成立(见 `navigate_teleport`)。
                 _cell = tm.cell_of(px, pz) if (tm is not None and tm.ok) else None
-                _exits = tedges.get(_cell) if _cell is not None else None
+                # ⚠ `tedges` 现在是 `EdgeRules`(额外边 + 禁边两条规则, 见 `_travel_edges`)
+                #   ⇒ 这里要的是"额外边"那一份; 直接 `.get` 会当场 AttributeError。
+                _exits = (tedges.extra.get(_cell)
+                          if (_cell is not None and tedges is not None) else None)
                 if _exits and not tm.walkable(*_cell):
                     if not self.navigate_teleport(px, pz, _exits):
                         self.log(f"[导航] 路径点 ({px:.1f},{pz:.1f}) 是传送门, 没能挤过去")
