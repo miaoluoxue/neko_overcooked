@@ -421,6 +421,12 @@ MATE_SYNC_TTL = float(os.environ.get("NEKO_MATE_TTL") or 3.0)
 #:   这一步还得有人做 —— 硬闸门会让两个人都站着(用户规则 5: 宁可重复也别站着)。
 #:   取 25.0 ≈ 走 12 格(`W_DIST` 是 2.0/格), 比"顺路"那一项重, 比"整步重做"轻。
 MATE_BUSY_PENALTY = float(os.environ.get("NEKO_MATE_PENALTY") or 25.0)
+#: 队友**在求助那一步**时, 给那个候选**加几分**("搭手", 见 `_mate_help`)。
+#: 求助的意思是"**我做不成这一步**"(`_mate_ask` 在连续失败上了冷板凳之后喊的),
+#: 而他做不成的那一步**本来就在我的 `pending` 里**, 只是被"让开"压着 ——
+#: 所以这里要把它**抬回来**。取和 `MATE_BUSY_PENALTY` 同样的 25.0(对称, 好推理)。
+#: `NEKO_MATE_HELP=0` ⇒ 逐字退回"看到 `ask` 也不理"的老行为(扣分照旧)。
+MATE_HELP_BONUS = float(os.environ.get("NEKO_MATE_HELP") or 25.0)
 
 
 class _GroundItem:
@@ -6889,12 +6895,68 @@ class Engine:
         else:
             self._mate_trace("ask", line)
 
+    def _same_step(self, said: str, op) -> bool:
+        """`said`(队友通报里的字符串)说的是**不是这一步**。
+
+        ☠ `_last_fail_step` **两条驱动写得不一样**(见那两处赋值):
+          评分那条路(`_execute_scored`)写 `"cook SushiRice"`,
+          顺序那条路写 `"3.cook SushiRice"`(**带步号**)。带步号的没法直接比,
+          所以在**这里**容忍掉 —— "完全相等"或者"`.` 后面正好接这一步"。
+        ⚠ **不能用裸 `endswith`** —— `"cook SushiRiceCooked"` 不是这一步,
+          要那个 `.` 分隔符挡住(`runtime/_matehelp_probe.py` 里钉了这一条)。
+        """
+        if op is None:
+            return False
+        want = f"{op.action} {op.target}"
+        s = (said or "").strip()
+        return s == want or s.endswith("." + want)
+
+    def _mate_asking(self, m: dict, op) -> bool:
+        """队友**正在为这一步**求助吗(`ask` 非空, 且说的就是这一步)。"""
+        return bool(m.get("ask")) and self._same_step(str(m["ask"]), op)
+
+    def _mate_help(self, op) -> float:
+        """队友**在求助这一步** ⇒ 加几分, 让他做不成的那一步有人做。
+
+        ☠ **为什么是加分, 不是给他让路**: 求助 = "我做不成这一步"(`_mate_ask`
+          是在连续失败、上了冷板凳之后喊的)。他做不成, 那一步**还得有人做** ——
+          而它本来就在我的 `pending` 里, 只是被"让开"压着。
+          (用户规则 5 的反面情形: **宁可重复也别站着** —— 而这里是"他已经明确
+           不做了", 连重复都算不上。)
+
+        ☠☠ **为什么不去复用 `pass`**(交接包 §5 说"要复用 `pass`" —— 查过了,
+          那半边**已经全覆盖**): `pass` 的语义是"**我**做不了这一环 ⇒ 把料丢给他做"。
+          而"他求助"只有三种现场:
+            · 台面**我够得着** ⇒ 自己做那一步 —— **就是这条**, 不用新造候选;
+            · 台面**我够不着** ⇒ `_pass_candidates` 条件②("我够不着**或**路太远")
+              **已经**提议 `pass`, 条件④ `_mate_can` 还替他验了"他走得到";
+            · 我够不着、料也没拿 ⇒ 那边会先让评分选 `fetch`, 下一步再 `pass`。
+          ⇒ 三种里两种已被覆盖; 再造一条 `pass` 候选只会和它重复, 而且会把
+            "我自己能做的事"**丢给他**。
+
+        ⚠ 和 `_mate_penalty` **同一扇门**(`NEKO_MATE_SYNC`)。
+        """
+        if not MATE_SYNC or not MATE_HELP_BONUS or op is None:
+            return 0.0
+        m = self._mate_doing()
+        if not m or not self._mate_asking(m, op):
+            return 0.0
+        # ★ 指纹 —— 与 `↓`/`⤵` 配对读: `↓` 说"我看到他求助了", 这一行说"我真去做了"。
+        self._mate_trace("help", f"[队友通报] ✚ 搭手 {op.action} {op.target}"
+                                 f"(队友在求助这一步, 他做不成) —— 加 {MATE_HELP_BONUS:.0f} 分")
+        return MATE_HELP_BONUS
+
     def _mate_penalty(self, op) -> float:
         """队友**正在做这一步** ⇒ 让开一点(返回要加到**原始分**上的负数, 或 0)。
 
         ☠ 判据是 **`动作 + 目标` 粗粒度**, **不是**步级占位 —— 那是另一条线, 本版没有。
         ☠ **扣分, 不是闸门**: 队友那条通报会过期、他其实也可能做不成 ——
           这一步还得有人做(用户规则 5: 宁可重复, 也别让人站着)。
+        ☠☠ **但他**在求助**这一步时不扣**(2026-09-17) —— `_mate_ask` 会**同时**
+          刷新 `op`, 所以"他刚喊完"的那一小段里 `op` 正是他喊的那一步;
+          只看 `op` 的话我这边会**扣分让开**: 他明说"我做不了", 我却绕开。
+          **方向是反的**。他喊完走开之后 `op` 会换掉, 那时这条匹配自然不成立,
+          搭手改由 `_mate_help` 认 `ask`(那才是它活了 5 秒的那一段)。
         """
         if not MATE_SYNC or op is None:
             return 0.0
@@ -6902,6 +6964,8 @@ class Engine:
         if not m or not m.get("op"):
             return 0.0
         if m["op"] != f"{op.action} {op.target}":
+            return 0.0
+        if self._mate_asking(m, op):
             return 0.0
         # ★ 指纹: **撞车**。这一行是"让开"真落到分上的唯一证据 ——
         #   与上面 `↓` 那一行配对看: `↓` 说"我读到队友在做 X"(通道通),
@@ -7579,6 +7643,14 @@ class Engine:
             _mb = self._mate_penalty(r["op"])
             if _mb:
                 raw[-1] += _mb
+            # **队友在求助这一步 ⇒ 搭手**(`NEKO_MATE_HELP`, 见 `_mate_help`)。
+            #   ☠ 同一形状、同一位置: 加在 `raw` 上, 不动 `scoring.py`。
+            #   ⚠ 排在 `_mate_penalty` **之后**: 他刚喊完时 `op` 还是那一步,
+            #     两个判据会同时成立 —— 顺序不影响结果(一个是 0, 一个是正),
+            #     但按"先扣后加"写, 读起来和日志里的 `⤵`/`✚` 顺序一致。
+            _mh = self._mate_help(r["op"])
+            if _mh:
+                raw[-1] += _mh
             sigs.append(f"{r['op'].action} {r['op'].target}")
 
         # 3) 队友的原始分: 只换位置相关的项 —— 步骤价对两个人都一样。
