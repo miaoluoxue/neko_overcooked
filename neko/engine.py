@@ -5238,8 +5238,8 @@ class Engine:
              `m_plateReturnStation.ReturnPlate()` ⇒ 出现在**干燥台**(PlateReturnStation)
 
         ⇒ 可观测的终点是"**干燥台上的盘子变多**" —— 洗手池自己看不到进度。
+        ☠ **③ 那一步必须走"使用键"**(不是拾取键、更不是裸 `key_down`) —— 见下面那一段。
         """
-        from bridge.keyboard_input import key_down, key_up
         _, _, held = self.pos(st)
         if held:
             self.log(f"[洗盘] 手上有 {held}, 先腾出手")
@@ -5300,25 +5300,46 @@ class Engine:
         if not self._approach(km, sk.x, sk.z, want=sk.name):
             self.log("[洗盘] 走不到洗手池")
             return False
-        self.interact("pickup", verify_hold_change=True)   # 放下盘子叠
-        # ③ **按住**交互键洗 —— 每 2 秒一个, 用"干燥台的盘子数"当进度条
-        key = self.kb.b.get("pickup")
-        if not key:
-            return False
+        self.interact("pickup", verify_hold_change=True)   # ① 放下盘子叠
+        # ③ **把"互动"顶起来** —— 洗手池是"**互动中才洗**", 用"干燥台的盘子数"当进度条。
+        #
+        # 依据(反编译, 规则 1): `ServerWashingStation.cs:87-110`
+        #     UpdateSynchronising():
+        #       if (!IsBeingInteractedWith() || m_plateCount <= 0) return;      // ← 两个前提
+        #       m_cleaningTimer += dt * …;
+        #       if (m_cleaningTimer > m_washingStation.m_cleanPlateTime) {      // 默认 2 秒一个
+        #           m_plateCount--; m_plateReturnStation.ReturnPlate(); }
+        #   `OnItemAdded` 放上盘叠 ⇒ 叠被销毁 + `AddPlates(size)` + `m_interactable.enabled = true`;
+        #   洗完最后一个 ⇒ `m_interactable.enabled = false`。
+        #   `SetStickyInteractionCallback(() => true)` ⇒ 互动**粘住**, 松键也不会断 ⇒
+        #   顶起来一次就够, 剩下的是等它自己一个个洗完。
+        #
+        # ☠☠ **为什么必须用"使用键"而不是"拾取键"**(2026-09-18 实机: "交到洗盘池还需要
+        #   交互一次"): "开始互动"在游戏里是**另一条消息**(`Interact`), 它由客户端
+        #   `Update_Interact`(`ClientPlayerControlsImpl_Default.cs:262-283`)发出;
+        #   而我们的 `pickup` 走的是**直调**(`ReceivePickUpEvent`, 见 `virtual_pad.tap`),
+        #   **绕开了那条链** ⇒ InteractorCount 一直是 0 ⇒ 洗手池认为**没人在交互** ⇒
+        #   一个都不洗, 而"放下盘叠"照样成功(那也是直调), 表现就是**用户看到的那个症状**。
+        #   插件侧的 `use` 动作一次把 `Interact` + `TriggerInteract` **两条都发**
+        #   (见 `virtual_pad.tap` 的注释) ⇒ 走它。
+        # ☠ **不再用裸 `key_down`**: 虚拟手柄那条路下, 裸键盘按键**到不了游戏**
+        #   (`tap` 会分派给 driver, 而 `key_down` 是全局键盘钩子) —— 那正是"按住也没用"的另一半。
+        #   ⇒ 改成**反复轻点使用键**, 和"放下盘叠"走**同一个已经验证过能用**的原语。
         t0 = time.time()
-        try:
-            key_down(key)
-            while time.time() - t0 < budget:
-                time.sleep(0.5)
-                km2 = self.map(self.state(force=True) or {}) or km
-                now = sum(int(getattr(d, "n", 0) or 0) for d in km2.of("return_plates"))
-                if now > before:
-                    self.log("[洗盘] ✓ 洗好 %d 个(干燥台上 %d → %d)"
-                             % (now - before, before, now))
-                    return True
-        finally:
-            key_up(key)
-        self.log("[洗盘] 按了 %.0fs, 干燥台没见新的干净盘子" % (time.time() - t0))
+        _tapped = 0
+        while time.time() - t0 < budget:
+            self.interact("chop", verify_hold_change=False)     # = 使用键(Interact + TriggerInteract)
+            _tapped += 1
+            time.sleep(0.4)
+            km2 = self.map(self.state(force=True) or {}) or km
+            now = sum(int(getattr(d, "n", 0) or 0) for d in km2.of("return_plates"))
+            if now > before:
+                self.log("[洗盘] ✓ 洗好 %d 个(干燥台上 %d → %d)"
+                         % (now - before, before, now))
+                return True
+        self.log("[洗盘] ⚠ 点了 %d 次使用键共 %.0fs, 干燥台**没见新的干净盘子** —— "
+                 "两种可能: ① 互动没被顶起来(洗手池没在洗) ② 这关洗好的盘子不去干燥台"
+                 % (_tapped, time.time() - t0))
         return False
 
     #: `op_assemble` 里"**干放**(台面没盘子)算不算这一步做成"。
