@@ -7,14 +7,17 @@
   · 每个厨师占一个灶台 —— 否则两人去抢同一个锅
   · 各自的**队友通报**("我在干嘛") —— 见 `publish_status`
 
-☠☠ **2026-09-18: 订单认领整个删掉了**(`claim_order`/`owner_of`/`release_order`/
-`orders_of` 与 `_orders` 表)。用户定的形状是"**回到最纯粹的按订单进行递归求解,
-一个厨师一单**" + "**两个厨师合作一单**": 两个人**刻意做同一张单**, 错开一步靠
-队友通报(`Engine._chain_pick`: "他在做这一步, 我就顺到链上的下一步")。
-认领是"一人一张单"那套**分工**的手段, 合作一单时它是纯负担 —— 而且它只在
-`Engine.plan()` 一处生效, 底下的候选池早就绕过它了。
-`key_of` **保留**: 它现在是 `Engine._order_key` 的唯一实现(诊断用), 那份
-"同名多单只占一个槽"的实机账还记在它的 docstring 里。
+☠☠ **2026-09-18 当天来回了一次**: 上午先把订单认领删掉(两个厨师**合作同一张单**),
+晚上又按用户的话**取回来** —— 原话:
+  > "**改成一人一单吧**"
+因为实机(`s_sushi_*`)打回来的形状是: 两人压在同一张单上**互相让位、又都推不动**
+(P2 卡在取料、P1 卡在摆盘), 还互相把菜板/料占着; 让位那条(8 秒规则)一触发,
+先让的那个人**反而没活了**(队友在他自己的那半条链上)。
+⇒ 回到"**一人一单**": **一个槽位只由一个厨师认领**(键 = 槽位 id, 见 `key_of`),
+两个人各做各的链, 队友通报那条通道仍然在(错开一步 / 求助搭手 / 8 秒让位都还在)。
+
+⚠ **认领只在 `Engine.plan()` 一处生效** —— 底下的候选池不看它; 所以"合作一单"那半天
+  也是靠 `_chain_pick` 的队友通报在错开, 而不是靠认领。
 
 黑板只在内存里, 谁先 claim 谁得。
 """
@@ -34,6 +37,7 @@ ASK_TTL = 5.0
 class OrderBoard:
     def __init__(self):
         self._lock = threading.Lock()
+        self._orders = {}      # 槽位键 -> cid (认领者) —— 一人一单
         self._spots = {}       # cid -> 组装台面 id
         self._stoves = {}      # 灶台 id -> cid
         #: cid -> `{op, need, ask, ask_at, at}` —— **队友通报**("我在干嘛")。
@@ -79,8 +83,33 @@ class OrderBoard:
             return name
         return f"#{i}:{name}"
 
+    def claim_order(self, key: str, cid: int) -> bool:
+        """认领一个**槽位**(`key` 用 `key_of(order)` —— **不是菜名**)。"""
+        with self._lock:
+            owner = self._orders.get(key)
+            if owner is None or owner == cid:
+                self._orders[key] = cid
+                return True
+            return False
+
+    def owner_of(self, key: str):
+        """**只读**: 这个槽位归谁(没人占 → `None`)。给"为什么没单可做"的诊断用。
+
+        ⚠ 和 `claim_order` 分开是**故意的** —— 诊断**不许顺手占位**
+          (同 `stove_owner` 那条理由: 拿我的 cid 把一张本来没主的单占掉是副作用)。
+        """
+        with self._lock:
+            return self._orders.get(key)
+
+    def release_order(self, key: str, cid: int) -> None:
+        with self._lock:
+            if self._orders.get(key) == cid:
+                del self._orders[key]
+
     def release_all(self, cid: int) -> None:
         with self._lock:
+            for k in [k for k, v in self._orders.items() if v == cid]:
+                del self._orders[k]
             self._spots.pop(cid, None)
             self._status.pop(cid, None)      # 我走了 ⇒ 那条通报也不该留着
             for k in [k for k, v in self._stoves.items() if v == cid]:
