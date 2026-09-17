@@ -5155,11 +5155,34 @@ class Engine:
         s0 = min(stacks, key=lambda s: (s.x - (cx or 0)) ** 2 + (s.z - (cz or 0)) ** 2)
         self.log("[洗盘] 去端脏盘子 %s(%d 个) @(%.1f,%.1f)"
                  % (s0.id, int(s0.n), s0.x, s0.z))
+        # ☠☠ **脏盘叠架在台面上 ⇒ 游戏报的是【那个台面的名字】, 不是叠自己的名字**
+        #   (2026-09-17 `s_mine_2_6` 实机): 站到位(距 1.31 格)了, 游戏说
+        #     `抓取='workstation_plate_return'`, 而我们一直拿 `DirtyPlateStack` 去比
+        #   ⇒ **永远"✗ 不是它"** ⇒ 洗不了盘子 ⇒ 场上 0 个干净盘 ⇒ `cook` 取菜
+        #     没有盘子接 —— 而"没有干净盘"正是"锅里的菜取不出来"那条链的源头。
+        #   这和 `_rescues` 那条"架在台面上的东西, 游戏报的是台面名"是**同一个机制**
+        #   (依据 `ServerAttachStation.cs:107-119` 的转发), 只是那条当时按**锅**修过,
+        #   没回头看**盘叠**。
+        #   ⇒ 换一个问法: **先按逐字名试一次(精确档不丢), 对不上就不指定名字再走一趟**,
+        #     拿到手之后**再问游戏"手上到底是什么"**复核 —— 判据仍然只有游戏一个(规则 2),
+        #     而且那一问比名字比对**强**: 它验的是**结果**, 不是我们对名字的假设。
         if not self._approach(km, s0.x, s0.z, want=s0.name):
-            self.log("[洗盘] 走不到脏盘堆")
-            return False
+            self.log(f"[洗盘] 逐字名 {s0.name!r} 对不上(叠架在台面上时游戏报的是**台面名**) "
+                     f"—— 不指定名字再走一趟")
+            if not self._approach(km, s0.x, s0.z):
+                self.log("[洗盘] 走不到脏盘堆")
+                return False
         if not self.interact("pickup", verify_hold_change=True):
             self.log("[洗盘] 拿不起脏盘子")
+            return False
+        # ⚠ 上面那条"不指定名字"的路**可能抓错旁边的东西** ⇒ 用游戏报的**手持物**复核。
+        #   判据抄 `map_model` 那条现成的口径(`is_plate` 里"名字带 `stack` 的是
+        #   **盘子的来源**、不是盘子本身") —— 一处口径, 不另发明一套。
+        _st_now = self.state(force=True) or {}
+        _, _, held = self.pos(_st_now)
+        if "stack" not in (held or "").lower():
+            self.log(f"[洗盘] ⚠ 抓到的不是脏盘叠(手上={held!r}) —— 放回去, 这一步不算")
+            self._drop_held(_st_now, held)
             return False
         # ② 放到洗手池
         sinks = km.of("wash")
@@ -8219,8 +8242,17 @@ class Engine:
             if need <= 0 or prog <= _alert * need:
                 continue                      # 还没到点(或数据不全)
             ratio = prog / need
-            if ratio >= 2.0:
-                continue                      # 已经毁了(糊了 / OverMixed)
+            # ☠☠ **糊透的不再一律跳过** —— 目的从"救这道菜"换成"**救这口灶台**"
+            #   (2026-09-18, 用户点名的"**会倒掉糊的锅了嘛**")。
+            #   原来这里是 `if ratio >= 2.0: continue`, 注释写的是"那道菜已经废了,
+            #   端下来也没用" —— **对这道菜是对的, 对灶台是错的**: 糊透的锅还占着
+            #   那口灶, 而 `_cook` 只认"锅里就是我要的那份" ⇒ 不腾出来,
+            #   **那口灶整局都不能用了**。
+            #   判据用**游戏报的 `state == "Burnt"`**(规则 2), `ratio` 只当老 dll 的兜底。
+            #   ⚠ 倒掉要走垃圾桶 ⇒ **这关没有垃圾桶就不提这个候选**(探测期纯读, 不空跑)。
+            _burnt = (str(getattr(c, "state", "") or "") == "Burnt" or ratio >= 2.0)
+            if _burnt and (km is None or not km.of("bin")):
+                continue
             if str(getattr(c, "burning", "")).lower() in ("true", "1"):
                 continue                      # 烧起来了 → 走灭火那条路
             x, z = getattr(c, "x", None), getattr(c, "z", None)
@@ -8231,6 +8263,9 @@ class Engine:
             # 措辞按**容器形态**分: 说"过火"而实际是搅拌器, 会把人带偏(日志是唯一线索)
             _past = "已经搅过头了" if _mix else "已经过火"
             _verb = "取出来" if _mix else "端下来"
+            if _burnt:
+                # 糊透的那一档: 措辞换掉(日志是唯一线索), 且**不是"救菜"是"腾灶台"**
+                _past, _verb = "**糊透了**", "**倒掉**(把灶台腾出来)"
             # ☠ **走不到的那口锅要上冷板凳** —— 实测(`s_sushi_1_3`)一口**卡在 14/12 秒
             #   不再变化**的锅让 `rescue` 每轮都被选中(40 分)、每轮都"走不到旁边(差 1.00 格)",
             #   把半局烧在同一个不可能的动作上。杂活那条"本轮不再选它"只在本轮有效,
@@ -8271,7 +8306,10 @@ class Engine:
                     what, _past, prog, need, max(0.0, 2 * need - prog), _verb),
                 at_name=_mount or _pot_name, at_x=x, at_z=z,
                 vessel=_pot_name,
-                urgency=scoring.burn_urgency_alert(ratio, _alert)))
+                # ⚠ `urgency` 现在已经**没有任何读者**(评分层删了) —— 留着它是因为
+                #   `Op.urgency` 是公开字段, 下一轮真接回"按紧迫度排序"时会用;
+                #   糊透的那一档给 0: 它是**清理**, 不是"再不动就废了"的急救。
+                urgency=0.0 if _burnt else scoring.burn_urgency_alert(ratio, _alert)))
         return out
 
     def op_rescue(self, km, x, z, op: Op, st: dict) -> bool:
@@ -8313,6 +8351,19 @@ class Engine:
             if _it.name == vessel and (_it.tag or "") == "CookingUtensil":
                 carryable = True
                 break
+        # ☠☠ **先问一句"糊透了没有"** —— 那是**完全不同的处置**: 不是把菜救回来,
+        #   而是把锅/设备腾出来(见 `_dump_burnt` 的依据)。判据**现读游戏那一帧**(规则 2),
+        #   不用候选里带来的旧值(从探测到执行之间它可能又涨了)。
+        _ck_live = next((c for c in (getattr(km, "cooking", None) or [])
+                         if getattr(c, "name", "") == vessel), None)
+        if _ck_live is not None:
+            _need_l = float(getattr(_ck_live, "need", 0) or 0)
+            _prog_l = float(getattr(_ck_live, "prog", 0) or 0)
+            if (str(getattr(_ck_live, "state", "") or "") == "Burnt"
+                    or (_need_l > 0 and _prog_l >= 2.0 * _need_l)):
+                self.log(f"[倒锅] {vessel or op.target!r} 里的东西**已经糊透了** —— "
+                         f"这道菜废了, 但灶台还得用: 倒掉腾出来")
+                return self._dump_burnt(km, x, z, op, carryable)
         if vessel and not carryable:
             # ☠☠ **"端不走"还不够 —— 还得看"内容物能不能进盘"**。用户 2026-09-15:
             #   > "搅完之后碗里是一个成品, **碗的内容物无法和盘子交互**"
@@ -8440,6 +8491,112 @@ class Engine:
             else:
                 self.log(f"[救锅] 走不到摆盘位 {sp.id} —— 菜先端在手上")
         self.log(f"[救锅] ✓ {what} 已取出, 设备留在 {holder.id}(空了就不会再报警)")
+        return True
+
+    def _dump_burnt(self, km, x, z, op: Op, carryable: bool) -> bool:
+        """**倒掉一锅糊透的东西 —— 目的不是救菜, 是把那口灶台腾出来。**
+
+        依据(反编译, 规则 1 —— `ServerRubbishBin.cs:138-151`): `HandlePlacement` 先看
+        **手上那件东西**的 `IDisposalBehaviour`:
+          · `WillBeDestroyed() == true`(`ServerIngredientDisposalBehaviour` —— 散料)
+            ⇒ `PassToDestroy` —— **东西直接没了**;
+          · `WillBeDestroyed() == false`(`ServerContentsDisposalBehaviour`, 要求身上有
+            `IngredientContainer` —— **锅和盘子都挂着它**)
+            ⇒ `AddToDisposer(carrier, this)` ⇒ `m_container.Empty()`
+            ⇒ **只清空内容物, 容器还端在手上**。
+        (`ServerUtensilRespawnBehaviour.RespawnCoroutine` 对**锅**也调同一个方法 ——
+         说明锅身上确实挂着 `ContentsDisposalBehaviour`, 这不是我推的。)
+
+        ⇒ 所以"倒掉"在游戏里就是**端着锅对垃圾桶按一下放置**: 不用找盘子、不用先取菜,
+          倒完锅还在手上, 直接放回灶台。
+        ☠ **为什么必须做**: 糊透的锅**占着那口灶** —— `_cook` 只认"锅里就是我要的那份",
+          别的一概绕开 ⇒ 不腾出来, **那口灶整局都不能用了**。
+        ⚠ 与"救锅"(报警窗口内)是**两件事**: 那条救的是这道**菜**, 这条腾的是**灶台**。
+        ⚠ **端不走的设备**(烤箱/炸锅/搅拌器)走"先取到盘子里、再连盘拿去倒" ——
+          盘子被清空之后**还是干净可用的**(同一个机制, 因为盘子也挂着那个行为)。
+        """
+        bins = km.of("bin")
+        if not bins:
+            self.log("[倒锅] ⚠ 这关没有垃圾桶 —— 糊掉的东西倒不掉(那口灶腾不出来)")
+            return False
+        bn = min(bins, key=lambda b: (b.x - x) ** 2 + (b.z - z) ** 2)
+
+        # ① 先把糊的东西弄到手上 —— 端锅 / 或"取到盘子里"
+        if carryable:
+            _, _, held0 = self.pos(self.state(force=True) or {})
+            if held0:
+                self.log(f"[倒锅] 手上还有 {held0!r} —— 先腾手")
+                self._put_down_plate(km, x, z, what=held0)
+            if not self._approach(km, op.at_x, op.at_z, tight=0.8, want=op.at_name):
+                self.log(f"[倒锅] 走不到 {op.at_name or op.target} 旁边")
+                return False
+            if not self.interact("pickup", verify_hold_change=True):
+                self.log("[倒锅] ✗ 没端起来(锅还在灶上)")
+                return False
+            _, _, got = self.pos(self.state(force=True) or {})
+            self.log(f"[倒锅] 把糊透的 {got or op.vessel or '锅'} 端起来了 —— 拿去倒")
+        else:
+            if not self._get_plate_for_pot(km, x, z, self._plate_type_now(),
+                                           taking=op.target):
+                self.log("[倒锅] ⚠ 拿不到干净盘子 —— 糊的东西取不出来(设备端不走)")
+                return False
+            holder = self._station_named(km, op.at_name)
+            if holder is None:
+                self.log(f"[倒锅] 找不到 {op.at_name!r} 那张台面 —— 取不出来")
+                return False
+            if not self._take_from_pot(holder, op):
+                self.log("[倒锅] ⚠ 糊的东西没取出来 —— 那台设备还占着")
+                return False
+            self.log("[倒锅] 糊的已经进盘子 —— 连盘拿去倒(倒完盘子还是干净的)")
+
+        # ② 走到垃圾桶按一下(放置) —— 游戏清空内容物, 容器留在手上
+        st2 = self.state(force=True)
+        km2 = self.map(st2) if st2 else None
+        _, _, held = self.pos(st2 or {})
+        if km2 is None:
+            self.log("[倒锅] 读不到地图 —— 东西先端在手上")
+            return False
+        if not self._approach(km2, bn.x, bn.z, tight=0.8, want=bn.name):
+            self.log(f"[倒锅] 走不到垃圾桶 {bn.id} —— {held or '东西'} 还在手上")
+            return False
+        ok_t, who = self._place_target_ok(bn, "", False)
+        if not ok_t:
+            self.log(f"[倒锅] ⚠ 站位不对: 游戏说会放到 {who!r}, 而不是垃圾桶 {bn.name!r} —— 不按")
+            return False
+        # ⚠ **不能要 `verify_hold_change`** —— 倒掉的是"容器里的东西", 容器名字前后没变;
+        #   靠"持有物变了"判成功只会误判成失败, 再按一次(同 `_take_from_pot` 那条理由)。
+        self.interact("pickup", verify_hold_change=False)
+        time.sleep(0.4)
+
+        # ③ 复核: **问游戏**"那口容器现在空了吗"(规则 2)。
+        #   ☠ 判据按**容器形态**分开 —— 盘子读 `heldhas`(那个字段可靠);
+        #     锅没有 `heldhas` ⇒ 放回灶之后读 `cooking_on().busy`(和 `_rescues` 同一份判据)。
+        if carryable:
+            st3 = self.state(force=True)
+            km3 = self.map(st3) if st3 else None
+            _, _, pot = self.pos(st3 or {})
+            stove = self._station_named(km3, op.at_name) if km3 is not None else None
+            if stove is None or not self._approach(km3, stove.x, stove.z, tight=0.8,
+                                                   want=stove.name):
+                self.log(f"[倒锅] 走不到原来那口灶({op.at_name!r}) —— 锅留在手上(它是空的)")
+                return True
+            if not self.interact("pickup", verify_hold_change=True):
+                self.log(f"[倒锅] ⚠ 锅({pot!r})没能放回灶上 —— 它是空的, 留在手上不碍事")
+                return True
+            ck = self._pot_now(stove)
+            if ck is not None and getattr(ck, "busy", False):
+                self.log(f"[倒锅] ⚠ 放回去之后游戏说锅里**还有东西**"
+                         f"({getattr(ck, 'inside', '') or getattr(ck, 'name', '')!r}) —— 没倒干净")
+                return False
+            self.log(f"[倒锅] ✓ 糊的倒掉了, 锅已放回 {stove.id} 且**是空的** —— 这口灶能用回来了")
+            return True
+        st4 = self.state(force=True)
+        _, _, held2 = self.pos(st4 or {})
+        _left = self._held_contents(st4 or {}) if held2 else set()
+        if _left:
+            self.log(f"[倒锅] ⚠ 倒完手上那个 {held2!r} 里还有 {sorted(_left)} —— 没倒干净")
+            return False
+        self.log(f"[倒锅] ✓ 糊的倒掉了, 手上这个 {held2!r} 又空了 —— 那台设备也腾出来了")
         return True
 
     def _plate_type_now(self) -> str:
