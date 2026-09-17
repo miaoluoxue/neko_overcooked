@@ -275,19 +275,6 @@ MATE_SYNC = (os.environ.get("NEKO_MATE_SYNC") or "1").strip().lower() \
 #: 队友那条通报**多久没更新就算过期**(秒)。过期当"不知道他在干嘛"处理 ——
 #: 宁可让开一步, 也别拿一条几秒前的旧消息去猜。
 MATE_SYNC_TTL = float(os.environ.get("NEKO_MATE_TTL") or 3.0)
-#: 队友**正在做同一步**时, 给那个候选**扣几分**。
-#: ⚠ 是**软扣分不是闸门**: 队友那条通报过期了、或者他其实做不成,
-#:   这一步还得有人做 —— 硬闸门会让两个人都站着(用户规则 5: 宁可重复也别站着)。
-#:   取 25.0 ≈ 走 12 格(`W_DIST` 是 2.0/格), 比"顺路"那一项重, 比"整步重做"轻。
-MATE_BUSY_PENALTY = float(os.environ.get("NEKO_MATE_PENALTY") or 25.0)
-#: 队友**在求助那一步**时, 给那个候选**加几分**("搭手", 见 `_mate_help`)。
-#: 求助的意思是"**我做不成这一步**"(`_mate_ask` 在连续失败上了冷板凳之后喊的),
-#: 而他做不成的那一步**本来就在我的 `pending` 里**, 只是被"让开"压着 ——
-#: 所以这里要把它**抬回来**。取和 `MATE_BUSY_PENALTY` 同样的 25.0(对称, 好推理)。
-#: `NEKO_MATE_HELP=0` ⇒ 逐字退回"看到 `ask` 也不理"的老行为(扣分照旧)。
-MATE_HELP_BONUS = float(os.environ.get("NEKO_MATE_HELP") or 25.0)
-
-
 class _GroundItem:
     """把一件**掉在地上的料**包成**和 `Station` 同形状**的取货目标。
 
@@ -6130,9 +6117,12 @@ class Engine:
           拆出来才**能离线钉**(见 `runtime/_matelog_probe.py`)。
         """
         if MATE_SYNC:
-            self.log(f"[队友通报] 开 —— {MATE_SYNC_TTL:.1f}s 没刷新算过期(当'不知道'), "
-                     f"撞车扣 {MATE_BUSY_PENALTY:.0f} 分(只扣分, 不拦人); "
-                     f"指纹: ↑我发布 / ↓我读到队友 / ⤵撞车让开")
+            # ☠ 措辞跟着 2026-09-18 的改造走: 通报原来只喂"扣分/加分"(评分层),
+            #   现在喂的是**链式执行器的错开** —— "他在做这一步 ⇒ 我顺到链上的下一步,
+            #   但他在为这一步求助时不跳"。说的和做的不一样 = 下一轮又要查半天。
+            self.log(f"[队友通报] 开 —— {MATE_SYNC_TTL:.1f}s 没刷新算过期(当'不知道'); "
+                     f"队友在做这一步 ⇒ 我顺到链上的下一步(他在求助时不跳); "
+                     f"指纹: ↑我发布 / ↓我读到队友 / [链] 队友在做…")
         else:
             self.log("[队友通报] 关(NEKO_MATE_SYNC=0)—— 一个字节都不发布、也不读")
 
@@ -8506,13 +8496,6 @@ class Engine:
             #   所以这里不设任何阈值。
             # ⚠ **`--mode sabotage` 下救援会垫底**(`scoring.transform` 取负 ⇒ 分越高越低):
             #   那是**故意的**, 不是 bug —— 捣蛋鬼的 `Mischief.BURN` 本来就是"放任灶台烧糊"。
-            return True, ""
-        if getattr(chore, "tend", False):
-            # **"到点回去取菜"同样不吃顺路闸门**(同 `pass`/`rescue` 的理由) ——
-            #   它也不是"顺手做的杂活", 而是"我自己的菜在灶上, 再不去就糊了"。
-            #   ⚠ 它也**不吃 `NEKO_CHORES=0` 那个总开关**: 调试期想关它用
-            #     `NEKO_COOK_LEAVE=0`(整条"放完就走"一起退回站锅边等), 而不是被
-            #     "关杂活"顺手关成"放进去就走、但永远不回来取"——那会把菜全烧掉。
             return True, ""
         if getattr(chore, "redo", False):
             # **回溯同样不吃顺路闸门、也不吃 `NEKO_CHORES=0`**(同 `pass`/`rescue` 的理由)。
