@@ -5231,7 +5231,7 @@ class Engine:
         if mk is None:
             self.log("[步骤] 这关没有搅拌台(MixingStation)")
             return False
-        _, _, held = self.pos(st)
+        held = self._held_fresh(st)     # ☠ 现读 —— `do_op` 刚 `_pickup_preposed` 过
         self.log(f"[步骤] 去 {mk.id} 搅拌 → {op.target} (站旁边/料放进去后自动开搅)")
         if not self._approach(km, mk.x, mk.z, tight=0.8):
             return False
@@ -5459,7 +5459,11 @@ class Engine:
                      ("(场上 %d 块都被别人的东西占着)" % len(_allb) if _allb
                       else "(这关没有 Workstation)"))
             return False
-        _, _, held = self.pos(st)
+        # ☠☠ **手必须现读** —— `do_op` 在派发之前刚跑过 `_pickup_preposed`,
+        #   它会把预置在别处的那份料**塞回手上**, 而传进来的 `st` 还是派发前那一拍。
+        #   拿 `st` 读 ⇒ `held` 空 ⇒ 下面 `if held: 先放上板` 不执行 ⇒ **料没上板**
+        #   ⇒ `base` 空 ⇒ "这块板是空的" ⇒ 这一支白判死(`MovingPlatform4` 实机)。
+        held = self._held_fresh(st)
         self.log(f"[步骤] 去 {board.id} 切 → {op.target}")
         # ⚠ **走不到 / 对不齐都算"这一支不行"** —— 用户 2026-09-15: "按一次没得到对应的
         #   结果这条路就失败了, 可以**返回到其他路**"。实测日志里那两条正是这样:
@@ -6512,8 +6516,9 @@ class Engine:
         #   三次就 `✗ 放弃` 整单)。用户那条规矩在这儿同样适用:
         #   "每次都用最新的……手上的盘、盘里的内容"。
         #   ⚠ `state(force=True)` 不吃 TTL —— 这一段判的就是"此刻手上有没有"。
-        _stn = self.state(force=True)
-        _, _, held = self.pos(_stn or st)
+        # ⚠ 这里原来自己现读了一遍(`_stn = self.state(force=True)`) —— 现在收进
+        #   `_held_fresh` 这一个入口, 免得下一处又漏(见它的 docstring)。
+        held = self._held_fresh(st)
         need = op.wait or 0.0
         want_pot = bool(getattr(op, "in_pot", False))
         plate_type = (flow.plate if flow is not None else "") or ""
@@ -6840,6 +6845,33 @@ class Engine:
             if is_plate(o, s.tag_of(i)):
                 return True
         return any("plate" in self._norm(o) for o in (s.on or []))
+
+    def _held_fresh(self, st) -> str:
+        """**此刻手上拿的是什么** —— **现读**, 不吃传进来的那一拍快照。
+
+        ☠☠ 为什么每个 `op_*` 都必须走这里(2026-09-17 `MovingPlatform4` 实机打回来的):
+          `do_op` 在**派发之前**会替 `chop`/`cook`/`mix`/`assemble` 跑一次
+          `_pickup_preposed`(`engine.py` 那句 `if op.action in ("chop", "cook", "mix",
+          "assemble")`)—— 它会把**预置在别处的那份料塞回手上**,
+          而它传给 `op_*` 的 `st` 仍是**派发前那一拍**的。
+          ⇒ 拿 `st` 读手**必然**读到"手是空的"。后果按动作各不相同:
+            · `op_chop` —— `if held: interact(...)  # 先放上板` **不执行** ⇒ 料没上板
+              ⇒ `base` 空 ⇒ 走"这块板是空的" ⇒ 这一支白判死。实测那一局的形状:
+                `[预置] ✓ 捡回来了 Cucumber` → `[步骤] 去 board0 切 → Cucumber`
+                → `[步骤] 需切 7 刀` → `✗ board0 上读不到要切的 'Cucumber' … 这块板是空的`
+                (而黄瓜**从头到尾就在手上**);
+            · `op_assemble` —— 走"手上空"那条 ⇒ `判失败, 不假装成功`;
+            · `op_mix` —— 同理, 料不进碗。
+          ☠ 这个坑 `_cook` **单独补过一次**(`s_mine_2_5`: 上一行刚
+            `[预置] ✓ 捡回来了 Rice`, 下一行就是 `[步骤] 手上没东西可煮`),
+            当时只补了**那一个**动作 ⇒ 同一族漏了三处。这次收成**一个入口**,
+            别再漏第四个(本仓"一条出口, 不是五条"的同一条纪律)。
+
+        ⚠ `state(force=True)` **不吃 TTL** —— 这条判的就是"此刻", 缓存在这里没有意义。
+        ⚠ 拿不到新快照 ⇒ 退回传进来的 `st`(不制造新的崩溃点)。
+        """
+        _stn = self.state(force=True)
+        return self.pos(_stn or st)[2]
 
     def _held_contents(self, st) -> set:
         """**手上那件容器里装了什么** —— 插件读的 `heldhas`(见 `SceneScanner.ReadHeldItems`)。
@@ -7192,7 +7224,7 @@ class Engine:
           · 不能再"给摆盘位补一个盘子"(_ensure_plate 会把手上这盘菜放到别处去);
           · 直接放到摆盘位 —— 那儿本来就有盘子时, 手上这盘会并进它。
         """
-        _, _, held = self.pos(st)
+        held = self._held_fresh(st)     # ☠ 现读 —— `do_op` 刚 `_pickup_preposed` 过
         # ☠☠ **目的地是【碗】的那些**(`Op.into_bowl`, mix 组)⇒ 去**搅拌台**放,
         #   不走摆盘位这条路。用户 2026-09-15: "碗的容量是'<=4 份任意处理过的料'……
         #   **碗的内容物无法和盘子交互**" ⇒ 这一组料的落点是**碗**, 不是盘。
