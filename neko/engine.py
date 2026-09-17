@@ -399,6 +399,29 @@ PASS_RANGE = float(os.environ.get("NEKO_PASS_RANGE") or 5.0)
 #:   (这正是"判定只能有一条规则"那件事, 见 `CH_TRAVELATOR` 的注释)。
 PASS_SLACK = 1.0
 
+#: **和队友通报"我在干嘛"**(2026-09-17 用户原话):
+#:   > "**厨师1的信息需要强制同步给厨师2，让脚本知道另外一个在干嘛，
+#:   >  包括位置，在做的事，指向的对象，手上的东西，需要是什么**"
+#:
+#: 前四项**本来就拿得到**: 位置/手上的东西/指向的对象(`pick`/`use`/`placeh`)
+#: 都在共享的 `World.state()` 那份 `chefs[]` 里(那条链由 C# 每帧刷新保证新鲜)。
+#: **只有"在做的事"和"需要是什么"是引擎内部的** —— 它们不在游戏状态里,
+#: 所以走黑板通报(见 `team.OrderBoard.publish_status`)。
+#:
+#: ☠☠ **这是一条旁路**: 只发布、只读、只影响**评分权重** ——
+#:   **不加任何"谁占着"的锁**。(步级占位那一套是另一条线, 本版没有, 也别从这儿引。)
+#: `0` = 一个字都不发布也不读, 逐字退回老行为。
+MATE_SYNC = (os.environ.get("NEKO_MATE_SYNC") or "1").strip().lower() \
+    not in ("0", "off", "no", "false", "none")
+#: 队友那条通报**多久没更新就算过期**(秒)。过期当"不知道他在干嘛"处理 ——
+#: 宁可让开一步, 也别拿一条几秒前的旧消息去猜。
+MATE_SYNC_TTL = float(os.environ.get("NEKO_MATE_TTL") or 3.0)
+#: 队友**正在做同一步**时, 给那个候选**扣几分**。
+#: ⚠ 是**软扣分不是闸门**: 队友那条通报过期了、或者他其实做不成,
+#:   这一步还得有人做 —— 硬闸门会让两个人都站着(用户规则 5: 宁可重复也别站着)。
+#:   取 25.0 ≈ 走 12 格(`W_DIST` 是 2.0/格), 比"顺路"那一项重, 比"整步重做"轻。
+MATE_BUSY_PENALTY = float(os.environ.get("NEKO_MATE_PENALTY") or 25.0)
+
 
 class _GroundItem:
     """把一件**掉在地上的料**包成**和 `Station` 同形状**的取货目标。
@@ -4318,7 +4341,18 @@ class Engine:
                 continue
         return out
 
-    def _fire_targets(self) -> list:
+    #: **锅/灶台着火算不算火情**(2026-09-17)。
+    #:
+    #: `_fire_targets` 里"从 `km.cooking` 的 `burning` 补一条"是**新加的行为** ——
+    #: 在此之前锅烧起来脚本**完全看不见**(那张插件表只扫 `ServerFlammable`/
+    #: `ClientFlammable`, 灶台/锅不在里面), 于是 `_rescues` 说"交给灭火那条路"、
+    #: 而那条路不知道有火 ⇒ **那一锅一直烧到报废**。
+    #: 按本仓"每个新行为都能一键回退"的约定留一个开关:
+    #: `NEKO_FIRE_POT=0` ⇒ 逐字退回"只认 `dyn.fires`"的老行为。
+    FIRE_POT = (os.environ.get("NEKO_FIRE_POT") or "1").strip().lower() \
+        not in ("0", "off", "no", "false", "none")
+
+    def _fire_targets(self, km=None) -> list:
         """场上正在烧的东西 —— **带名字/类型**(灭火时要打出来)。
 
         为什么非要有名字(实机 2026-09-14 `s_summer_1_4`): `dyn.fires` 里既有
@@ -4326,17 +4360,44 @@ class Engine:
         (那一关 11 处里 8 处是 `FireWorkHazard`)——
         只报坐标的话, "喷了没反应"分不清是"没对准"还是"这东西根本灭不掉",
         而这两种情形的处置完全相反(前者要调站位, 后者要换目标)。
+
+        ☠☠ **锅/灶台着火不在 `dyn.fires` 里**(2026-09-17 用户: "**锅起火的话不会灭火**,
+          地上的火已经验证过了还可以") ⇒ 只靠插件那张表, 锅烧起来了脚本**看不见**,
+          `extinguish` 连"有火"都不知道, 那一锅就一直烧到报废。
+        ⚠ 而**这份数据我们本来就有**: `km.cooking` 的每个条目带 `burning`
+          (`_pot_valid` 判"糊了/过了"用的就是它)。⇒ 用**锅自己的坐标**补一条,
+          名字/类型标清楚是"锅着火" —— 于是 `extinguish` 那一整套
+          (走过去 → 面向 → 喷 0.9s → 确认) **原样适用**, **一行插件代码都不用改**。
+        ⚠ `km=None`(老调用方)⇒ 逐字退回"只看 `dyn.fires`"的老行为。
         """
         try:
             dyn = self.bridge.get_dyn()
         except Exception as e:
+            # ☠ **插件读失败 ≠ 没有锅着火** —— 这两条来源是**独立的**:
+            #   `dyn.fires` 来自桥, 锅那条来自 `km.cooking`。原来这里 `return []`,
+            #   于是插件抖一下就把锅那一路一起丢了(= 锅烧着也当没火)。
+            #   ⇒ 记一笔, 继续往下走去补锅那条。
             self.log(f"[灭火] 读火失败: {e}")
-            return []
+            dyn = None
         out = []
         for f in (dyn or {}).get("fires") or []:
             try:
                 out.append({"x": float(f.get("x") or 0), "z": float(f.get("z") or 0),
                             "name": f.get("name") or "", "type": f.get("type") or ""})
+            except (TypeError, ValueError):
+                continue
+        # ---- 锅/灶台着火: 从 `km.cooking` 的 `burning` 补 ----
+        #   ⚠ `FIRE_POT=0` ⇒ 这一整段不执行, 逐字退回"只认 `dyn.fires`"的老行为。
+        if not self.FIRE_POT:
+            return out
+        for ck in (getattr(km, "cooking", None) or ()):
+            try:
+                if not getattr(ck, "burning", False):
+                    continue
+                out.append({"x": float(getattr(ck, "x", 0) or 0),
+                            "z": float(getattr(ck, "z", 0) or 0),
+                            "name": getattr(ck, "name", "") or "锅",
+                            "type": "CookingBurn"})
             except (TypeError, ValueError):
                 continue
         return out
@@ -4404,7 +4465,9 @@ class Engine:
         tried = set()          # 喷过没反应的那些(坐标取整), 免得在它身上反复耗时间
         t0 = _t.time()
         while _t.time() - t0 < budget:
-            fires = self._fire_targets()
+            # ☠ 传 `km` —— 锅/灶台着火**不在插件那张火表里**, 得从 `km.cooking`
+            #   的 `burning` 补(见 `_fire_targets` 的 ☠☠)。不传 = 看不见锅着火。
+            fires = self._fire_targets(km)
             if not fires:
                 break
             cx, cz, _ = self.pos(self.state() or {})
@@ -4794,6 +4857,25 @@ class Engine:
             return True
         now = time.time()
         need = float(ck.need)
+        # ☠☠ **"已放进"可能是假的**(2026-09-17 实机 `s_mine_2_6` 的定案点 —— 先取证据)。
+        #   那局 P2 每轮都打 `已放进 hob0(需 12s, 11s 后熟)` **紧接着**
+        #   `hob0 的账清了(糊了/过了 —— 交给救锅线)`, 重复 6 次以上, `cook` 永远做不完。
+        #   而"下一轮立刻判糊"要求**登记那一刻** `prog >= need*2`(或 `burning`) ——
+        #   也就是说**锅里那口旧的糊菜还在**: 新料**根本没进去**, 可
+        #   `interact("pickup", verify_hold_change=True)` 报了成功(手上确实空了)。
+        #   ⇒ 于是 台账记了一笔"我放进去的" ⇒ 下一轮 `_pot_valid` 立刻判它失效 ⇒
+        #     丢给救锅线 ⇒ 而救锅**也要盘子** ⇒ 锅永远清不掉 ⇒ 死循环。
+        #   ⚠ **这一行只打证据, 不改行为**(照样登记) —— 定案要看下一局的日志:
+        #     若这行真出现, 就证明"放进去"那一下没落地, 病根在放置那一步(或锅满了),
+        #     不在台账、也不在取菜。
+        try:
+            _in = self._norm(getattr(ck, "inside", "") or getattr(ck, "ing", "") or "")
+        except Exception:                                        # noqa: BLE001
+            _in = ""
+        if _in and _in != self._norm(op.target):
+            self.log(f"[煮] ⚠ 游戏说锅里现在是 {_in!r}, 不是刚放进去的 "
+                     f"{self._norm(op.target)!r} —— **这一笔可能没真放进去**"
+                     f"(旧菜还在锅里? 那下一轮会立刻判它'糊了/过了')")
         live[stove.id] = {
             "raw": op.target,
             "target": self._norm(op.target),
@@ -6634,6 +6716,83 @@ class Engine:
                 still = now - pt
         return ox, oz, held, still, bool(self.teammate_is_human)
 
+    # ---------------- 队友通报("我在干嘛") ----------------
+    #
+    # 用户 2026-09-17 原话那五项里, **只有两样要新通报**:
+    #   · **在做的事**、**需要是什么** —— 引擎内部, 游戏状态里没有;
+    #   · 位置 / 手上的东西 / **指向的对象**(`pick`/`use`/`placeh`)
+    #     **本来就在**共享的 `World.state()` 那份 `chefs[]` 里, 别再抄一份。
+    # 见 `team.OrderBoard.publish_status` 那段注释。
+    def _mate_cid(self) -> int:
+        """队友的 cid。**双人只有两只** ⇒ `1 - self.cid`。"""
+        try:
+            return 1 - int(self.cid)
+        except Exception:                                        # noqa: BLE001
+            return -1
+
+    def _mate_doing(self) -> dict:
+        """**队友那一拍在干嘛**(黑板上那条通报); 没开/没有/过期 ⇒ `{}`。
+
+        ☠ **读的是队友那一格(`_mate_cid()`), 不是我自己那一格** ——
+          `mate_status(cid)` 取的是"**那个 cid 名下的**通报", 传 `self.cid`
+          就变成读自己的了(永远读得到、也永远只看到自己)。
+        """
+        # ⚠ `getattr(self, "board", None)` —— 离线桩**不调 `__init__`**, 没有 `board`;
+        #   直接读属性会把那些桩当场打崩(`AttributeError`), 而**崩不算报红**。
+        #   本仓别处(`_plate_bound`/`_claim_res`…)一律这么写, 跟着来。
+        bd = getattr(self, "board", None)
+        if not MATE_SYNC or bd is None:
+            return {}
+        try:
+            return bd.mate_status(int(self._mate_cid()), MATE_SYNC_TTL) or {}
+        except Exception:                                        # noqa: BLE001
+            return {}
+
+    def _mate_publish(self, op, need: str = "", ask: str = "") -> None:
+        """把**我**这一拍在干嘛通报给队友。`ask` 非空 = 正式求助(见 `ASK_TTL`)。"""
+        bd = getattr(self, "board", None)          # ⚠ 同 `_mate_doing`: 桩没有 board
+        if not MATE_SYNC or bd is None or op is None:
+            return
+        try:
+            bd.publish_status(getattr(self, "cid", 0),
+                              op=f"{op.action} {op.target}",
+                              need=need, ask=ask)
+        except Exception:                                        # noqa: BLE001
+            pass
+
+    def _mate_ask(self, what: str, need: str = "") -> None:
+        """**正式求助**: 我这一步真做不成(连续失败上了冷板凳) ⇒ 喊一声。
+
+        ☠ 和普通通报是**两件事**: 求助有自己的 TTL(`team.ASK_TTL`), 而且
+          它**同时还刷新 `op`** —— 队友既看得到"我在做哪一步", 也多知道一条"我卡住了"。
+        ⚠ 喊完**不改变我自己的行为**: 我照样去做别的(那一步已经上冷板凳了) ——
+          这只是"让队友知道", 不是"把活推给他"。
+        """
+        bd = getattr(self, "board", None)          # ⚠ 同 `_mate_doing`: 桩没有 board
+        if not MATE_SYNC or bd is None or not what:
+            return
+        try:
+            bd.publish_status(getattr(self, "cid", 0), op=str(what),
+                              need=str(need or ""), ask=str(what))
+        except Exception:                                        # noqa: BLE001
+            pass
+
+    def _mate_penalty(self, op) -> float:
+        """队友**正在做这一步** ⇒ 让开一点(返回要加到**原始分**上的负数, 或 0)。
+
+        ☠ 判据是 **`动作 + 目标` 粗粒度**, **不是**步级占位 —— 那是另一条线, 本版没有。
+        ☠ **扣分, 不是闸门**: 队友那条通报会过期、他其实也可能做不成 ——
+          这一步还得有人做(用户规则 5: 宁可重复, 也别让人站着)。
+        """
+        if not MATE_SYNC or op is None:
+            return 0.0
+        m = self._mate_doing()
+        if not m or not m.get("op"):
+            return 0.0
+        if m["op"] != f"{op.action} {op.target}":
+            return 0.0
+        return -MATE_BUSY_PENALTY
+
     def _op_target_for_score(self, km, st, op, x: float, z: float,
                              tm=None, reach=None):
         """给评分用: 这一步"要去哪儿" —— 返回 `((tx,tz), label)` 或 `(None, 原因)`。
@@ -7296,6 +7455,13 @@ class Engine:
             _pb = self._plan_bonus(r["op"])
             if _pb:
                 raw[-1] += _pb
+            # **队友正在做这一步 ⇒ 让开一点**(`NEKO_MATE_SYNC`, 见 `_mate_penalty`)。
+            #   ☠ 和 `_plan_bonus` 同一形状: **加在 `raw` 上**, 不动 `scoring.py`
+            #     (那是**纯函数模块**, 它的纪律是"能脱离游戏肉眼核对")。
+            #   ☠ 是**扣分不是闸门** —— 理由见 `MATE_BUSY_PENALTY` 的注释。
+            _mb = self._mate_penalty(r["op"])
+            if _mb:
+                raw[-1] += _mb
             sigs.append(f"{r['op'].action} {r['op'].target}")
 
         # 3) 队友的原始分: 只换位置相关的项 —— 步骤价对两个人都一样。
@@ -8024,6 +8190,9 @@ class Engine:
             _tag = (f"[杂活] {op.action} {op.target}" if is_chore
                     else f"第{i+1}/{total}步 {op.action} {op.target}")
             self.log(f"[引擎] ▶ {_tag} (评分 {scoring.fmt(fin)}){_chef}")
+            # **通报队友: 我这一拍在做这件事**(2026-09-17 用户要求, 见 `_mate_publish`)。
+            #   ⚠ 只通报"在做的事"; "需要什么"要等真卡住时再喊(见失败那两处)。
+            self._mate_publish(op)
             # ⚠ 这里**没有** `_maybe_mischief()` 掷骰 —— 走评分路径时人格由
             #   `ModeState.transform` 在评分向量上表达; 两个都开会叠加成双重捣蛋
             #   (见 `SCORE_DRIVES_MODE`)。要对照旧行为就 `set NEKO_SCORE=0`。
@@ -10514,6 +10683,9 @@ class Engine:
                     self.log("[引擎]    如果这行反复出现, 才是真有 bug —— 把第一次失败的日志发给开发者。")
                     self.log("=" * 62)
                     self.bench_step(str(sig[1]), f"{name} 连续 {_fail_n} 次")
+                    # **正式求助**: 这一步我是真做不成了 ⇒ 让队友知道一声
+                    #   (2026-09-17 用户: "需要是什么"; 见 `_mate_ask`)。
+                    self._mate_ask(str(sig[1]), need=name)
                     _fail_sig, _fail_n = None, 0
                     time.sleep(0.5)
                     continue

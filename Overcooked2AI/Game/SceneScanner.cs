@@ -767,6 +767,25 @@ namespace Overcooked2AI.Game
                 var comp = chefGo.GetComponent(pcType);
                 if (comp == null)
                     return "";
+                // ☠☠ **读之前强制刷一次**(2026-09-17 用户: "强制每帧刷新厨师选择的对象的信息")。
+                //   游戏自己**每帧**也算(`ClientPlayerControlsImpl_Default.cs:226` 调
+                //   `UpdateNearbyObjects()`), 但它被三道闸门挡着:
+                //     · `IsLocallyControlled()` 为假 ⇒ 整段不跑;
+                //     · `PauseLayer.Main` 暂停 ⇒ 提前 return;
+                //     · `PauseLayer.Network` 暂停 ⇒ 只跑 Movement, **不刷这四个字段**。
+                //   后两种正是"能走不能按"的形状 —— 我们读到的就是那一刻的陈旧值。
+                //   `UpdateNearbyObjects()` 是 **public**(`PlayerControls.cs:692`),
+                //   项目里已有一处先例(`InteractDirect.cs:94`)。
+                //   ⚠ 只读路径上加这一下: **不挂 Harmony**、不改游戏状态 ——
+                //     它只按**厨师当前的朝向/站位**重算一次"现在指哪", 不动世界。
+                //   ⚠ 拿不到这个方法(老 dll)就跳过, 退回"读当前值"。
+                try
+                {
+                    var refresh = pcType.GetMethod("UpdateNearbyObjects", Type.EmptyTypes);
+                    if (refresh != null)
+                        refresh.Invoke(comp, null);
+                }
+                catch (Exception) { }
                 var prop = pcType.GetProperty("CurrentInteractionObjects");
                 if (prop == null)
                     return "";

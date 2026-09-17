@@ -234,8 +234,13 @@ namespace Overcooked2AI.Game
                     catch (Exception) { }
                 }
 
-                // 厨师位置: 0.1 秒(导航是闭环, 用旧坐标算方向必然来回震)
-                if (now - _lastChefScan >= 0.1f)
+                // 厨师: **每帧**(2026-09-17 用户: "强制每帧刷新厨师选择的对象的信息")。
+                //   原来是 0.1 秒 —— 那治的是"用旧坐标算方向会来回震", 本身没错;
+                //   但那四个字段(pick/use/pickh/placeh)是**游戏的交互判定**,
+                //   站位/朝向一变它就该变, 10 Hz 意味着最坏 100ms 的陈旧 ——
+                //   而 `_align_for_place`/`_aim_ok` 全是拿它当"此刻"用的。
+                //   ⚠ `ChefScanSec > 0` ⇒ 退回按秒节流(见那个字段的注释)。
+                if (ChefScanSec <= 0f || now - _lastChefScan >= ChefScanSec)
                 {
                     _lastChefScan = now;
                     try
@@ -349,6 +354,31 @@ namespace Overcooked2AI.Game
         private bool _recipeDetailRead;
         private string _chefsCache = "[]";
         private float _lastChefScan = -10f;
+
+        /// <summary>厨师扫描周期(秒)。`0` = **每帧**(默认, 2026-09-17 起); 正数 = 按秒节流。</summary>
+        ///
+        /// 用户原话: "**强制每帧刷新厨师选择的对象的信息**"。
+        /// 原来是 0.1 秒(原文注释: "导航是闭环, 用旧坐标算方向必然来回震") ——
+        /// 那已经是朝"更新鲜"做过的第一次, 再提一档是同方向。
+        /// ⚠ `NEKO_CHEF_HZ` 给正数可退回按秒; **游戏要继承到这个环境变量才生效**
+        ///   (Steam 直接起游戏的话继承的是系统变量, 不是看护那个终端) ——
+        ///   拿不到就按默认(每帧)走, 不会因此起不来。
+        private static readonly float ChefScanSec = ReadChefScanSec();
+
+        private static float ReadChefScanSec()
+        {
+            try
+            {
+                var s = System.Environment.GetEnvironmentVariable("NEKO_CHEF_HZ");
+                if (string.IsNullOrEmpty(s))
+                    return 0f;
+                float v;
+                if (float.TryParse(s, out v) && v > 0f)
+                    return v;
+            }
+            catch (Exception) { }
+            return 0f;
+        }
 
         /// <summary>从 {"stations":[...],"cooking":[...]} 里抠出某个数组原文。</summary>
         private static string ExtractArray(string json, string key)

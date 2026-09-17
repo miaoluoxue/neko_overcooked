@@ -16,6 +16,12 @@ from __future__ import annotations
 import threading
 import time
 
+#: **正式求助**活多久(秒) —— 超过就当对方没看见。
+#: ☠ 它和"通报"的 TTL(`MATE_SYNC_TTL`)是**两件事**:
+#:   通报是"我这一拍在干嘛"(一直刷), 求助是"**我卡住了**"(发一次) ——
+#:   求助不该因为我还在走动而被当成"还新鲜"。
+ASK_TTL = 5.0
+
 
 class OrderBoard:
     def __init__(self):
@@ -27,6 +33,12 @@ class OrderBoard:
         #: ☠ 只发布**分工**(谁做哪步), **不发布可行性** —— 可行性是执行期每轮重判的
         #:   (`_feasible`), 世界变了就该变; 把它冻在黑板里等于拿旧世界硬套。
         self._plans = {}
+        #: cid -> `{op, need, ask, ask_at, at}` —— **队友通报**("我在干嘛")。
+        #: ☠ 只存**引擎内部**那两样(在做的事 / 需要什么): 位置、手上的东西、
+        #:   指向的对象(`pick`/`use`/`placeh`)本来就拿得到(共享的 `World.state()`
+        #:   那份 `chefs[]` 里就有), 再抄一份就是**造第二份真相**
+        #:   (同"`_plates` 不存盘里装了什么"那条纪律)。见 `publish_status`。
+        self._status = {}
         self.log = lambda *a: None
 
     # ---- 订单 ----
@@ -88,6 +100,7 @@ class OrderBoard:
             for k in [k for k, v in self._orders.items() if v == cid]:
                 del self._orders[k]
             self._spots.pop(cid, None)
+            self._status.pop(cid, None)      # 我走了 ⇒ 那条通报也不该留着
             for k in [k for k, v in self._stoves.items() if v == cid]:
                 del self._stoves[k]
 
@@ -168,3 +181,52 @@ class OrderBoard:
             best = min(free, key=lambda s: (s.x - pos[0]) ** 2 + (s.z - pos[1]) ** 2)
             self._spots[cid] = best.id
             return best
+
+    # ---- 队友通报("我在干嘛") ----
+    #
+    # 用户 2026-09-17 原话:
+    #   "**厨师1的信息需要强制同步给厨师2，让脚本知道另外一个在干嘛，
+    #     包括位置，在做的事，指向的对象，手上的东西，需要是什么**"
+    #
+    # ☠☠ **它不是占位、不是锁** —— 读到什么**只影响评分权重**
+    #   ("他正在做这一步 ⇒ 我让开一点")。谁真的去做仍由评分决定:
+    #   队友那条通报过期了、或者他其实做不成, 这一步还得有人做 ——
+    #   硬闸门会让两个人都站着(用户规则 5: **宁可重复, 也别让人站着**)。
+    #   (步级占位那一套是**另一条线**, 本版没有, 也别从这儿引。)
+    def publish_status(self, cid: int, op: str = "", need: str = "",
+                       ask: str = "") -> None:
+        """通报我这一拍在干嘛。**只写我自己那一格**。
+
+        · `op`   = **在做的事**(`"fetch SushiRice"` 这种 `动作 + 目标`)
+        · `need` = **需要是什么** —— 那一步**卡在哪**(没卡就空串)。
+                   源就是 `_op_actionable` 返回的那个 `why`。
+        · `ask`  = **正式求助**(非空才覆盖, 有自己的 TTL, 见 `ASK_TTL`)。
+        """
+        with self._lock:
+            ent = self._status.get(cid) or {}
+            ent["op"] = str(op or "")
+            ent["need"] = str(need or "")
+            # ⚠ `ask` **没传就保留上一条** —— 否则每拍一次普通通报都会把求助抹掉。
+            if ask:
+                ent["ask"] = str(ask)
+                ent["ask_at"] = time.time()
+            ent["at"] = time.time()
+            self._status[cid] = ent
+
+    def mate_status(self, cid: int, ttl: float = 3.0) -> dict:
+        """**只读**: 队友这一拍在干嘛 —— 没有/过期 ⇒ `{}`(当"不知道"处理)。
+
+        ☠ **过期回空, 不回旧值** —— 宁可让调用方当"不知道", 也别拿一条几秒前的
+          旧消息去猜。求助(`ask`)另外按 `ASK_TTL` 单独判。
+        """
+        now = time.time()
+        with self._lock:
+            o = self._status.get(cid)
+            if not o:
+                return {}
+            if now - float(o.get("at", 0.0)) > ttl:
+                return {}
+            out = dict(o)
+            if out.get("ask") and now - float(out.get("ask_at", 0.0)) > ASK_TTL:
+                out["ask"] = ""          # 求助过期 ⇒ 当没喊过
+            return out

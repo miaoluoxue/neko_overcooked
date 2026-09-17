@@ -183,6 +183,78 @@ KEEP_FOCUS_EVERY = float(os.environ.get("NEKO_WATCH_KEEP_FOCUS_EVERY") or 2.0)
 CHILD = (os.environ.get("NEKO_WATCH_CHILD") or "run_engine.py").split()
 
 
+# ---------------------------------------------------------------- 全自动进关
+#
+# 用户 2026-09-17: "**需要做一下自动进关, 在 run_watch.py 里新建一个参数管理全自动化,
+# 包括主界面加入之后, 选择 party 模式, 进入可进入的关卡**"。
+# 逻辑在 `neko/auto_level.py`(**纯模块 + I/O 注入**, 可离线验), 这里只是接线 + 按键。
+#
+# ☠☠ **判据只有 `scene`/`inRound`/`users`** —— 插件报不出"主菜单选中哪个标签页"
+#   (`app.menu` 读的是**游戏内**暂停菜单, 主界面里恒为空串)。所以这是
+#   "**盲发按键 + 看落到哪一屏**", 每一步都打 `[进关] ▶ …`, 卡在哪一眼看得见。
+
+def parse_seq(spec: str):
+    """转发 `auto_level.parse_seq`（补上本机选定的输入后端前缀）。
+
+    ⚠ 做成**模块级函数**是为了让探针能直接喂字符串 —— `AUTO_SEQ` 是 import 时读的
+      环境变量, 探针改不动它(和 `_argv_of` 当初提出来是同一个理由)。
+    """
+    from auto_level import parse_seq as _p
+    return _p(spec, prefix=AUTO_KEY_PREFIX)
+
+
+def norm_seq(seq):
+    """把**裸键序列**补上本机选定的输入后端前缀(`NEKO_WATCH_AUTO_INPUT`)。"""
+    from auto_level import norm_seq as _n
+    return _n(seq, prefix=AUTO_KEY_PREFIX)
+
+
+#: **序列里的裸键走哪条输入** —— `kbd`(默认) / `pad`。
+#:
+#: ☠☠ 用户 2026-09-17: "**那用键盘, 键盘有效**" ⇒ 默认 `kbd`。
+#:   两条路的**代价不一样**, 别随手换:
+#:     · `kbd` —— 走 `SendInput`, **只发给前台窗口** ⇒ 每次发键前必须
+#:       `activate_game()`(见 `do_auto`)。前端 UI 的确认键在键盘上**硬编码是 `Space`**
+#:       (`PlayerInputLookup.cs:482-489`), 所以这条路的键名是 `SPACE`/`D`/`RIGHT`;
+#:     · `pad` —— 走真 InControl 设备, **不看焦点**, 但实测在菜单里**没反应**
+#:       (那个虚拟手柄可能还没被分配给玩家)。
+#: ⚠ `join`(补 P2)**永远是虚拟手柄** —— 那是加入流程唯一的入口, 不受这个开关管。
+AUTO_INPUT = (os.environ.get("NEKO_WATCH_AUTO_INPUT") or "kbd").strip().lower()
+AUTO_KEY_PREFIX = "kbd:" if AUTO_INPUT.startswith("kbd") else "pad:"
+
+
+#: **总开关**(默认 `0` = 关)。开着时: **在大厅里选主题 → 进图**。
+#: ☠ 2026-09-17 起**只管这一半** —— 主界面(加入/切 Party)那一半用户明确不要了,
+#:   见 `auto_level.DEFAULT_SEQ`(想加回来那儿有照抄的原默认值)。
+#: 关着时**逐字退回老行为**(只补 P2, 一个菜单键都不按)。
+AUTO = (os.environ.get("NEKO_WATCH_AUTO") or "0") not in ("0", "", "false", "False")
+#: **大厅"第几次进关 ⇒ 按几下右"**(见 `auto_level.PICK_RIGHTS`)。逗号分隔, 例: `1,2,0`。
+#: 表用完之后在 `0..len-1` 里随机挑。空 = 用默认表。
+#: ⚠ 计数是**看护进程内的第几次进关** —— 看护重启就从头算。
+AUTO_PICK = [int(x) for x in (os.environ.get("NEKO_WATCH_AUTO_PICK") or "").replace(";", ",").split(",")
+             if x.strip().lstrip("-").isdigit()] or None
+#: 每个动作之间等多久(秒)。太短游戏还没反应过来就按下一个, 太长又白等。
+AUTO_GAP = float(os.environ.get("NEKO_WATCH_AUTO_GAP") or 1.5)
+#: 同一阶段**整个序列**最多重来几遍。跑完还不变就停手打警告(别把界面按乱)。
+#: ⚠ 2026-09-17 实机后从 3 降到 **2** —— 有 `AUTO_SETTLE` 之后重来的代价变高了。
+AUTO_TRIES = int(os.environ.get("NEKO_WATCH_AUTO_TRIES") or 2)
+#: ☠☠ **走完一遍序列后, 先等这么久再看"阶段变没变"**(秒)。
+#:
+#: 为什么必须有(实机打回来的): 原来走完一遍就立刻判"没变"⇒重来, 而**中间步骤本来就不
+#: 改变 `scene`**(切标签只是移动光标), 按完之后**游戏还要好几秒才加载完**。实测:
+#:     `[进关] ⚠ screen 阶段按了 3 遍还是没动 —— 停手`
+#:     `[进关] 阶段 → lobby(scene='Lobbies' …)`      ← **紧接着就变了**
+#: ⇒ 那 3 遍里同一个 `A` 被按了 3 次, 而它其实第 1 次就成了。
+AUTO_SETTLE = float(os.environ.get("NEKO_WATCH_AUTO_SETTLE") or 8.0)
+#: 用哪个虚拟手柄(0/1)。与 `join_player` 的默认值一致。
+AUTO_PAD = int(os.environ.get("NEKO_WATCH_AUTO_PAD") or 1)
+#: **换序列**(不用改代码): `NEKO_WATCH_AUTO_SEQ=lobby=A,A`。
+#: 空 = 用 `auto_level.DEFAULT_SEQ`(☠ **2026-09-17 起只含 `lobby`** —— 用户
+#: "主菜单进入的部分不要了"; 想把主界面那半加回来见 `DEFAULT_SEQ` 的注释)。
+#: ⚠ 对着 `[进关] ▶ …` 那几行改配置就行。
+AUTO_SEQ = parse_seq(os.environ.get("NEKO_WATCH_AUTO_SEQ") or "")
+
+
 def _argv_of(child: list, py: str, root: str) -> list:
     """把 `CHILD`(脚本 + 参数)拼成完整的命令行。**空列表 ⇒ 返回空**(调用方报错)。
 
@@ -308,6 +380,10 @@ class Watcher:
         self._wait_menu_logged = False   # "还没进主菜单"只打一次(见 tick 里那段)
         self._started = False       # 这一局启动过引擎没有
         self._last_beat = time.time()
+        #: **全自动进关**(`NEKO_WATCH_AUTO=1` 时由 main 塞进来; 否则 None = 老行为)。
+        self.auto = None
+        #: 进关机器人的按键回调 —— 由 main 注入(看护不自己碰桥)。
+        self.auto_do = None
 
     # ---------------- 单步 ----------------
     def tick(self, st: dict) -> None:
@@ -371,6 +447,14 @@ class Watcher:
                          " —— **先不按 A**, 等着")
             return
         self._wait_menu_logged = False
+        # ☠☠ **全自动进关开着时, 主界面/大厅这一摊交给它**(2026-09-17)。
+        #   为什么**不让老路和新路并存**: 老路是"每趟大厅只按一次 A"(`_pressed`),
+        #   而进关要按**好几个**键(补 P2 → 切 Party → 确认 → 选主题 → 再确认)。
+        #   两条都跑 ⇒ 同一趟里按两遍 A ⇒ 按多了会**引进第三个人**(A 不是 toggle)。
+        #   ⇒ 二选一, 由 `AUTO` 决定。
+        if self.auto is not None:
+            self.auto.tick(st, self.auto_do)
+            return
         if not self._pressed:
             self._pressed = True
             self.join_lobby(st, users)
@@ -565,8 +649,61 @@ def main() -> int:
         log("[看护] " + ("补 P2 这一步完成(跳过或已按, 见上面那行日志)"
                          if ok else "⚠ 补 P2 没做成 —— 见上面原因; 这一趟大厅不再重试"))
 
+    def do_auto(action):
+        """**进关机器人的按键执行** —— 动作语义见 `neko/auto_level.py` 的模块头。
+
+        ☠ `join` 复用**既有那个 `join_lobby`** —— 它身上带着两条不能丢的保护:
+          "读不到玩家名单就**不按**"(猜错会引进第三个人)、"按 A 之前先切前台"。
+          在这儿重写一份就是本仓栽过两次的"同一件事两处各写一份"。
+        """
+        a = str(action or "")
+        if a == "join":
+            _st = get_state()
+            join_lobby(_st, lobby_users_of(_st))
+            return
+        if a == "wait":
+            return
+        if a.startswith("pad:"):
+            # ☠ **走 `vpad`(真 InControl 设备)**: 它不看焦点, 而键盘 `SendInput`
+            #   只发给前台窗口 —— 看护跑起来之后前台经常不是游戏。
+            k = a[4:].strip().lower()
+            b.vpad(AUTO_PAD, connected=1, **{k: 1})
+            time.sleep(0.15)
+            b.vpad(AUTO_PAD, connected=1, **{k: 0})
+            return
+        if a.startswith("kbd:"):
+            # 键盘那条路**必须当场把前台拽回来**(见 `_menu_ctl.py` 的实测)
+            ki.activate_game()
+            time.sleep(0.20)
+            ki.tap(a[4:].strip().upper(), duration=0.10)
+            return
+        log(f"[进关] ⚠ 不认识的动作 {a!r} —— 只有 join / wait / pad:<键> / kbd:<键>")
+
     w = Watcher(get_state=get_state, start_engine=start_engine,
                 stop_engine=stop_engine, join_lobby=join_lobby, log=log)
+    if AUTO:
+        from auto_level import (AutoLevel as _AutoLevel, DEFAULT_SEQ as _DEF_SEQ,
+                                PICK_RIGHTS as _DEF_PICK)
+        # ⚠ `AutoLevel` **自己会归一化**(裸键 → 按 `prefix` 补后端), 所以这里直接喂
+        #   默认序列或用户写的序列都行。
+        w.auto = _AutoLevel(seq=(AUTO_SEQ or _DEF_SEQ),
+                            tries=AUTO_TRIES, gap=AUTO_GAP,
+                            settle=AUTO_SETTLE, prefix=AUTO_KEY_PREFIX, log=log,
+                            pick_rights=AUTO_PICK)
+        w.auto_do = do_auto
+        log(f"[看护] **全自动进关已开** —— **补 P2 → 大厅选主题 → 进图**"
+            f"(⚠ 主界面**只补 P2**, 切标签那一半没开: 用户 2026-09-17 "
+            f"\"主菜单进入的部分不要了\"; 但 `join` **不能删** —— 老路已被 AUTO 挡掉)")
+        log(f"[看护]   序列 = {AUTO_SEQ or norm_seq(_DEF_SEQ)}"
+            f"   裸键走 **{AUTO_INPUT}**(`NEKO_WATCH_AUTO_INPUT`; join 永远走虚拟手柄)")
+        log(f"[看护]   大厅选主题: 第几次进关按几下右 = "
+            f"{AUTO_PICK or list(_DEF_PICK)}(用完在 0..{len(AUTO_PICK or _DEF_PICK) - 1} 里随机)"
+            f"   `NEKO_WATCH_AUTO_PICK`")
+        log(f"[看护]   每步 {AUTO_GAP:.1f}s, 走完一遍等 {AUTO_SETTLE:.0f}s, "
+            f"每阶段最多重来 {AUTO_TRIES} 遍")
+        log(f"[看护]   ⚠ 阶段判据只有 scene/inRound(读不到'选中哪个标签页'), "
+            f"所以是盲发按键 —— 卡住就看 `[进关] ▶ …` 那几行对着改 "
+            f"`NEKO_WATCH_AUTO_SEQ`")
     try:
         w.run()
     except KeyboardInterrupt:
