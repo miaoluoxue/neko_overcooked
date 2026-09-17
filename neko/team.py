@@ -250,6 +250,17 @@ class OrderBoard:
           (别人的盘子不算我的摆盘位)。
         ⚠ 同一个槽位**理论上只该有一条**(W1 绑、W4 解), 但补盘/换台面会短暂留下两条
           ⇒ 这里取**最近碰过的那条**(`at` 最大): 那才是"我正在做的那盘"。
+        ☠☠ **实测更正(2026-09-17 `s_sushi_1_4`): "两条"不是短暂的, 是常驻的。**
+          去订单归属之后两个厨师推进**同一张单**, 而 `bind_plate` 是**以 sid 为键**的
+          (`_plates[sid] = …`) ⇒ 两人各绑一只盘到**同一个槽位**, 实测:
+            `[P1] [盘子] counter14 那盘 → 本单(#-111224:Sushi_Fish)`
+            `[P2] [盘子] counter31 那盘 → 本单(#-111224:Sushi_Fish)`
+          ⇒ 同一张单的料被劈成两半, **两只盘都凑不满**, 谁也交不出去。
+          而下面那行 cid 过滤让**两个厨师互相看不见**(各只看得到自己那条) ——
+          这就是用户说的"**厨师2没有感知**"在代码里的落点。
+          ⇒ 要"一起拼同一只盘"请用 `slot_stations`(复数版, 不看 cid);
+            **本函数的语义保持不变** —— 老调用点与 `runtime/_coop_plate_probe.py:235`
+            的断言都依赖它。
         ☠ **这里刻意不管"过期"** —— 陈旧绑定的清理是**引擎侧**的事(R1 第一层认到空台面
           就 `unbind_plate`, W4 交付成功就解绑)。`team.py` 保持**零配置依赖**:
           它不认识任何 `NEKO_*` 阈值, TTL 一律由调用方传进来。
@@ -267,6 +278,26 @@ class OrderBoard:
                 if _at > best_at:
                     best, best_at = sid, _at
         return best
+
+    def slot_stations(self, slot: str, cid=None) -> list:
+        """**这个槽位名下所有台面** —— `slot_station` 的复数版(给"一槽一盘"用)。
+
+        ☠ 为什么必须有它(`Engine._slot_plate`, 开关 `NEKO_SHARE_PLATE`):
+          `slot_station(slot, cid)` 的 cid 过滤让两个厨师**互相看不见对方那盘**
+          (实测两人各绑一只盘到同一个槽位) ⇒ 同一张单的菜被劈进两只盘,
+          两只都凑不满 ⇒ 谁也交不出去。要"一起拼同一只盘"就得先**看得见**。
+        ⚠ **`slot_station` 一行不改** —— 老调用点 + `runtime/_coop_plate_probe.py:235`
+          的断言("别人查不到")都依赖它; 这只是**多一个入口**, 不是替换。
+        ⚠ 拿不到 ⇒ 返回 `[]`, 调用方退回老路。
+        ⚠ 排序**不在这里做**: 只需要"同一时刻的一致快照"(整段在 `self._lock` 里)。
+          要按"最近碰过"排, 调用方用 `plate_idle(sid)`(越小越近)。
+        """
+        if not slot:
+            return []
+        with self._lock:
+            return [sid for sid, ent in self._plates.items()
+                    if ent.get("slot") == slot
+                    and (cid is None or ent.get("cid") in (None, cid))]
 
     def unbind_slot(self, slot: str, cid) -> int:
         """把这个槽位**名下所有**的台面绑定清掉(只清**归我的**那几条)。返回清了几条。
