@@ -6743,6 +6743,56 @@ class Engine:
         except Exception:                                        # noqa: BLE001
             return -1
 
+    def _mate_trace(self, kind: str, text: str) -> None:
+        """队友通报的**日志指纹** —— 同一个 `kind` 内容没变就不再打。
+
+        ☠☠ **为什么非要有指纹(2026-09-17 交接包 §③)**: 这条通道是**旁路**
+          (只发布、只读、只影响评分权重) ⇒ 它生效时**动作一个字节都不变**。
+          于是"没生效"和"生效了、只是两人本来就没撞车"在日志里**长得完全一样**
+          —— 都是"什么都没发生"。实机 14:51 那局就卡在这儿: 用户问
+          "队友通报到底跑没跑", 日志**一个字都答不上来**。
+          ⇒ 四个 kind 各答一个问题, **少一个就还是分不出来**:
+            · `pub`   —— **我发布出去了**吗(还是开关关着/黑板是 None)
+            · `see`   —— **我读到队友**了吗; 读到的是哪一步
+            · `yield` —— 那一次**真的撞车**了吗(扣分真落到分上了)
+            · `ask`   —— 我喊**求助**了吗
+          `pub` 有而 `see` 一直说"从来没有过" ⇒ **通道只出不进**;
+          `pub`/`see` 都有、两边步骤不同 ⇒ **生效了, 本来就没撞车**。
+
+        ⚠ **只在内容变化时打**: `_mate_penalty` 要**每个候选每一轮**问一次,
+          不比变化就是每秒几百行 —— 把日志淹了反而更看不见。
+        ⚠ 台账用 `getattr` 起手、**不写进 `__init__`**: 离线桩不调 `__init__`(本仓惯例)。
+        """
+        last = getattr(self, "_mate_trace_last", None)
+        if last is None:
+            last = {}
+            try:
+                setattr(self, "_mate_trace_last", last)
+            except Exception:                                    # noqa: BLE001
+                return
+        if last.get(kind) == text:
+            return
+        last[kind] = text
+        try:
+            self.log(text)
+        except Exception:                                        # noqa: BLE001
+            pass
+
+    def _mate_startup_note(self) -> None:
+        """**启动时**把队友通报的开/关说一遍(见 `_mate_trace`)。
+
+        ☠ 为什么必须**单独**说一次、不能等第一次 `_mate_publish`: 关掉时那个方法
+          直接 `return` ⇒ "关了"和"开着但一步都没选出来"在日志里**一模一样**。
+        ☠ 为什么是单独一个方法: `run()` 里那个 `while True` 探针跑不了,
+          拆出来才**能离线钉**(见 `runtime/_matelog_probe.py`)。
+        """
+        if MATE_SYNC:
+            self.log(f"[队友通报] 开 —— {MATE_SYNC_TTL:.1f}s 没刷新算过期(当'不知道'), "
+                     f"撞车扣 {MATE_BUSY_PENALTY:.0f} 分(只扣分, 不拦人); "
+                     f"指纹: ↑我发布 / ↓我读到队友 / ⤵撞车让开")
+        else:
+            self.log("[队友通报] 关(NEKO_MATE_SYNC=0)—— 一个字节都不发布、也不读")
+
     def _mate_doing(self) -> dict:
         """**队友那一拍在干嘛**(黑板上那条通报); 没开/没有/过期 ⇒ `{}`。
 
@@ -6757,21 +6807,54 @@ class Engine:
         if not MATE_SYNC or bd is None:
             return {}
         try:
-            return bd.mate_status(int(self._mate_cid()), MATE_SYNC_TTL) or {}
-        except Exception:                                        # noqa: BLE001
+            m = bd.mate_status(int(self._mate_cid()), MATE_SYNC_TTL) or {}
+        except Exception as e:                                   # noqa: BLE001
+            # ☠ 原来这里是 `except: pass` —— 于是"读通报这条路整个坏了"在日志里
+            #   和"队友没在发布"**长得一样**。那正是最该看见的一行。
+            self._mate_trace("see", f"[队友通报] ✗ 读队友通报出错: {e}")
             return {}
+        op = str(m.get("op") or "")
+        last = getattr(self, "_mate_trace_last", None)
+        if op:
+            tail = (f"  需要={m['need']}" if m.get("need") else "")
+            if m.get("ask"):
+                tail += f"  **求助={m['ask']}**"
+            self._mate_trace("see", f"[队友通报] ↓ 队友: {op}{tail}")
+            if isinstance(last, dict):
+                last["_ever_seen"] = True
+        else:
+            # ☠ **"从来没有过" 和 "过期/被清" 必须分开说** —— 两者的处置完全不同:
+            #   前者是**通道没通**(他没发布 / 不是同一块黑板 / cid 对不上),
+            #   后者是通道**通过**、只是队友这几秒没刷新。
+            #   糊成一句"读不到"就等于把这两个问题又盖回去了 —— 而"到底通没通"
+            #   正是这条指纹要回答的那个问题。
+            ever = bool(isinstance(last, dict) and last.get("_ever_seen"))
+            self._mate_trace("see",
+                             "[队友通报] ↓ 队友: (过期/被清 —— 当'不知道'处理; "
+                             "通道**通过**过)" if ever else
+                             "[队友通报] ↓ 队友: (**从来没有过** —— 通道没通: "
+                             "他没发布? 不是同一块黑板? cid 对不上?)")
+        return m
 
     def _mate_publish(self, op, need: str = "", ask: str = "") -> None:
         """把**我**这一拍在干嘛通报给队友。`ask` 非空 = 正式求助(见 `ASK_TTL`)。"""
         bd = getattr(self, "board", None)          # ⚠ 同 `_mate_doing`: 桩没有 board
         if not MATE_SYNC or bd is None or op is None:
             return
+        line = f"[队友通报] ↑ 我: {op.action} {op.target}"
+        if need:
+            line += f"  需要={need}"
+        if ask:
+            line += f"  **求助={ask}**"
         try:
             bd.publish_status(getattr(self, "cid", 0),
                               op=f"{op.action} {op.target}",
                               need=need, ask=ask)
-        except Exception:                                        # noqa: BLE001
-            pass
+        except Exception as e:                                   # noqa: BLE001
+            # ☠ 原来 `except: pass` 把"发布失败"吞了 ⇒ "没生效"在日志里无声无息。
+            self._mate_trace("pub", f"[队友通报] ✗ 发布失败: {e}  ({line})")
+        else:
+            self._mate_trace("pub", line)
 
     def _mate_ask(self, what: str, need: str = "") -> None:
         """**正式求助**: 我这一步真做不成(连续失败上了冷板凳) ⇒ 喊一声。
@@ -6784,11 +6867,14 @@ class Engine:
         bd = getattr(self, "board", None)          # ⚠ 同 `_mate_doing`: 桩没有 board
         if not MATE_SYNC or bd is None or not what:
             return
+        line = f"[队友通报] ↑ 我(求助): {what}" + (f"  需要={need}" if need else "")
         try:
             bd.publish_status(getattr(self, "cid", 0), op=str(what),
                               need=str(need or ""), ask=str(what))
-        except Exception:                                        # noqa: BLE001
-            pass
+        except Exception as e:                                   # noqa: BLE001
+            self._mate_trace("ask", f"[队友通报] ✗ 求助发布失败: {e}  ({line})")
+        else:
+            self._mate_trace("ask", line)
 
     def _mate_penalty(self, op) -> float:
         """队友**正在做这一步** ⇒ 让开一点(返回要加到**原始分**上的负数, 或 0)。
@@ -6804,6 +6890,11 @@ class Engine:
             return 0.0
         if m["op"] != f"{op.action} {op.target}":
             return 0.0
+        # ★ 指纹: **撞车**。这一行是"让开"真落到分上的唯一证据 ——
+        #   与上面 `↓` 那一行配对看: `↓` 说"我读到队友在做 X"(通道通),
+        #   这一行说"我因为 X 让了"(真生效)。只有 `↓` 没有它 = **生效了但没撞车**。
+        self._mate_trace("yield", f"[队友通报] ⤵ 让开 {op.action} {op.target}"
+                                  f"(队友也在做) —— 扣 {MATE_BUSY_PENALTY:.0f} 分")
         return -MATE_BUSY_PENALTY
 
     def _op_target_for_score(self, km, st, op, x: float, z: float,
@@ -10490,6 +10581,8 @@ class Engine:
 
     def run(self, dry: bool = False):
         self.log("[引擎] 启动, 等对局...")
+        # **队友通报开没开** —— 必须在**启动时**说一次(见 `_mate_startup_note`)。
+        self._mate_startup_note()
         if PLAN_MODE == "on":
             self.log("[引擎] ⚠ NEKO_PLAN=on —— **接管执行还没实现**, 现在仍走评分那条路。"
                      "先用 shadow 看计划对不对。")
