@@ -287,18 +287,6 @@ TOSS_BATCH_MAX = int(float(os.environ.get("NEKO_BATCH") or 3))
 #: ⚠ 和 `IDLE_WAIT` 的分工: 这个管"这一步做不成", 那个管"一件事都做不成"。
 STEP_COOLDOWN = float(os.environ.get("NEKO_STEP_COOLDOWN") or 20.0)
 
-#: **一个厨师同时最多认领几张单** —— 双人时防止一个人把订单栏攬光、另一个饿死。
-#:
-#: 用户 2026-09-16 原话:
-#:   > "N 张单都被队友这种就不应该发生啊, **给队友了做不完怎么办**,
-#:   >  最好就是只领 2 张, 做完再一张一张领。"
-#:
-#: 正常流程下手里只会有一张(`plan()` 认领一张 → `run()` 做完 → 下一轮再领),
-#: 所以这个上限平时**不生效**; 它是**兜底** —— 认领一旦泄漏(订单从栏上消失、
-#: 或 `run()` 里那条 `continue` 跳过释放), 上限能保证另一个厨师**还有单可领**。
-#: `NEKO_CLAIM_MAX` 可调。
-CLAIM_MAX = int(float(os.environ.get("NEKO_CLAIM_MAX") or 2))
-
 #: **"这一支刚试过、不行" 记多久**(秒)。`NEKO_BRANCH_TTL` 可调, `0` = 不记。
 #:
 #: 用户 2026-09-15 定的规矩: "**按一次没有得到对应的结果这条路就失败了, 可以返回到其他路**"。
@@ -559,10 +547,6 @@ class Engine:
         self._plan_force = False
         #: 上一次"为什么没单可做"那句话 —— 只在**变化时**打, 见 `run()` 里那段。
         self._no_order_said = ""
-        #: **我这一轮认领着哪张单** —— 认领的寿命 = "我在做它的时间"(见 `plan()`)。
-        #: 空串 = 手上没有。⚠ 它取代了原来"在 `run()` 末尾释放"的写法, 因为那条路
-        #: 上有两个 `continue` 会跳过释放, 而订单消失时更是永远不放。
-        self._claimed = ""
         #: 风: 已经说过一次"插件没报 wind 字段, 退回几何投影"了没有(那行日志每帧都会想打)。
         self._wind_fb_told = False
         #: 灭火: 已经说过一次"找不到灭火器/在队友手上"没有(主循环每 2 秒调一次灭火)。
@@ -9167,21 +9151,27 @@ class Engine:
         for a in (p.assumptions or [])[:4]:
             self.log(f"[规划]   ⚠ 依赖: {a}")
 
-    @staticmethod
-    def _order_key(o: dict) -> str:
-        """订单的**身份** —— 有 `id` 就用它, 没有才退回名字(老 dll)。
+    def _order_key(self, o: dict) -> str:
+        """订单的**身份** —— 有槽位 `id` 就用它, 没有才退回名字(老 dll)。
 
         ☠☠ **为什么必须有**(2026-09-16 双脚本实机, 用户: "N 张单都被队友这种就不应该
           发生啊"): 同一道菜会在订单栏上**同时挂好几张**(实测 `Sushi_Fish` 一次挂了
           **5 张**), 而 `OrderBoard` 原来**按名字**记归属(`{name: cid}`) ⇒ 5 张单
-          **只占一个槽**:
-            · P1 领了 `Sushi_Fish` ⇒ 槽位归 P1;
-            · P2 想做**另一张** `Sushi_Fish` ⇒ `claim_order` 看到名字被占 ⇒ **永远领不到**
-              ⇒ 整局空转, 而订单栏上 4 张单**没人做**。
-          日志证据: `空转: 2→3→4→5 张单都被队友认领了 ['Sushi_Fish', …]`。
+          **只占一个槽** ⇒ 队友整局领不到单、站了 43 秒。
         `id` 来自订单栏那一格的 widget 实例 id(`OrderCapture.cs`), 稳定、不重号。
         ⚠ 老 dll 没 `id` ⇒ 退回名字 —— **行为与加这个之前逐字相同**。
+
+        ☠ **2026-09-18: 订单认领整个废掉了**(两个厨师合作同一张单) ⇒ 这个键现在只剩
+          **诊断**一个用处(`_no_order_why` 里把订单栏上的单列出来)。
+          ⚠ 但**判据仍然只有一份**: 转发 `team.OrderBoard.key_of`, **别再各写一遍字面**
+            —— 本仓有"两份实现产出不同字符串 ⇒ 永远比不中"的旧账。
         """
+        bd = getattr(self, "board", None)
+        if bd is not None:
+            try:
+                return bd.key_of(o)
+            except Exception:                                      # noqa: BLE001
+                pass
         return str(o.get("id") or o.get("name") or "")
 
     def _no_order_why(self) -> str:
@@ -9194,17 +9184,13 @@ class Engine:
         orders = self.live_orders()
         if not orders:
             return "订单栏是空的"
-        names = [o.get("name") or "?" for o in orders]
-        if self.board is None:
-            # 单人: 有单就一定能领 ⇒ 走到这儿只可能是"菜谱推不出来"
-            return f"有单({names})但推不出菜谱"
-        # ⚠ **按槽位判, 不按名字** —— 同名多单时"按名字判"会把 5 张说成 1 张
-        #   (见 `team.key_of` 的账)。这里数的是"还有几格不是我在做"。
-        taken = [n for o, n in zip(orders, names)
-                 if self.board.owner_of(self.board.key_of(o)) not in (None, self.cid)]
-        if taken:
-            return f"{len(taken)} 张单都被队友认领了 {taken}"
-        return f"有单({names})但认领后仍推不出来(detail 缺?)"
+        # ☠☠ **2026-09-18: "被队友认领"这一档不存在了** —— 订单认领已废(两个厨师
+        #   **合作同一张单**)。所以走到这儿只剩一种可能: **菜谱推不出来**
+        #   (老 dll 的 `detail` 缺 / 这一关的知识表里没有这道菜)。
+        #   ⚠ 原来那句"N 张单都被队友认领了"现在会**误导** —— 它描述的是一个
+        #     已经不存在的状态(2026-09-16 实测过它骗了我一轮)。
+        keys = [self._order_key(o) for o in orders]
+        return f"有单({keys})但推不出菜谱(detail 缺?)"
 
     def _idle_chore(self, km, st) -> bool:
         """**一张单都领不到时, 去干一件杂活** —— 救锅最优先。
@@ -10736,9 +10722,11 @@ class Engine:
     def _plate_type_now(self) -> str:
         """订单要的容器名(Plate)。救锅那条路拿不到 `flow`, 从**订单明细**里现取一个。
 
-        ☠ **绝不能调 `plan()`** —— 它会 `board.claim_order(...)` **顺手占单**,
-          而救锅是"谁的都是救", 在里面占单是纯粹的副作用(而且会改黑板上别人的归属)。
-          `state.details` 里本来就有 `plate`, 直接读。
+        ☠ **别调 `plan()`** —— 那是"领单"那条路(要 `ensure_knowledge` + 把菜谱
+          `derive` 一遍、还会重试), 而这里只要一个容器名 —— 而且救锅是"谁的都是救",
+          没有"哪张单"这回事。`state.details` 里本来就有 `plate`, 直接读。
+          (2026-09-18 之前这里写的理由是"它会顺手占单" —— 订单认领已废, 那条不再成立,
+           但**结论不变**。)
         ⚠ 拿不到就返回空串 —— `_get_plate_for_pot` 那边空串等于"不看类型",
           退回按距离挑(别让它因为读不到类型而**拿不到盘子**)。
         """
@@ -10892,62 +10880,23 @@ class Engine:
 
         取当前挂在订单栏上、剩余时间最少的那张订单 —— 订单是顺序出现的,
         不需要预测, 读它就行。
+
+        ☠☠ **2026-09-18: 不再按订单认领** —— 用户定的形状是"**回到最纯粹的按订单进行
+          递归求解, 一个厨师一单**" + "**两个厨师合作一单**", 所以这里**不调
+          `board.claim_order`**: 两个人算出来的是**同一张单**, 错开一步靠**队友通报**
+          (`_chain_pick` 里"他在做这一步, 我就顺到链上的下一步")。
+
+          为什么废掉认领: 认领是"一个厨师一单"那套**分工**的手段, 而分工会让另一张单
+          没人做; 合作一单时它是纯负担 —— 而且它**只在 `plan()` 这一处生效**, 底下
+          `_execute_scored` 的候选池早就把它绕过去了(那条账见交接包)。
         """
         if self.know is None and not self.ensure_knowledge(st):
             return None
-        orders = self.live_orders()
-        # ☠☠ **先把上一张放掉** —— 认领的寿命 = **"我在做它的时间"**。
-        #
-        # 原来是"在 `run()` 的末尾释放", 而那条路上有**两个 `continue`**
-        # (主流程卡住改做杂活 / 连续失败 3 次上冷板凳) ⇒ 都会**跳过释放**;
-        # 更狠的是**订单从订单栏上消失时**(被别人交了/过期), 这里根本看不见它,
-        # 那个认领就**永远留着**。
-        #
-        # ☠ 认领的**键**现在是"订单栏上的槽位 id"(`team.key_of`), 不再是菜名 ——
-        #   于是"同名新单顶着旧认领⇒队友永远领不到"那条病**已经治了**
-        #   (实测 2026-09-16: 5 张同名的 `Sushi_Fish` 曾经只占一个槽, P2 空转 43 秒)。
-        #
-        # ⚠ **但"每轮先放掉"这条规则仍然要留** —— 它管的是另一件事:
-        #   上一步失败 / 被队友交掉 / 这一单过期之后, 那个槽位不该还记在我名下。
-        #   (`release_order` 只在自己是主时才真删, 蹭不掉队友的认领。)
-        if self.board is not None and self._claimed:
-            # ⚠ 只在**它还在订单栏上**时才放 —— 已经没了的单放不放都一样,
-            #   但 `drop_plan` 顺手清掉, 免得下一张**同名新单**顶着旧计划。
-            self.board.release_order(self._claimed, self.cid)
-            self._claimed = ""
-        # ☠☠ **上限要数"订单栏上实时的归属", 不是"这一轮我领了几张"。**
-        #   后者在 `plan()` 里**永远只会涨到 1**(一轮只领一张) ⇒ `>= CLAIM_MAX`
-        #   恒不成立 ⇒ 那是个**死代码上限**, 兜不住任何泄漏。
-        #   (我第一版就是那么写的, 写完自己复查才看出来。)
-        _held = 0
-        if self.board is not None:
-            for o in orders:
-                if self.board.owner_of(self.board.key_of(o)) == self.cid:
-                    _held += 1
-        for o in orders:
-            name = o["name"]
-            # 双人: **一个槽位**只由一个厨师认领, 否则两人做同一道菜会互相打架
-            # ☠ 键 = `key_of(o)`(槽位 id), **不是 `name`** —— 账见 `team.key_of`:
-            #   按名字认领时 5 张同名单只占一格, 队友整局领不到单。
-            if self.board is not None:
-                _key = self.board.key_of(o)
-                if self.board.owner_of(_key) != self.cid:
-                    # ☠ **别把单都揽了** —— 手上已经有 `CLAIM_MAX` 张就不再抢新的,
-                    #   把机会留给队友。用户 2026-09-16:
-                    #     "N 张单都被队友这种就不应该发生啊, **给队友了做不完怎么办**"
-                    if _held >= CLAIM_MAX:
-                        continue
-                    if not self.board.claim_order(_key, self.cid):
-                        continue
-                    _held += 1
-                self._claimed = _key
-            detail = self.find_detail(st, name)
+        for o in self.live_orders():
+            detail = self.find_detail(st, o["name"])
             if not detail:
-                if self.board is not None:
-                    self.board.release_order(self.board.key_of(o), self.cid)
-                    self._claimed = ""
                 continue
-            return name, float(o.get("t", 1.0)), self._derive_with_retry(detail, st)
+            return o["name"], float(o.get("t", 1.0)), self._derive_with_retry(detail, st)
         return None
 
     # ---------------- 主循环 ----------------
@@ -11214,10 +11163,9 @@ class Engine:
                     time.sleep(0.5)
                     continue
             if self.board is not None:
-                # ⚠ **按槽位放, 不按名字** —— `name` 是菜名, 而认领的键是槽位
-                #   (`team.key_of`); 拿名字放等于**没放掉**, 要等下一轮 `plan()` 才补上。
-                self.board.release_order(self._claimed, self.cid)
-                # ☠ 计划也要清 —— 否则下一局/下一张单会顶着同一个订单名拿到**上一份**计划,
+                # ☠ **订单认领已经废了**(2026-09-18, 两个厨师合作同一张单) ⇒ 这里
+                #   不再有 `release_order`。剩下这一句是**计划**的清理。
+                # ☠ 计划要清 —— 否则下一局/下一张单会顶着同一个订单名拿到**上一份**计划,
                 #   而它的分工是对着旧世界算的(实测最坏: 两边按不同的旧计划各做各的)。
                 self.board.drop_plan(name)
             time.sleep(0.5)

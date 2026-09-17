@@ -1,14 +1,22 @@
-"""双人协同: 订单黑板。
+"""双人协同: 共享黑板。
 
 两个厨师是**两个独立的个体**, 各自跑自己的引擎循环(P1 用 WASD, P2 用方向键),
 但共享一块黑板来避免互相踩踏:
 
-  · 一张订单只由一个厨师认领 —— 否则两人做同一道菜, 材料翻倍、盘子打架
-    ⚠ **"一张订单"= 订单栏上的一个槽位, 不是"一个菜名"** —— 见 `key_of`。
   · 每个厨师占一个自己的组装台面 —— 否则材料会混进同一个容器
   · 每个厨师占一个灶台 —— 否则两人去抢同一个锅
+  · 各自的**队友通报**("我在干嘛") —— 见 `publish_status`
 
-黑板只在内存里, 谁先 claim 谁得。认领会随订单完成/失败释放。
+☠☠ **2026-09-18: 订单认领整个删掉了**(`claim_order`/`owner_of`/`release_order`/
+`orders_of` 与 `_orders` 表)。用户定的形状是"**回到最纯粹的按订单进行递归求解,
+一个厨师一单**" + "**两个厨师合作一单**": 两个人**刻意做同一张单**, 错开一步靠
+队友通报(`Engine._chain_pick`: "他在做这一步, 我就顺到链上的下一步")。
+认领是"一人一张单"那套**分工**的手段, 合作一单时它是纯负担 —— 而且它只在
+`Engine.plan()` 一处生效, 底下的候选池早就绕过它了。
+`key_of` **保留**: 它现在是 `Engine._order_key` 的唯一实现(诊断用), 那份
+"同名多单只占一个槽"的实机账还记在它的 docstring 里。
+
+黑板只在内存里, 谁先 claim 谁得。
 """
 
 from __future__ import annotations
@@ -26,7 +34,6 @@ ASK_TTL = 5.0
 class OrderBoard:
     def __init__(self):
         self._lock = threading.Lock()
-        self._orders = {}      # 订单名 -> cid (认领者)
         self._spots = {}       # cid -> 组装台面 id
         self._stoves = {}      # 灶台 id -> cid
         #: 订单名 -> `(Plan, 发布者 cid, 发布时刻)` —— 见 `publish_plan`。
@@ -48,13 +55,17 @@ class OrderBoard:
 
         ☠☠ **认领必须按"槽位", 不能按菜名**(2026-09-16 双脚本实机打回来的):
           同一道菜会在订单栏上**同时挂好几张**(实测 `Sushi_Fish` 一次挂了 **5 张**),
-          而认领原来按名字记 ⇒ 5 张单**只占一个槽**:
+          而认领原来按名字记(`{name: cid}`) ⇒ 5 张单**只占一个槽**:
             · P1 领了 `Sushi_Fish` ⇒ 这一格归 P1;
-            · P2 想做**另一张** `Sushi_Fish` ⇒ `owner_of('Sushi_Fish')` 是 P1 ⇒
+            · P2 想做**另一张** `Sushi_Fish` ⇒ 按名字查归属仍是 P1 ⇒
               **永远领不到** ⇒ 整局空转, 而订单栏上另外 4 张没人做。
           实测那一局: `[P2] [引擎] 空转: 5 张单都被队友认领了`, P2 站了 **43 秒** ——
           还正好堵在 P1 送餐的必经之路上(那一趟因此判"这一格推不过去"而中止,
           `serve_any` 白跑)。**一个 bug 同时吃掉了 P2 的全部产能和 P1 的一次送餐。**
+
+        ⚠ **认领本身已在 2026-09-18 删掉**(两个厨师改成合作同一张单), 但这个函数
+          **留着**: 它是 `Engine._order_key` 的唯一实现, 而"订单栏上这一格是谁"
+          在诊断里仍然要看(同名多单时按名字判会把 5 张说成 1 张)。
 
         ⇒ 本仓记过的第三条"订单没有 id、只有名字"的账。C# 侧 `OrderCapture` 现在把
           `id` 报出来了 —— 那是订单栏上**这一格的 widget 实例 id**: 交付后那一格空出来
@@ -72,41 +83,12 @@ class OrderBoard:
             return name
         return f"#{i}:{name}"
 
-    def claim_order(self, key: str, cid: int) -> bool:
-        """`key` 用 `key_of(order)` —— **不是菜名**。"""
-        with self._lock:
-            owner = self._orders.get(key)
-            if owner is None or owner == cid:
-                self._orders[key] = cid
-                return True
-            return False
-
-    def owner_of(self, key: str):
-        """**只读**: 这个槽位归谁(没人占 → `None`)。给"为什么没单可做"的诊断用。
-
-        ⚠ 和 `claim_order` 分开是**故意的** —— 诊断**不许顺手占位**
-          (同 `stove_owner` 那条理由: 拿我的 cid 把一张本来没主的单占掉是副作用)。
-        """
-        with self._lock:
-            return self._orders.get(key)
-
-    def release_order(self, key: str, cid: int) -> None:
-        with self._lock:
-            if self._orders.get(key) == cid:
-                del self._orders[key]
-
     def release_all(self, cid: int) -> None:
         with self._lock:
-            for k in [k for k, v in self._orders.items() if v == cid]:
-                del self._orders[k]
             self._spots.pop(cid, None)
             self._status.pop(cid, None)      # 我走了 ⇒ 那条通报也不该留着
             for k in [k for k, v in self._stoves.items() if v == cid]:
                 del self._stoves[k]
-
-    def orders_of(self, cid: int) -> list:
-        with self._lock:
-            return [k for k, v in self._orders.items() if v == cid]
 
     # ---- 台子 ----
     def claim_stove(self, stove_id: str, cid: int) -> bool:
