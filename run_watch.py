@@ -42,12 +42,11 @@
 ```ini
 # 每行 KEY=VALUE; # 开头是注释
 NEKO_WATCH_CHILD=run_team.py --input keys,virtual
-NEKO_PLAN=on
 NEKO_WATCH_KEEP_FOCUS=1
 ```
 
 ☠ **显式设的环境变量优先于这个文件**(走 `setdefault`) —— 临时改一格
-(`set NEKO_PLAN=shadow`) 仍然管用, 不用去动文件。路径可用 `NEKO_WATCH_LOCAL` 换。
+(`set NEKO_WATCH_KEEP_FOCUS=0`) 仍然管用, 不用去动文件。路径可用 `NEKO_WATCH_LOCAL` 换。
 
 环境变量:
   `NEKO_WATCH_KEEP_FOCUS` **持续把游戏拽回前台**(默认 0)。见下面那条。
@@ -91,7 +90,7 @@ def _load_local_config() -> str:
     """**把本机参数本地化** —— 从 `runtime/watch.local` 读 `KEY=VALUE` 填进环境变量。
 
     为什么要它(用户 2026-09-16: "将参数本地化"): 每开一次终端都要 `set` 一串环境变量
-    (`NEKO_WATCH_CHILD=run_team.py --input keys,virtual`、`NEKO_PLAN=on`、焦点策略…),
+    (`NEKO_WATCH_CHILD=run_team.py --input keys,virtual`、`NEKO_WATCH_KEEP_FOCUS=1`、焦点策略…),
     忘一个就跑成另一个配置 —— 而**跑错配置的代价是一整局**。
     ⇒ 写一次在文件里, 以后直接 `python -u run_watch.py`。
 
@@ -99,7 +98,7 @@ def _load_local_config() -> str:
     · 格式: 每行 `KEY=VALUE`, `#` 开头或空行忽略。**值里的 `=` 原样保留**
       (所以 `NEKO_WATCH_CHILD=run_team.py --input virtual` 这种带参数的写法没问题)。
     · ☠ **用 `setdefault`**: 显式设过的环境变量**优先于文件** —— 临时改一格
-      (`set NEKO_PLAN=shadow`) 仍然管用, 不用去动文件。
+      (`set NEKO_WATCH_KEEP_FOCUS=0`) 仍然管用, 不用去动文件。
     · **文件不存在 / 读不动 ⇒ 静默跳过**(它不是必需项; 打一行日志就够)。
     """
     path = os.environ.get("NEKO_WATCH_LOCAL") or os.path.join(_ROOT, "runtime", "watch.local")
@@ -596,8 +595,14 @@ class ChildEngine:
 def main() -> int:
     # ⚠ **必须在任何输出之前**(见 `neko/logfile.py`)。它同时会把解析出来的路径写回
     #   `NEKO_LOG` —— 下面 `ChildEngine` 起的 `run_engine.py` 继承环境变量, 于是
-    #   **父子两个进程写同一个文件**, `[看护]` 和 `[引擎]`/`[规划]` 落在同一份日志里。
-    from logfile import enable
+    #   **父子两个进程写同一个文件**, `[看护]` 和 `[引擎]` 落在同一份日志里。
+    # ☠ **留底这件事由看护来定**(2026-09-18): `logfile` 那边原来"看 `NEKO_PLAN`
+    #   是不是 shadow/on 才默认开", 而规划器整文件删了 ⇒ 那条一失效, 实机那一局
+    #   就**静默没有日志文件**了(验收全靠它)。⇒ 这里显式给一个默认路径。
+    #   ⚠ `setdefault`: 显式设过 `NEKO_LOG`(含 `0` = 关)的**优先**。
+    from logfile import enable, default_path
+    if not (os.environ.get("NEKO_LOG") or "").strip():
+        os.environ["NEKO_LOG"] = default_path()
     enable()
     log = lambda m: print(m, flush=True)                           # noqa: E731
     log(f"[看护] 启动 —— 轮询游戏状态, 缺 P2 就补, 进对局拉起 {CHILD[0]}")

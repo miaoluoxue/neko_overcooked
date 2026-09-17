@@ -16,9 +16,13 @@
 
 开关(环境变量):
   · `NEKO_LOG=<路径>` —— 写到那个文件。`0`/`off`/`no`/`false` = 关。
-  · 不设时: **`NEKO_PLAN` 是 `shadow`/`on` 就默认开**, 落到桌面
-    (`neko-plan-<时间戳>.log`); 否则不开(不打搅)。
+  · 不设时**不开**(不打搅) —— **要留底由调用方自己决定**:
+    `run_watch.py` 会先 `setdefault` 一个桌面路径再 `enable()`(看护跑的那一局
+    一定要留底, 否则实机验收只能靠终端翻页)。
+    ☠ 2026-09-18 之前这里挂的是"`NEKO_PLAN` 是 shadow/on 就默认开" —— 规划器
+    整文件删了, 那个条件失效; 而"要不要留底"本来就不该由**另一个功能**的开关决定。
   · `NEKO_LOG_DIR` —— 换目录(默认桌面)。
+  · `default_path()` —— 上面那个"默认落到哪儿"的唯一实现, 给调用方用。
 
 ## ☠ 两个进程写同一个文件
 
@@ -53,6 +57,18 @@ def _default_dir() -> str:
     return desk if os.path.isdir(desk) else home
 
 
+def default_path() -> str:
+    """**没显式设 `NEKO_LOG` 时该落到哪儿** —— 桌面(或 `NEKO_LOG_DIR`)下带时间戳的
+    一个文件。调用方(`run_watch.py`)拿它去 `setdefault("NEKO_LOG", …)`。
+
+    ☠ 为什么把它做成公开函数: "要不要留底"这件事该由**调用方**决定,
+      而不是由 `logfile` 偷偷看另一个功能的开关(那正是 2026-09-18 删掉的那条
+      `NEKO_PLAN` 条件 —— 规划器一删, 留底就**静默消失**了)。
+    """
+    ts = time.strftime("%m%d-%H%M%S")
+    return os.path.join(_default_dir(), "neko-%s.log" % ts)
+
+
 def _resolve(path: str | None) -> str | None:
     if path:
         return path
@@ -61,10 +77,7 @@ def _resolve(path: str | None) -> str | None:
         if env.lower() in ("0", "off", "no", "false"):
             return None
         return env
-    # 没显式设 ⇒ 只在**影子/接管模式**下默认开(那时才真的需要留底对照)。
-    if (os.environ.get("NEKO_PLAN") or "").strip().lower() in ("shadow", "on"):
-        ts = time.strftime("%m%d-%H%M%S")
-        return os.path.join(_default_dir(), "neko-plan-%s.log" % ts)
+    # 没显式设 ⇒ **不开**。要留底的调用方自己先 setdefault(`run_watch.py` 就是这么做的)。
     return None
 
 

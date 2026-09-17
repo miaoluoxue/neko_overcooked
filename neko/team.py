@@ -36,10 +36,6 @@ class OrderBoard:
         self._lock = threading.Lock()
         self._spots = {}       # cid -> 组装台面 id
         self._stoves = {}      # 灶台 id -> cid
-        #: 订单名 -> `(Plan, 发布者 cid, 发布时刻)` —— 见 `publish_plan`。
-        #: ☠ 只发布**分工**(谁做哪步), **不发布可行性** —— 可行性是执行期每轮重判的
-        #:   (`_feasible`), 世界变了就该变; 把它冻在黑板里等于拿旧世界硬套。
-        self._plans = {}
         #: cid -> `{op, need, ask, ask_at, at}` —— **队友通报**("我在干嘛")。
         #: ☠ 只存**引擎内部**那两样(在做的事 / 需要什么): 位置、手上的东西、
         #:   指向的对象(`pick`/`use`/`placeh`)本来就拿得到(共享的 `World.state()`
@@ -115,37 +111,16 @@ class OrderBoard:
 
     # ---- 计划(递归规划器) ----
     #
-    # 为什么计划必须上黑板(而不是"两个引擎各算一份"):
-    #   `run_team.py` 是两个线程各跑一个 `Engine`, 各读各的帧(`World.state_ttl = 0`
-    #   ⇒ 两个线程读到的帧**天然差一拍**)。联合计划要求两边对"**谁做哪一步**"
-    #   **完全一致** —— 靠"同样的输入算出同样的结果"不可靠。
-    #   ☠ 不一致的代价不是效率, 是**死锁**: "A 等 B 背背包、B 等 A 背背包",
-    #      一局 150 秒直接报废。
-    #
-    # 形状照抄上面那几张表: dict + `Lock`, 谁先 claim 谁得。
-    def publish_plan(self, order: str, plan, cid: int) -> bool:
-        """发布一份计划。**第一个发布的赢** —— 后来者**不覆盖**。
-
-        为什么要"先到先得"而不是"后者覆盖": 覆盖的话两边可能各持一份(各自发布之后
-        又各自读到了不同的时间点), **又分叉了** —— 那就白上黑板了。
-        返回 `True` = 这次是我发布的; `False` = 已经有人发布过了(去读它)。
-        """
-        with self._lock:
-            if order in self._plans:
-                return False
-            self._plans[order] = (plan, cid, time.time())
-            return True
-
-    def get_plan(self, order: str):
-        """读已经发布的那份计划; 没有 ⇒ `None`。"""
-        with self._lock:
-            e = self._plans.get(order)
-            return e[0] if e else None
-
-    def drop_plan(self, order: str) -> None:
-        """订单下架/换关时清掉 —— 否则下一局的计划会顶着上一局的订单名。"""
-        with self._lock:
-            self._plans.pop(order, None)
+    # ☠☠ **2026-09-18: 整块删掉**(`publish_plan`/`get_plan`/`drop_plan` 与 `_plans` 表)。
+    #   用户定的形状是"回到最纯粹的按订单进行递归求解" ⇒ 规划器整文件删除,
+    #   "怎么拆这一单"由 `cookbook.derive()` 那条链回答, 执行层按链顺序走
+    #   (`Engine._execute_chain`)。
+    #   当年为什么计划必须上黑板(留着当账): `run_team.py` 是两个线程各跑一个
+    #   `Engine`, 各读各的帧 ⇒ 两边对"谁做哪一步"必须**完全一致**, 而"同样的输入
+    #   算出同样的结果"不可靠; ☠ 不一致的代价不是效率, 是**死锁**
+    #   ("A 等 B 背背包、B 等 A 背背包"), 一局 150 秒直接报废。
+    #   ⇒ 现在**没有"谁做哪一步"这回事了**(两个厨师合作同一张单, 逐步错开靠队友通报),
+    #     所以这个死锁面连同黑板一起消失。
 
     def pick_spot(self, candidates: list, cid: int, pos: tuple):
         """给厨师挑一个组装台面(尽量不与他人重复), 并记下归属。"""
