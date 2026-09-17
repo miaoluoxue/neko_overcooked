@@ -3949,7 +3949,20 @@ class Engine:
             return False
         _, _, held = self.pos(st)
         self.log(f"[步骤] 去 {mk.id} 搅拌 → {op.target} (站旁边/料放进去后自动开搅)")
-        if not self._approach(km, mk.x, mk.z, tight=0.8):
+        # ☠☠ **`want=` 必须传** —— 和 `op_assemble` 的 `into_bowl` 那一条**同一个坑**
+        #   (见本文件 :5718 那段注释): `_approach` 的 `want` 默认空, 而它的验收是
+        #     `if (not want) or self._aim_ok(st2, want):`(:2217) ⇒ **空即短路**,
+        #   只要旁边有**任何**可交互物就判"到位"。
+        #   实机(2026-09-17 `s_wonderland_1_2`)的后果 —— 搅拌这一步**整条链断在收尾**:
+        #     `[接近] (6.5,0.1) 距 2.05 格, 游戏说可作用: 抓取='' ✓`   ← 2 格开外也算"到位"
+        #     `[步骤] 搅了 10 秒(容器: ['DLC03_utensil_mixer (1)'] → 同一个)`  ← 白等满
+        #     `[虚拟手柄] ⚠ 直调 pickup 失败: 没有可取的目标(站位不对…)`
+        #     `[步骤] ✗ 搅拌好的东西取不回来`
+        #   ⇒ 而 `mix` 的收尾**就是**"空手对着**搅拌器**按交互把它取下来"(用户原话),
+        #     所以判据必须**点名这台搅拌器** —— `_fresh_station_name` 拿的就是
+        #     游戏此刻报的那个名字(`workstation_mixer_01 (N)`)。
+        want_mk = self._fresh_station_name(mk)
+        if not self._approach(km, mk.x, mk.z, tight=0.8, want=want_mk):
             return False
         if held:
             # ☠☠ **到这里手上不该还有东西** —— 料是由前面那些 `into_bowl` 的
