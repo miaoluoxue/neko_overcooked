@@ -151,18 +151,30 @@ class OrderBoard:
     #   硬闸门会让两个人都站着(用户规则 5: **宁可重复, 也别让人站着**)。
     #   (步级占位那一套是**另一条线**, 本版没有, 也别从这儿引。)
     def publish_status(self, cid: int, op: str = "", need: str = "",
-                       ask: str = "") -> None:
+                       ask: str = "", did: str = None, left: int = None) -> None:
         """通报我这一拍在干嘛。**只写我自己那一格**。
 
-        · `op`   = **在做的事**(`"fetch SushiRice"` 这种 `动作 + 目标`)
-        · `need` = **需要是什么** —— 那一步**卡在哪**(没卡就空串)。
-                   源就是 `_op_actionable` 返回的那个 `why`。
-        · `ask`  = **正式求助**(非空才覆盖, 有自己的 TTL, 见 `ASK_TTL`)。
+        用户 2026-09-18 点名的三个问题(两人一张单时"必须互相通信"):
+          ① **我做了啥**  ⇒ `did`  —— 我刚**做完**的那一步(`"fetch Cucumber"`)
+          ② **我打算做啥** ⇒ `op`   —— 我**选中并正在做**的那一步(发布时机就是"选中那一刻",
+                                     所以它同时是"打算"和"在做")
+          ③ **我做完了吗** ⇒ `left` —— 这一单**还剩几步**(`0` = 这单我做完了)
+        加上原有的:
+          · `need` = **需要是什么**(那一步卡在哪, 源是 `_op_actionable` 的 `why`)
+          · `ask`  = **正式求助**(非空才覆盖, 有自己的 TTL, 见 `ASK_TTL`)
+
+        ⚠ **`did`/`left`/`ask` 都是"没传就保留上一条"** —— 一次普通通报不该把求助抹掉,
+          也不该把"我刚做完什么"清成空(那是另一件事的快照)。
+          `op`/`need` 则**每次都覆盖**: 它们描述的是"此刻", 空了就是真的没有。
         """
         with self._lock:
             ent = self._status.get(cid) or {}
             ent["op"] = str(op or "")
             ent["need"] = str(need or "")
+            if did is not None:
+                ent["did"] = str(did or "")
+            if left is not None:
+                ent["left"] = int(left)
             # ⚠ `ask` **没传就保留上一条** —— 否则每拍一次普通通报都会把求助抹掉。
             if ask:
                 ent["ask"] = str(ask)

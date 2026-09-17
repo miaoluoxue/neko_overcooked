@@ -185,6 +185,19 @@ STEP_COOLDOWN = float(os.environ.get("NEKO_STEP_COOLDOWN") or 20.0)
 #: 关掉 = 逐字退回"带子只是能走的一格 + 站位躲着它"的老行为。
 BELT_ON = (os.environ.get("NEKO_BELT") or "1").strip().lower()     not in ("0", "off", "no", "false", "none")
 
+#: **"我打算做这一步, 超过这么多秒还没做成 ⇒ 交给队友试试, 我去做别的"**(秒)。
+#: `NEKO_HANDOFF_WAIT` 可调, `0` = 关掉这条规则。
+#:
+#: 用户 2026-09-18 原话:
+#:   > "两人一个单需要互相通信, 我做了啥, 我打算做啥, 我做完了吗, **如果 8 秒内没有完成
+#:   >  就试试让另一个厨师帮忙完成, 我去做其他**"
+#:
+#: ☠ 触发点是"**我这儿一个候选都没有**"(即将进入 `IDLE_WAIT` 那 20 秒)—— 不是"某一步走了
+#:   8 秒"。横穿厨房的一趟 `fetch` 本来就可能 8 秒以上, 拿它当"没完成"会误报;
+#:   而"链上一个都做不了"是**硬证据**: 我就是卡住了(实机 `s_sushi_*`: P1 攥着一根黄瓜
+#:   干等 20 秒, 既不求助、也不让位、也不腾手)。
+HANDOFF_WAIT = float(os.environ.get("NEKO_HANDOFF_WAIT") or 8.0)
+
 #: **"这一支刚试过、不行" 记多久**(秒)。`NEKO_BRANCH_TTL` 可调, `0` = 不记。
 #:
 #: 用户 2026-09-15 定的规矩: "**按一次没有得到对应的结果这条路就失败了, 可以返回到其他路**"。
@@ -6284,12 +6297,21 @@ class Engine:
                              "他没发布? 不是同一块黑板? cid 对不上?)")
         return m
 
-    def _mate_publish(self, op, need: str = "", ask: str = "") -> None:
-        """把**我**这一拍在干嘛通报给队友。`ask` 非空 = 正式求助(见 `ASK_TTL`)。"""
+    def _mate_publish(self, op, need: str = "", ask: str = "",
+                      did: str = None, left: int = None) -> None:
+        """把**我**这一拍在干嘛通报给队友。`ask` 非空 = 正式求助(见 `ASK_TTL`)。
+
+        `did`(我**刚做完**的那一步)与 `left`(这一单**还剩几步**)是 2026-09-18 按用户
+        点名的三个问题加的 —— 见 `team.OrderBoard.publish_status`。
+        """
         bd = getattr(self, "board", None)          # ⚠ 同 `_mate_doing`: 桩没有 board
         if not MATE_SYNC or bd is None or op is None:
             return
         line = f"[队友通报] ↑ 我: {op.action} {op.target}"
+        if did:
+            line += f"  (刚做完 {did})"
+        if left is not None:
+            line += f"  本单还剩 {left} 步"
         if need:
             line += f"  需要={need}"
         if ask:
@@ -6297,7 +6319,7 @@ class Engine:
         try:
             bd.publish_status(getattr(self, "cid", 0),
                               op=f"{op.action} {op.target}",
-                              need=need, ask=ask)
+                              need=need, ask=ask, did=did, left=left)
         except Exception as e:                                   # noqa: BLE001
             # ☠ 原来 `except: pass` 把"发布失败"吞了 ⇒ "没生效"在日志里无声无息。
             self._mate_trace("pub", f"[队友通报] ✗ 发布失败: {e}  ({line})")
@@ -7256,6 +7278,84 @@ class Engine:
                 return op, r
         return None, None
 
+    def _yield_same_step(self, op) -> bool:
+        """**同一拍两人选中了同一步** ⇒ cid 大的那个让位。返回"我让不让"。
+
+        ☠ 为什么需要: 队友通报是**异步**的 —— "跳过队友正在做的那一步"只在**下一拍**
+          生效, 而两人可能在**同一拍**里各自选中同一步(实测症状: 两人一起跑同一趟
+          `fetch` / 一起挤同一块板)。真正动手之前补一道确定性判据, 把那半拍省下来。
+        ☠ **判据必须是两边都能独立算出的**: 只用共享黑板上的通报 + 各自的 cid。
+          谁 cid 大谁让 ⇒ 两边读到同一批通报 ⇒ **结论一致** ⇒ 只有一个真的去做。
+          (这跟"步级认领"不是一回事: 不写任何占位/锁, 只是把人**这一拍**的选择错开。)
+        ⚠ 让的那个人**多花半拍重选**, 不是白跑一趟; 下一拍他也不会再选中它
+          (那时队友的通报还在, `_chain_pick` 那条"顺到下一步"会接手)。
+        ⚠ 队友**在为这一步求助** ⇒ 我上, 不让(那正是要搭手的时候)。
+        """
+        if not MATE_SYNC or getattr(self, "board", None) is None:
+            return False
+        m = self._mate_doing() or {}
+        if not m or not self._same_step(str(m.get("op") or ""), op):
+            return False
+        if self._mate_asking(m, op):
+            return False
+        try:
+            mine, his = int(self.cid), int(self._mate_cid())
+        except Exception:                                          # noqa: BLE001
+            return False
+        if mine <= his:
+            return False                       # 我 cid 小 ⇒ 我做, 让他让
+        self.log(f"[让位] 两人同一拍都选中了 {op.action} {op.target} —— "
+                 f"我(cid={mine})让, 去选链上别的(免得两人跑同一趟)")
+        return True
+
+    def _handoff_to_mate(self, ops, pending, held: str) -> bool:
+        """**我卡住了 ⇒ 请队友接手这一步, 我去做别的**(用户 2026-09-18 的"8 秒规则")。
+
+        三步, 缺一不可:
+          ① **正式求助**(`_mate_ask`) —— 他看到之后**不会跳过**这一步
+             (`_chain_pick` 里 `mate_ask` ⇒ 不跳, 那句"他在为这一步求助 ⇒ 我做"就是接口);
+          ② **本地上冷板凳** —— 我让位。⚠ 冷板凳是**每个引擎各一份**(`self._step_bench`),
+             **不会连着队友一起挡** —— 这正是"让位"而不是"放弃";
+          ③ **把手上的料放下**(`_drop_held`, 记进我自己的 `_preposed`) —— 腾出手才能
+             "去做别的"(**空手是回退态**, 用户定的不变量); 而且那份料**我下一轮还能捡回来**。
+
+        ☠ 判据"**该做的是哪一步**" = 链上第一个**目标和我手上这份同名**、还没做完的那步
+          (实机: 我攥着 `Cucumber`, 卡住的正是 `chop Cucumber`)。手上空的就退而求其次,
+          报链上第一个还没做完的步骤(让队友知道我在等哪一环)。
+        ⚠ 手上这份链上根本没有(杂活抓来的/别人的料)⇒ 不硬报一个假步骤, 只把料放下。
+        """
+        want = ""
+        try:
+            hn = self._norm(held or "")
+            if hn:
+                for j in pending:
+                    if j < len(ops) and self._norm(getattr(ops[j], "target", "")) == hn:
+                        want = f"{ops[j].action} {ops[j].target}"
+                        break
+            if not want and pending:
+                j0 = pending[0]
+                if j0 < len(ops):
+                    want = f"{ops[j0].action} {ops[j0].target}"
+        except Exception:                                          # noqa: BLE001
+            want = ""
+        if not want and not held:
+            return False
+        if want:
+            self.log(f"[让位] ⏳ 我卡住 {HANDOFF_WAIT:.0f} 秒还没做成 {want}"
+                     f" —— **请队友接手**, 我去做别的")
+            try:
+                self._mate_ask(want, need="我这边做不成这一步")
+            except Exception:                                      # noqa: BLE001
+                pass
+            self.bench_step(want, "卡住 8 秒让给队友")
+        else:
+            self.log(f"[让位] ⏳ 我卡住了, 手上这份({held!r})不在链上 —— 先把它放下")
+        if held:
+            st = self.state(force=True)
+            self._drop_held(st or {}, held)
+            self.log(f"[让位] 把手上的 {held!r} 放到脚下(记进预置, 我下一轮还能捡回来)")
+        return True
+
     def _execute_chain(self, flow: DishFlow, ops: list, retries: int, total: int) -> bool:
         """**按链的顺序做完这一单**(`execute` 的默认执行器, 2026-09-18)。
 
@@ -7332,6 +7432,15 @@ class Engine:
                     self._chain_pick_log(ops, pending, info)
                     self.log(f"[引擎] 现在没有任何可做的动作 —— 先等 {IDLE_WAIT:.0f} 秒再看"
                              f"(`NEKO_IDLE_WAIT=0` 可关掉这个等待)")
+                # ☠☠ **8 秒规则**(用户 2026-09-18): 卡住满 `HANDOFF_WAIT` 秒 ⇒
+                #   请队友接手这一步, **我把料放下去做别的** —— 而不是在这里干等 20 秒。
+                #   ⚠ 只在**这一条路**上触发(一个候选都没有 = 硬证据, 见常量的注释)。
+                if HANDOFF_WAIT > 0 and time.time() - _idle_since >= HANDOFF_WAIT:
+                    _idle_since = time.time()          # 让它每 8 秒重说一次, 不刷屏
+                    try:
+                        self._handoff_to_mate(ops, pending, held)
+                    except Exception as e:                             # noqa: BLE001
+                        self.log(f"[让位] 出错: {e!r}")
                 if time.time() - _idle_since < IDLE_WAIT:
                     self.kb.release_all()
                     time.sleep(1.0)
@@ -7358,7 +7467,16 @@ class Engine:
             _tag = (f"[兜底] {op.action} {op.target}" if is_chore
                     else f"第{i+1}/{total}步 {op.action} {op.target}")
             self.log(f"[引擎] ▶ {_tag}{_chef}")
-            self._mate_publish(op)
+            self._mate_publish(op, did=getattr(self, "_last_did", None), left=len(pending))
+            # ☠☠ **同一拍撞车 ⇒ 让位**(2026-09-18, 用户: "一个厨师做完一单之后开始
+            #   下一个链的时候会冲突"): 通报是异步的, 两人可能在**同一拍**各自选中同一步,
+            #   而"跳过队友在做的那步"要到**下一拍**才生效 —— 那时两人都已经上路了。
+            #   ⇒ 这里补一道**确定性 tie-break**(见 `_yield_same_step`), 在真的动手之前拆开。
+            if not is_chore and self._yield_same_step(op):
+                if i not in pending:
+                    pending.append(i)
+                    pending.sort()
+                continue
             done = False
             self._last_fail_kind = ""
             for attempt in range(1 if is_chore else retries + 1):
@@ -7420,6 +7538,7 @@ class Engine:
                 self.log(f"[引擎] ✗ 这一步没做成: {op.action} {op.target} —— 让位, 先做链上别的")
                 continue
             self.log(f"[引擎] ✓ {op.action} {op.target}")
+            self._last_did = f"{op.action} {op.target}"     # "我做了啥" —— 喂给队友通报
             if not is_chore:
                 _new = self._drop_subsumed_fetches(ops, pending, op)
                 if _new != pending:
