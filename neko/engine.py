@@ -8045,6 +8045,335 @@ class Engine:
         self.log(f"[评分] 决策点 {len(pending)} 个候选{rn}{m}")
         self.log(scoring.table(rows))
 
+    # ------------------------------------------------------------ 链式执行(2026-09-18)
+    #
+    # 用户 2026-09-18 定的形状: **回到"按订单递归求解"** —— 一条链按顺序走, 卡住了才去找
+    # 兜底, 兜底也没有就等。**评分不再决定"先做哪一步"**。
+    #
+    # 为什么退这一步: 叠了评分池 / 杂活池 / 递归规划器 / 前瞻性四层之后, 日志里再也看不出
+    # "它到底在按哪条链做事"; 而底下两个结构性问题(**寻路** / **行为解析**)需要一条
+    # 行为可预测的基线。用户原话: "**回到最纯粹的按订单进行递归求解**"。
+    #
+    # ⚠ 保留的那一半同样是用户点名的: 链走不动时**不许停机**, 要去做别的(兜底 + 冷板凳)。
+    def _chain_pick(self, km, st, flow, ops, pending, cx, cz, held, tm, reach,
+                    mate=None, mate_op: str = "", mate_ask: bool = False):
+        """**链上第一个现在能做的步骤** → `(下标, 可行性字典)`; 一个都不能做 ⇒ `(None, None)`。
+
+        ☠ **顺序 = `pending` 的顺序 = `derive()` 给出的那条链的顺序** —— 这正是"递归求解"
+          四个字: 先做哪一步由**菜谱**决定, 不由分数决定。
+
+        ☠☠ **`steps` 传 `pending` 全集**(不是"剔掉冷板凳/已交出去之后的候选集") ——
+          `_op_actionable` 里那两处"上游还没做完吗"的扫描靠它。拿候选集问, 会把
+          冷板凳上那一步**当成不存在** ⇒ 下游的闸门整个失效(那条实测账见 `_rank_candidates`)。
+
+        ⚠ **严格档全灭 ⇒ 退回放宽档**, 和 `_rank_candidates` 是同一颗保险丝:
+          闸门是用来排序的, 不是用来把活干没的(规则 5)。`_held_is` 认不出名字时,
+          它是唯一的救生圈。
+
+        三种"跳过这一步, 看下一步"的理由(**都不是失败**, 所以不记冷板凳):
+          · `step_benched` —— 刚试过没成, 让位 20 秒(见 `bench_step`);
+          · `handoff_live` —— 已经丢给队友了, 等他(传球那条线);
+          · **队友正在做这一步**(`_mate_doing` 的通报) —— 两个人合作同一张单时靠它错开。
+            ⚠ 但**他在为这一步求助**(`ask`)时不跳 —— 那正是要搭手的信号。
+        """
+        info = {}
+
+        def _scan(strict: bool):
+            for j in pending:
+                info[j] = self._feasible(km, st, ops[j], j, cx, cz, held, tm, reach,
+                                         ops, pending, flow, mate=mate, strict=strict,
+                                         steps=pending)
+
+        def _first():
+            for j in pending:                       # ★ 链的顺序
+                op = ops[j]
+                if self.step_benched(f"{op.action} {op.target}"):
+                    continue
+                if self.handoff_live(op.action, op.target):
+                    continue
+                if mate_op and self._same_step(mate_op, op) and not mate_ask:
+                    if getattr(self, "_chain_mate_said", None) != mate_op:
+                        self._chain_mate_said = mate_op
+                        self.log(f"[链] 队友在做 {mate_op} —— 我顺到链上的下一步")
+                    continue
+                if info[j]["cell"] is not None:
+                    return j, info[j]
+            return None, None
+
+        _scan(True)
+        j, r = _first()
+        if j is None and pending:
+            # 保险丝: 严格档一个都不剩 ⇒ 放宽档(与 `_rank_candidates` 逐字同一条)
+            self.log("[链] ⚠ 严格判据下链上一个候选都不剩 → 退回放宽档(只看手上有东西)")
+            _scan(False)
+            j, r = _first()
+        # ⚠ **`info` 一定要带回去** —— 调用方拿它打"为什么一个都做不了"的逐条理由
+        #   (`_chain_pick_log`); 返回 `None` 会把那条路当场打崩, 而**崩不算报红**。
+        if j is not None:
+            return j, r
+        return None, info
+
+    def _chain_pick_log(self, ops, pending, info) -> None:
+        """一个都挑不出来时**把理由说出来** —— 否则"卡住"和"没事干"在日志里长得一样。"""
+        bits = []
+        for j in pending[:6]:
+            op = ops[j]
+            why = (info.get(j) or {}).get("why") or "站不到(可达性)"
+            bits.append(f"{j+1}.{op.action} {op.target}({why})")
+        if len(pending) > 6:
+            bits.append(f"…共 {len(pending)} 步")
+        self.log("[链] 链上一个都做不了: " + "; ".join(bits))
+
+    def _fallback_pick(self, km, st, flow, ops, pending, cx, cz, held, tm, reach,
+                       mate=None, used=None):
+        """**兜底**: 链上一个可做的都没有时才轮到它们 —— 返回 `(op, 可行性字典)` 或 `(None, None)`。
+
+        ☠ **顺序是写死的优先级, 不再是评分**(用户 2026-09-18 选的"链 + 兜底"):
+          救锅 > 传球 > 回溯 > 杂活(交菜排在最前) > 取菜/备料。
+          理由: 前三个是"**链子本身出问题了**"的修法(锅要糊了 / 这一环我够不着 /
+          上游的料没了), 修不修得好决定这条链还能不能走; 杂活只是"顺便做点别的"。
+        ⚠ 生成器**一个都不改** —— 这一步只换"谁来选", 候选怎么来原样不动。
+        ⚠ `_chore_admitted` 照旧过一遍: `NEKO_CHORES=0` 要能关掉杂活, 而闸门的
+          "菜谱一个可做的都没有"那一档在这里**恒成立**(`flow_ds=[]`) ⇒ 兜底语义
+          天然就是 `stuck` 那一档。
+        """
+        cands = []
+        for fn, args in (
+                (self._rescues, (km, st)),
+                (self._pass_candidates, (km, st, flow, ops, pending, tm, reach)),
+                (self._redos, (km, st, ops, pending, len(ops))),
+                (self._tends, (km, st)) if COOK_LEAVE else (None, None),
+                (self._chore_candidates, (km, st, flow)),
+                (self._preps, (km, st, flow, self._all_flows(st), self._inventory(km, st)))
+                if self.PREP_ON else (None, None),
+        ):
+            if fn is None:
+                continue
+            try:
+                cands += list(fn(*args))
+            except Exception as e:                                     # noqa: BLE001
+                self.log(f"[兜底] 探测出错({getattr(fn, '__name__', '?')}): {e!r}")
+        if not cands:
+            return None, None
+        # 交菜排最前(临门一脚), 其余保持生成顺序 —— 只排一次, 稳定
+        cands.sort(key=lambda o: 0 if getattr(o, "action", "") in ("serve_any",) else 1)
+        for op in cands:
+            if self.step_benched(f"{op.action} {op.target}"):
+                continue
+            # ⚠ 兜底里混着**菜谱 op**(`_redos` 回溯出来的就是链上那几步) ⇒ 能认出它在
+            #   链上第几位就传第几位 —— `_op_actionable` 的 `OP_PREREQ` 扫描靠这个下标
+            #   找"我自己这一份"的上游(传 -1 会让那道闸门整个不设防)。
+            #   ☠ **按身份找, 不能按值找**(`Op` 是 dataclass, 同名单会相等)。
+            _idx = next((k for k in pending if ops[k] is op), -1)
+            try:
+                r = self._feasible(km, st, op, _idx, cx, cz, held, tm, reach,
+                                   ops, pending, flow, mate=mate, strict=True, steps=pending)
+            except Exception:                                          # noqa: BLE001
+                continue
+            if r["cell"] is None:
+                continue
+            d = reach.get(r["cell"]) if r["cell"] is not None else None
+            try:
+                ok, why = self._chore_admitted(op, d, [], used or {})
+            except Exception:                                          # noqa: BLE001
+                ok, why = True, ""
+            if ok:
+                return op, r
+        return None, None
+
+    def _execute_chain(self, flow: DishFlow, ops: list, retries: int, total: int) -> bool:
+        """**按链的顺序做完这一单**(`execute` 的默认执行器, 2026-09-18)。
+
+        与 `_execute_scored` 的关系: **`do_op` 与所有 `op_*` 一行不动**, 换掉的只是
+        "下一步做哪个" —— 从"评分最高的那个"换成"**链上第一个现在能做的**"。
+
+        三个出口(**没有"整单失败"这个出口** —— 用户要求不许停机):
+          · 链上还有能做的 → 做它;
+          · 链上暂时没有、兜底有 → 做兜底(`_fallback_pick`), 冷板凳照记;
+          · 两边都没有 → `IDLE_WAIT` 窗口内**等**(世界会变: 队友动了、锅熟了、路通了),
+            等满才作废这一单, 让 `run()` 重新规划。
+        """
+        pending = list(range(len(ops)))
+        used = {}                           # {杂活键: 本轮做过几次}(闸门用)
+        _idle_since = None
+        _branch_n = 0
+        # **换单就清传递指令台账** —— 判据与 `_execute_scored` 那段**逐字一致**
+        # (见 `HANDOFF_TTL` 的注释: 拿"进了这个函数"当判据会把刚丢出去的活忘掉)。
+        if self._handoff_flow != flow.name:
+            self._handoffs.clear()
+            self._handoff_told.clear()
+            self._handoff_seen.clear()
+            self._handoff_flow = flow.name
+        while pending:
+            self.apply_commands()
+            if self._ctrl_stop:
+                self.kb.release_all()
+                self.log("[控制] ⏹ 收到 stop —— 中止这一单(外层会干净收工)")
+                return False
+            if self._ctrl_paused:
+                self.kb.release_all()
+                if not getattr(self, "_ctrl_paused_told", False):
+                    self._ctrl_paused_told = True
+                    self.log("[控制] ⏸ 暂停 —— 停在**这一步之前**, 下 `resume` 继续")
+                time.sleep(0.3)
+                continue
+
+            st = self.state()
+            if not st or not st.get("inRound"):
+                self.log("[引擎] 对局结束, 中止")
+                return False
+            km = self.map(st)
+            if km is None:
+                time.sleep(0.3)
+                continue
+            try:
+                self._handoff_received(km)
+            except Exception as e:                                     # noqa: BLE001
+                self.log(f"[传球] 查产物出错: {e!r}")
+
+            tm = self.terrain()
+            cx, cz, held = self.pos(st)
+            if cx is None or tm is None or not getattr(tm, "ok", False):
+                time.sleep(0.3)
+                continue
+            mate = self._mate(st)
+            _m = self._mate_doing() or {}
+            reach = tm.distances_from(cx, cz, at_y=self.chef_y(st),
+                                      extra_edges=self._travel_edges(km, tm))
+            i, info = self._chain_pick(km, st, flow, ops, pending, cx, cz, held,
+                                       tm, reach, mate=mate,
+                                       mate_op=str(_m.get("op") or ""),
+                                       mate_ask=bool(_m.get("ask")))
+            is_chore = i is None
+            if i is not None:
+                pick = ops[i]
+            else:
+                pick, _r = self._fallback_pick(km, st, flow, ops, pending, cx, cz,
+                                               held, tm, reach, mate=mate, used=used)
+            if pick is None:
+                # ---- 两边都没有: 等, 不判死 ----
+                if _idle_since is None:
+                    _idle_since = time.time()
+                    self._chain_pick_log(ops, pending, info)
+                    self.log(f"[引擎] 现在没有任何可做的动作 —— 先等 {IDLE_WAIT:.0f} 秒再看"
+                             f"(`NEKO_IDLE_WAIT=0` 可关掉这个等待)")
+                if time.time() - _idle_since < IDLE_WAIT:
+                    self.kb.release_all()
+                    time.sleep(1.0)
+                    continue
+                self._last_fail_step = "chain:没有可做的动作"
+                return False
+            _idle_since = None
+            op = pick
+            if is_chore:
+                k = chore_key(op)
+                used[k] = used.get(k, 0) + 1
+            else:
+                pending = [p for p in pending if p != i]
+            # 订单没了就别再做它的杂活(洗一次盘子能烧 20 秒)
+            if is_chore and not self._order_live(flow.name):
+                self.log(f"[引擎] 订单 {flow.name} 已经不在订单栏上了 —— 这一单都不做了")
+                return True
+            if not is_chore:
+                self._top_up_plate()
+            _st0 = self.state()
+            _c0 = self.pos(_st0) if _st0 else (None, None, "")
+            _chef = (f"  厨师({_c0[0]:.1f},{_c0[1]:.1f}) 手持{_c0[2]!r}"
+                     if _c0[0] is not None else "")
+            _tag = (f"[兜底] {op.action} {op.target}" if is_chore
+                    else f"第{i+1}/{total}步 {op.action} {op.target}")
+            self.log(f"[引擎] ▶ {_tag}{_chef}")
+            self._mate_publish(op)
+            done = False
+            self._last_fail_kind = ""
+            for attempt in range(1 if is_chore else retries + 1):
+                st = self.state()
+                if not st or not st.get("inRound"):
+                    self.log("[引擎] 对局结束, 中止")
+                    return False
+                km = self.map(st)
+                if km is None:
+                    time.sleep(0.3)
+                    continue
+                try:
+                    done = self.do_op(km, st, op, flow, attempt)
+                except Exception as e:
+                    self.log(f"[引擎] {op.action} 异常: {e}")
+                    done = False
+                finally:
+                    self.kb.release_all()
+                if done:
+                    break
+                if self._last_fail_kind == "death":
+                    self.log(f"[引擎] ⚠ 这一步是**摔死**失败 —— 不再原路重试")
+                    break
+                if self._last_fail_kind == KIND_BRANCH:
+                    self.log(f"[引擎] ⚠ 这一步**这一支不行**({op.action} {op.target}) "
+                             f"—— 不原地重试, 换一支重选")
+                    break
+                # ☠ **"放完就走"那一趟**(`KIND_DEFER`): 没做成, 但**也没失败**
+                #   —— 原地重试毫无意义(它就是"还没到点"), 直接去做别的。
+                #   (这一族随前瞻性一起拆, 见计划第 3 笔; 在那之前它还得认。)
+                if self._last_fail_kind == KIND_DEFER:
+                    self.log(f"[引擎] ⏸ {op.action} {op.target} **还没到回来的时候** "
+                             f"—— 不重试, 先去做别的")
+                    break
+                # ⚠ **杂活不重试**(与 `_execute_scored` 同一条): 一次导航最多 25 秒,
+                #   重试三次就是 75 秒, 而它只是兜底 —— 不值得。而且兜底那一路 `i` 是
+                #   `None`, 下面那行带步号的日志会当场崩(**崩不算报红**)。
+                if is_chore:
+                    break
+                self.log(f"[引擎] 第{i+1}步失败, 重试 {attempt+1}/{retries}")
+            if not done:
+                if self._last_fail_kind == KIND_DEFER:
+                    if i not in pending:
+                        pending.append(i)
+                        pending.sort()
+                    self.log(f"[引擎] ⏸ {op.action} {op.target} 先搁着(料在灶上, 到点回来取)"
+                             f" —— 这一轮去做别的")
+                    continue
+                # ☠☠ **失败 ⇒ 一律上冷板凳**(不是只有 `rescue`) —— 2026-09-17 `s_mine_2_6`
+                #   实机打回来的: "本轮不再选它"那句话**撑不过一轮**, 而兜底池每轮重建
+                #   ⇒ 失败的那一步每轮被原样捞回来, 每秒重选一次、连打几十轮。
+                #   ⚠ key 与 `_idle_chore`/`_chain_pick`/`_chore_admitted` **逐字一致**
+                #     (`"{action} {target}"`), 否则冷板凳按下去也没人看。
+                self.bench_step(f"{op.action} {op.target}",
+                                "兜底没做成" if is_chore else "这一步没做成")
+                if is_chore:
+                    self.log(f"[引擎] ⚠ 兜底没做成: {op.action} {op.target} —— 让位")
+                    continue
+                if self._last_fail_kind == KIND_BRANCH and _branch_n < BRANCH_RETRY_MAX:
+                    _branch_n += 1
+                    if i not in pending:
+                        pending.append(i)
+                        pending.sort()
+                    self.log(f"[引擎] ↺ {op.action} {op.target} 放回候选 "
+                             f"({_branch_n}/{BRANCH_RETRY_MAX}) —— 这一支不行, 换一支再选")
+                    continue
+                # ☠☠ **这一步没做成 ≠ 整单作废** —— 这一步上冷板凳(上面那行), 然后
+                #   **顺到链上的下一步**(`continue`)。这正是用户 2026-09-18 要的
+                #   "链 + 兜底": 整单唯一的退出口是"链上一个都做不了 + 兜底也没有 +
+                #   等满 `IDLE_WAIT`"(见上面那段), 不是某一步失败。
+                #   ⚠ 顺不下去时自然会在下一轮落进兜底/等待, 不需要在这里特判。
+                self._last_fail_step = f"{op.action} {op.target}"
+                self.log(f"[引擎] ✗ 这一步没做成: {op.action} {op.target} —— 让位, 先做链上别的")
+                continue
+            self.log(f"[引擎] ✓ {op.action} {op.target}")
+            if not is_chore:
+                _new = self._drop_subsumed_fetches(ops, pending, op)
+                if _new != pending:
+                    self.log(f"[引擎] {op.action} {op.target} 做完了 —— 同名的 fetch 已经多余, 销号")
+                    pending = _new
+            if self._flow_completed_by(op, flow):
+                self.log(f"[引擎] ★ {flow.name} 已经交掉了 —— 这一单收工")
+                return True
+            if self.mode_state is not None and not is_chore:
+                try:
+                    self.mode_state.remember(f"{op.action} {op.target}")
+                except Exception:                                      # noqa: BLE001
+                    pass
+        return True
+
     def _execute_scored(self, flow: DishFlow, ops: list, retries: int, total: int) -> bool:
         """**阶段一 + 阶段二**: 用四项评分挑"下一步做哪个", 而不是按下标顺序走。
 
@@ -9036,10 +9365,14 @@ class Engine:
                 self._wear_backpack(_kmw, _cxw, _czw)
         ops = self._skip_already_on_spot(flow.ops)
         total = len(ops)
-        # **评分接管"选哪个"**(交接包 §4)。`SCORE_DRIVES_MODE=0` 时下面的旧循环逐字不变 ——
-        # 真机验证期留一条"一键退回旧行为"的路(`set NEKO_SCORE=0`), 没有离线测试就只有它兜底。
+        # **执行器: 按链的顺序走**(2026-09-18 用户定的"回到按订单递归求解")。
+        #   `SCORE_DRIVES_MODE=0` 时下面的旧循环逐字不变 —— 真机验证期留一条
+        #   "一键退回旧行为"的路(`set NEKO_SCORE=0`), 没有离线测试就只有它兜底。
+        #   ⚠ 这个开关**原来的含义**是"评分接管选步", 现在评分已经不再决定顺序,
+        #     所以它只剩"新执行器 / 最老的顺序循环"两档(`_execute_scored` 已不被调用,
+        #     随本系列的第三笔一起删)。
         if SCORE_DRIVES_MODE:
-            return self._execute_scored(flow, ops, retries, total)
+            return self._execute_chain(flow, ops, retries, total)
         for i, op in enumerate(ops):
             done = False
             # 摆盘位缺盘子就趁手空补上 —— 见 _top_up_plate() 的注释(一整轮 9 次失败都是它)
