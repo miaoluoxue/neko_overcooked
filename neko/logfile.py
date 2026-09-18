@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""**把日志同时写一份到文件**(默认桌面) —— 控制台照旧, 文件留底。
+"""**把日志同时写一份到文件**(默认仓库的 `runtime/`) —— 控制台照旧, 文件留底。
 
 为什么需要:
   · **控制台刷得太快** —— 一局 150 秒几百行, 影子模式的 `[规划]` 和评分层的
@@ -16,13 +16,14 @@
 
 开关(环境变量):
   · `NEKO_LOG=<路径>` —— 写到那个文件。`0`/`off`/`no`/`false` = 关。
-  · 不设时**不开**(不打搅) —— **要留底由调用方自己决定**:
-    `run_watch.py` 会先 `setdefault` 一个桌面路径再 `enable()`(看护跑的那一局
-    一定要留底, 否则实机验收只能靠终端翻页)。
-    ☠ 2026-09-18 之前这里挂的是"`NEKO_PLAN` 是 shadow/on 就默认开" —— 规划器
-    整文件删了, 那个条件失效; 而"要不要留底"本来就不该由**另一个功能**的开关决定。
-  · `NEKO_LOG_DIR` —— 换目录(默认桌面)。
-  · `default_path()` —— 上面那个"默认落到哪儿"的唯一实现, 给调用方用。
+  · **不设就什么都不写**(用户 2026-09-18: "**默认不输出文件**") —— 只走控制台。
+    要留底就自己设 `NEKO_LOG`, 没有"默认路径"这回事了。
+    ⚠ 演进: 原来挂"`NEKO_PLAN` 是 shadow/on 就默认开"(规划器一删那条就失效) →
+      改成看护 `setdefault` 一个**桌面**路径(往用户桌面上堆日志) → 又改成塞
+      `runtime/` → 现在**连默认都不给**。
+  · `NEKO_LOG_DIR` / `default_path()` —— ⚠ **现在没有任何东西默认调它们**。
+    留着只是给"想要一个落点"的调用方一个现成的、**不会落到用户桌面**的选择
+    (仓库的 `runtime/`, 见 `_default_dir`)。要不要留着由你定。
 
 ## ☠ 两个进程写同一个文件
 
@@ -50,11 +51,15 @@ def _default_dir() -> str:
     d = (os.environ.get("NEKO_LOG_DIR") or "").strip()
     if d:
         return d
-    # 中文 Windows 上桌面文件夹名**仍然是 `Desktop`**(被本地化的是显示名)。
-    # 拿不到就退回用户主目录 —— 宁可放错地方, 也别因为找不到桌面就把日志丢了。
-    home = os.path.expanduser("~")
-    desk = os.path.join(home, "Desktop")
-    return desk if os.path.isdir(desk) else home
+    # ☠ 用户 2026-09-18: "**run_watch 不要写到桌面了**" —— 改落到仓库自己的
+    #   `runtime/`(gitignore)。日志是**本机跑出来的临时产物**, 和 `runtime/watch.local`、
+    #   那些 `_*_probe.py` 是同一类东西: 该待在仓库里, 不该往用户桌面上堆。
+    # ⚠ 桌面是 2026-09-18 **之前**的默认。**已经写在桌面上的老文件不会自己消失**
+    #   (要清就自己去删) —— 这里只保证**不再新增**。
+    # ⚠ 路径按**本文件所在位置**推(`neko/logfile.py` → 仓库根), 不看 cwd ——
+    #   看护是从哪个目录被拉起来的都不影响落点。
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(root, "runtime")
 
 
 def default_path() -> str:

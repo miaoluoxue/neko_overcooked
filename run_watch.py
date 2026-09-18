@@ -593,16 +593,17 @@ class ChildEngine:
 
 
 def main() -> int:
-    # ⚠ **必须在任何输出之前**(见 `neko/logfile.py`)。它同时会把解析出来的路径写回
-    #   `NEKO_LOG` —— 下面 `ChildEngine` 起的 `run_engine.py` 继承环境变量, 于是
+    # ⚠ **必须在任何输出之前**(见 `neko/logfile.py`)。开了之后它会把解析出来的路径
+    #   写回 `NEKO_LOG` —— 下面 `ChildEngine` 起的 `run_engine.py` 继承环境变量, 于是
     #   **父子两个进程写同一个文件**, `[看护]` 和 `[引擎]` 落在同一份日志里。
-    # ☠ **留底这件事由看护来定**(2026-09-18): `logfile` 那边原来"看 `NEKO_PLAN`
-    #   是不是 shadow/on 才默认开", 而规划器整文件删了 ⇒ 那条一失效, 实机那一局
-    #   就**静默没有日志文件**了(验收全靠它)。⇒ 这里显式给一个默认路径。
-    #   ⚠ `setdefault`: 显式设过 `NEKO_LOG`(含 `0` = 关)的**优先**。
-    from logfile import enable, default_path
-    if not (os.environ.get("NEKO_LOG") or "").strip():
-        os.environ["NEKO_LOG"] = default_path()
+    #
+    # ☠☠ **默认不留底**(用户 2026-09-18: "**默认不输出文件**") —— 看护**不再自己凑一个
+    #   默认路径**塞进 `NEKO_LOG`; 只有**显式设过**才写文件, 不设就只走控制台
+    #   (`enable()` 自己在没设时就不开)。
+    #     要留底: `set NEKO_LOG=runtime\neko.log`(`0` = 显式关)。
+    #   ⚠ 老行为是"看护先 `setdefault` 一个**桌面**路径" —— 那会往用户桌面上堆日志;
+    #     中间一度改成塞 `runtime/`, 现在**连默认都不给**了。
+    from logfile import enable
     enable()
     log = lambda m: print(m, flush=True)                           # noqa: E731
     log(f"[看护] 启动 —— 轮询游戏状态, 缺 P2 就补, 进对局拉起 {CHILD[0]}")

@@ -42,7 +42,7 @@ from engine import Engine                # noqa: E402
 from logfile import enable               # noqa: E402
 
 # ⚠ **必须在任何输出之前** —— 它只接管之后的写入(见 `neko/logfile.py`)。
-#   默认写到桌面, 父进程(看护)会把同一个路径
+#   默认写到仓库的 `runtime/`(见 `logfile._default_dir`), 父进程(看护)会把同一个路径
 #   写回 `NEKO_LOG` 让本进程复用, 于是 `[看护]`/`[引擎]`/`[规划]` 落在同一个文件里。
 enable()
 from world import World                  # noqa: E402
