@@ -62,7 +62,7 @@ SMALL_STAND = float(os.environ.get("NEKO_SMALL_STAND") or 0.7)
 #: 失败往往是暂时的(路被队友堵着、背包刚被人捡走又掉回来)。
 PACK_TRY_COOLDOWN = float(os.environ.get("NEKO_PACK_COOLDOWN") or 8.0)
 
-from pathing import dir_for_step
+from pathing import dir_for_step, GRID as GRID_M
 from cookbook import Knowledge, derive, Op, DishFlow
 import scoring
 
@@ -208,6 +208,18 @@ BELT_DASH = (os.environ.get("NEKO_BELT_DASH") or "1").strip().lower() \
     not in ("0", "off", "no", "false", "none")
 #: 两次冲刺之间至少隔多久(秒) —— 冲刺**自带冷却**, 按太勤全是白按(而且会顶掉移动键的那口气)。
 BELT_DASH_EVERY = float(os.environ.get("NEKO_BELT_DASH_EVERY") or 0.7)
+
+#: **端着那盘菜时, 摆盘位离得比这个远(格)就"就近放下"** —— 用户 2026-09-18:
+#: "**取完米之后还是回到原位了, 但是左边和右边又很多位置啊**"。
+#: 粘住摆盘位是为了让"**这盘菜在哪**"有唯一答案(见 `pick_assemble_spot` 的实机账);
+#: 而盘子**就在手上**时换台面 = **把这盘菜一起搬过去**, 只要**同时把 pin 改掉**,
+#: 唯一答案照样成立 ⇒ 没有理由为它横穿厨房。`NEKO_ASSEMBLE_NEAR` 可调。
+ASSEMBLE_NEAR_CELLS = float(os.environ.get("NEKO_ASSEMBLE_NEAR") or 5.0)
+
+#: **冲刺推广到"路远"**(用户 2026-09-18: "**推广一下冲刺, 路途过远就可以使用冲刺加快,
+#: 冲刺会冲大概 3 格**")。判据就是这句话: **剩下的路比一次冲刺还长**就按一下。
+#: `NEKO_DASH_FAR` 可调(格)。
+DASH_FAR_CELLS = float(os.environ.get("NEKO_DASH_FAR") or 3.0)
 
 #: **"这一支刚试过、不行" 记多久**(秒)。`NEKO_BRANCH_TTL` 可调, `0` = 不记。
 #:
@@ -902,7 +914,7 @@ class Engine:
                 #   ⇒ 这就是"**位置补偿**": 净值 = `R·û' + W`, 解出来的摇杆方向让
                 #      **净值**朝目标, 带子把人顺着它自己的方向送的这一段**已经算进去了**。
                 _blt = self._belt_at(tm, x, z)
-                self._belt_dash(_blt)
+                self._move_dash(dist, _blt is not None)
                 if _blt is not None:
                     if _blt != getattr(self, "_belt_told", None):
                         self._belt_told = _blt
@@ -3210,23 +3222,27 @@ class Engine:
             return None
         return w.get(tm.cell_of(x, z))
 
-    def _belt_dash(self, blt) -> bool:
-        """**在传送带上补一个冲刺** —— 返回"这一下按了没有"。
+    def _move_dash(self, dist: float, on_belt: bool) -> bool:
+        """**该按冲刺吗** —— 返回"这一下按了没有"。
 
-        用户 2026-09-18: "**传送带的时候补一个冲刺, 手柄按 b 是冲刺**"。
-        带子把人推着走 / 顶着走(实机 `s_sushi_1_4` 里是 ±2.5 u/s), 冲刺是**短促的加速**
-        —— 在带子上那几秒用它最划算。
+        用户 2026-09-18 两句:
+          > "**传送带的时候补一个冲刺**, 手柄按 b 是冲刺"
+          > "**推广一下冲刺, 路途过远就可以使用冲刺加快, 冲刺会冲大概 3 格**"
 
-        `blt` = `_belt_at` 的返回值(`(vx, vz)` 或 `None`) ⇒ **不在带子上就不按**:
-        平地那一趟由导航自己的节奏管, 别在这儿抢它的按键。
-        节流 `BELT_DASH_EVERY`(默认 0.7s): 冲刺**自带冷却**, 按太勤全是白按。
+        ⇒ 判据就是那第二句: 冲刺约等于 **3 格**的位移 ⇒ **剩下的路比一次冲刺还长**
+          (`dist >= DASH_FAR_CELLS`) 按了就不亏; 近处不按 —— 收尾那几格靠冲刺反而
+          更难对齐(导航在目标附近本来就是小步微调)。
+        ⚠ **在带子上则不论远近都补**: 带子把人推着走/顶着走, 那几秒冲刺最划算。
+        ⚠ 节流 `BELT_DASH_EVERY`(默认 0.7s): 冲刺**自带冷却**, 连按是白按。
         """
-        if not BELT_DASH or blt is None:
+        if not BELT_DASH:
+            return False
+        if not on_belt and dist < DASH_FAR_CELLS * GRID_M:
             return False
         now = time.time()
-        if now - getattr(self, "_belt_dash_at", 0.0) < BELT_DASH_EVERY:
+        if now - getattr(self, "_dash_at", 0.0) < BELT_DASH_EVERY:
             return False
-        self._belt_dash_at = now
+        self._dash_at = now
         try:
             self.kb.dash()
             return True
@@ -5597,6 +5613,28 @@ class Engine:
         if _fresh is not None:
             spot = _fresh
             self.assemble_spot = spot
+        # ★★ **端着"那盘菜"时就近放下, 并把摆盘位改到这儿**(用户 2026-09-18:
+        #    "**取完米之后还是回到原位了, 但是左边和右边又很多位置啊**")。
+        #    ☠ 为什么这样安全: 粘住摆盘位是为了让"**这盘菜在哪**"有唯一答案
+        #      (见 `pick_assemble_spot` 里"同一份材料取了 7 遍"的实机账);
+        #      而盘子**就在我手上**时换台面 = **把这盘菜一起搬过去** —— 只要
+        #      **同时把 pin 也改掉**, 唯一答案照样成立 ⇒ 没有理由为它横穿厨房。
+        #    ⚠ 只在"手里是**有菜的盘子**"时做: 端着**空盘**那一趟(去锅边接菜)不许换
+        #      —— 空盘不承载"这盘菜在哪", 换了会跟原来那盘分家。
+        #    ⚠ 只在原位**确实远**、且近处**确实有空台面**、并且**近至少一格**时才换。
+        if holding_plate and self._held_contents(self.state(force=True)):
+            _pin_d = ((spot.x - x) ** 2 + (spot.z - z) ** 2) ** 0.5
+            if _pin_d >= ASSEMBLE_NEAR_CELLS * GRID_M:
+                _free = self._free_counter(km, x, z)
+                if _free is not None:
+                    _fd = ((_free.x - x) ** 2 + (_free.z - z) ** 2) ** 0.5
+                    if _fd + GRID_M < _pin_d:
+                        self.log(f"[步骤] 端着这盘菜 —— 摆盘位**就近改到 {_free.id}**"
+                                 f"(原来的 {spot.id} 在 {_pin_d:.1f} 格外, 这儿 "
+                                 f"{_fd:.1f} 格): 盘子在我手上, 搬过去就是")
+                        spot = _free
+                        self.assemble_spot = spot
+                        self._assemble_sid = spot.id
         _dry = False        # 走了"干放"那条路吗 —— 见下面收尾处的判据
         if holding_plate:
             self.log(f"[步骤] 手上端着盘子 {held!r} —— 直接放到 {spot.id}(不再另取盘子)")
