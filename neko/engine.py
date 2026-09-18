@@ -221,6 +221,16 @@ ASSEMBLE_NEAR_CELLS = float(os.environ.get("NEKO_ASSEMBLE_NEAR") or 5.0)
 #: `NEKO_DASH_FAR` 可调(格)。
 DASH_FAR_CELLS = float(os.environ.get("NEKO_DASH_FAR") or 3.0)
 
+#: **在一个目的地上最多磨多久, 就该换下一个**(秒) —— 用户 2026-09-18: "**交互不了就换
+#: 目的地的等待时间需要压缩, 压到 3 秒**"。
+#: 管的是这两处的"试多久才认这里不行":
+#:   · `op_chop` 的按刀数循环(一下都没落下去时);
+#:   · `_align_for_place` 的换站位格循环。
+#: ☠ **只有"一下都没落下去"(`landed == 0`)才按时间砍** —— 真在切的那一轮该按刀数跑完,
+#:   砍了等于把切了一半的料丢下(那是"假成功"的反面, 一样坏)。
+#: `NEKO_DEST_TRY` 可调。
+DEST_TRY_SECONDS = float(os.environ.get("NEKO_DEST_TRY") or 3.0)
+
 #: **"这一支刚试过、不行" 记多久**(秒)。`NEKO_BRANCH_TTL` 可调, `0` = 不记。
 #:
 #: 用户 2026-09-15 定的规矩: "**按一次没有得到对应的结果这条路就失败了, 可以返回到其他路**"。
@@ -1946,7 +1956,14 @@ class Engine:
         want = self._fresh_station_name(spot)
         if not want:
             return True                      # 不知道期望名字时只能放行(老 dll)
+        _t_align = time.time()
         for k in range(tries):
+            # ☠ **换站位格也别磨太久**(用户 2026-09-18: 压到 3 秒) —— 到这个点还没对齐
+            #   就认"这块台面这一格不行", 交给上层换目的地(`mark_branch_dead`)。
+            if time.time() - _t_align >= DEST_TRY_SECONDS:
+                self.log(f"[步骤] ⚠ 挪了 {DEST_TRY_SECONDS:.0f} 秒还没对齐 "
+                         f"{getattr(spot, 'id', '?')} —— 换下一个目的地")
+                break
             st = self.state(force=True)
             if not st or not st.get("inRound"):
                 return False
@@ -4303,11 +4320,20 @@ class Engine:
                 time.sleep(0.2)
             landed = 0
             done = False
+            _t_dest = time.time()          # 这一个目的地(这一格)的起算时刻
             for i in range(max_chops + 3):
                 if not self.round_active():
                     return False
                 if _board_workable():
                     landed += 1
+                # ☠ **"按不动"时别把时间烧在一个目的地上** —— 用户 2026-09-18:
+                #   "交互不了就换目的地的等待时间需要压缩, 压到 3 秒"。
+                #   ⚠ **只有一下都没落下去**(`landed == 0`)才砍: 真在切的那一轮该按
+                #     刀数跑完(砍了等于把切了一半的料丢下)。
+                if not landed and time.time() - _t_dest >= DEST_TRY_SECONDS:
+                    self.log(f"[步骤] {board.id} 上 {DEST_TRY_SECONDS:.0f} 秒**一下都没落下去**"
+                             f" —— 不磨了, 换下一个目的地")
+                    break
                 self.kb.chop()
                 time.sleep(0.35)
                 cur = self._board_item(board.id)
