@@ -745,22 +745,49 @@ class KitchenMap:
         if not key:
             return None
         low = key.lower()
-        # 1) 精确: 箱子 prefab 名 或 ing 字段等于目标(或互为子串的基本形式)
-        exact, loose = [], []
+        kn = _norm_name(key)
+        # 1) 精确: 箱子的 `spawn` / `ing`(它**出什么料** —— C# `PickupItemSpawner.m_itemPrefab`)
+        #    归一化后**相等**。
+        #
+        # ☠☠ **"精确"档里原来放的是子串命中, 那等于没有精确档**(2026-09-18 实机
+        #   `s_balloon_1_5` 打回来的): 出 `PastaTomato` 的箱子, `spawn`/`ing` 里必然含
+        #   "pasta" ⇒ `"pastatomato".find("pasta") >= 0` ⇒ **它也进了精确档**; 于是两个
+        #   箱子并列, 谁近选谁。P1 站在 (5.7,-0.4) 时到那个错箱子近 0.3 格 ⇒ 去拿了
+        #   `PastaTomato`; 而同一拍的 P2 只是站位不同就选对了 —— **两个厨师跑同一步却
+        #   分岔**, 表现成"同一个 `fetch Pasta`, 一个拿对了一个拿错了"。拿错的后果不是
+        #   白跑一趟: 后面 `cook Pasta` 拿着生料下锅, 游戏 `placeCanHandle=False` ⇒
+        #   连试 3 次 ⇒ 冷板凳, 整单就在这一步耗掉。
+        #   ⚠ "名字里凑巧含目标词会被误判"这件事, **本函数自己的模糊层注释就警告过**,
+        #     同文件的 `pack_yielding`(见上)也是为同一个坑改成精确比的 —— 判据只有一份。
+        # ⚠ **`s.name` 不参与精确比**: 它分不开 `(1)`/`(2)` —— `_norm_name` 会把
+        #   "DispenserCrate 3 (1)" 的 ` (1)` 和结尾的 ` 3` **一起**剥掉, 两个箱子都
+        #   归一化成 `dispensercrate`。它留在下面 `hay` 里给第 2/3 档用。
+        exact, sub, loose = [], [], []
         for s in self.of("crate"):
             if ok is not None and not ok(s):
                 continue                       # 走不到的货源, 直接不算候选
             hay = (s.spawn + " " + s.ing + " " + s.name)
-            if hay.lower().find(low) >= 0:
+            if kn and (_norm_name(s.spawn) == kn or _norm_name(s.ing) == kn):
                 d = (s.x - x) ** 2 + (s.z - z) ** 2
                 exact.append((d, s))
                 continue
-            # 2) 模糊: 去掉 sushi_ 之类前缀再比
+            # 2) **子串命中 —— 这一档就是原来那个"精确"档**, 只是降到了中间。
+            if hay.lower().find(low) >= 0:
+                d = (s.x - x) ** 2 + (s.z - z) ** 2
+                sub.append((d, s))
+                continue
+            # 3) 模糊(老行为, 判据一个字不改): 去掉 sushi_ 之类前缀再比
             short = low.replace("sushi_", "").replace("sushi", "")
             if short and short in hay.lower():
                 d = (s.x - x) ** 2 + (s.z - z) ** 2
                 loose.append((d, s))
-        best = exact or loose
+        # ☠ **三档的顺序是"老两档"的严格细化, 不是重新排优先级**:
+        #   没有真·精确命中时 `sub or loose` == 老代码的 `exact or loose` ⇒ **逐字退回
+        #   老行为**(这条是验收点, 探针 `runtime/_srcpick_probe.py` 第 [3] 节钉着它)。
+        #   ⚠ 别改成 `exact or loose` 那种两档写法 —— 那样会把第 2 档并进第 3 档, 对
+        #     `sushi_` 这类 `low != short` 的名字会多算进候选, 等于在"没命中精确档"时
+        #     偷偷放宽(探针里那条用例当场红过)。
+        best = exact or sub or loose
         if not best:
             return None
         best.sort(key=lambda t: t[0])
