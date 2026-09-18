@@ -183,7 +183,8 @@ STEP_COOLDOWN = float(os.environ.get("NEKO_STEP_COOLDOWN") or 20.0)
 #:   · **逆流禁边** —— 带速 ≥ 厨师速度时, 逆着它那一步从图里剪掉(`_belt_blocked_edges`)
 #:   · **顺流整段边** —— 沿一条带子走算**一步**(带子替你走, `conveyor_edges(long_ride=)`)
 #: 关掉 = 逐字退回"带子只是能走的一格 + 站位躲着它"的老行为。
-BELT_ON = (os.environ.get("NEKO_BELT") or "1").strip().lower()     not in ("0", "off", "no", "false", "none")
+BELT_ON = (os.environ.get("NEKO_BELT") or "1").strip().lower() \
+    not in ("0", "off", "no", "false", "none")
 
 
 #: **一个厨师同时最多认领几张单** —— 2026-09-18 用户: "**改成一人一单吧**" ⇒ 默认 **1**。
@@ -199,6 +200,14 @@ CLAIM_MAX = int(float(os.environ.get("NEKO_CLAIM_MAX") or 1))
 #: 那是**站位格**不对(游戏把 `m_interactable` 判成 null), 不是这块板不行;
 #: 而料就在这块板上, 把板划掉等于这一单没救。`NEKO_CHOP_CELLS` 可调。
 CHOP_CELL_TRIES = int(float(os.environ.get("NEKO_CHOP_CELLS") or 3))
+
+#: **在传送带上补一个冲刺**(用户 2026-09-18: "**传送带的时候补一个冲刺, 手柄按 b 是冲刺**")。
+#: 带子把人推着走 / 顶着走, 冲刺是**短促的加速** —— 在带子上那几秒用它最划算。
+#: `NEKO_BELT_DASH=0` 一键回退。
+BELT_DASH = (os.environ.get("NEKO_BELT_DASH") or "1").strip().lower() \
+    not in ("0", "off", "no", "false", "none")
+#: 两次冲刺之间至少隔多久(秒) —— 冲刺**自带冷却**, 按太勤全是白按(而且会顶掉移动键的那口气)。
+BELT_DASH_EVERY = float(os.environ.get("NEKO_BELT_DASH_EVERY") or 0.7)
 
 #: **"这一支刚试过、不行" 记多久**(秒)。`NEKO_BRANCH_TTL` 可调, `0` = 不记。
 #:
@@ -893,12 +902,14 @@ class Engine:
                 #   ⇒ 这就是"**位置补偿**": 净值 = `R·û' + W`, 解出来的摇杆方向让
                 #      **净值**朝目标, 带子把人顺着它自己的方向送的这一段**已经算进去了**。
                 _blt = self._belt_at(tm, x, z)
+                self._belt_dash(_blt)
                 if _blt is not None:
                     if _blt != getattr(self, "_belt_told", None):
                         self._belt_told = _blt
                         self.log(f"[带] 脚下是地面传送带 —— 被推 "
                                  f"({_blt[0]:.2f},{_blt[1]:.2f}) u/s "
-                                 f"(厨师 {self.chef_speed(st):.1f}) —— 已并进补偿")
+                                 f"(厨师 {self.chef_speed(st):.1f}) —— 已并进补偿"
+                                 + ("; **顺带补冲刺**(手柄 B)" if BELT_DASH else ""))
                     wnd = _blt if wnd is None else (wnd[0] + _blt[0], wnd[1] + _blt[1])
                 else:
                     self._belt_told = None
@@ -3198,6 +3209,30 @@ class Engine:
         if not w:
             return None
         return w.get(tm.cell_of(x, z))
+
+    def _belt_dash(self, blt) -> bool:
+        """**在传送带上补一个冲刺** —— 返回"这一下按了没有"。
+
+        用户 2026-09-18: "**传送带的时候补一个冲刺, 手柄按 b 是冲刺**"。
+        带子把人推着走 / 顶着走(实机 `s_sushi_1_4` 里是 ±2.5 u/s), 冲刺是**短促的加速**
+        —— 在带子上那几秒用它最划算。
+
+        `blt` = `_belt_at` 的返回值(`(vx, vz)` 或 `None`) ⇒ **不在带子上就不按**:
+        平地那一趟由导航自己的节奏管, 别在这儿抢它的按键。
+        节流 `BELT_DASH_EVERY`(默认 0.7s): 冲刺**自带冷却**, 按太勤全是白按。
+        """
+        if not BELT_DASH or blt is None:
+            return False
+        now = time.time()
+        if now - getattr(self, "_belt_dash_at", 0.0) < BELT_DASH_EVERY:
+            return False
+        self._belt_dash_at = now
+        try:
+            self.kb.dash()
+            return True
+        except Exception as e:                                     # noqa: BLE001
+            self.log(f"[带] 冲刺没按成: {e!r}")
+            return False
 
     def _belt_at(self, tm, x: float, z: float):
         """**脚底下那条地面传送带此刻推人的速度** —— `(vx, vz)`(世界单位/秒)或 None。
