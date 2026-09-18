@@ -8708,6 +8708,16 @@ class Engine:
             self.log(f"[救锅] 找不到刚放下的锅 {pot!r} 在哪张台面上 —— 取菜留到下一轮")
             return True
         plate_type = self._plate_type_now()
+        # ☠☠ **先问一句"锅里还有东西吗", 再去拿盘子**(2026-09-18 实机日志里那一趟白跑):
+        #   P2 走了 **16 格**去端锅 → 放到 counter1 → 又跑去 plates0 拿盘子 → 回来才发现
+        #   **锅已经是空的**(另一个厨师早把菜取走了) ⇒ 那趟拿盘子纯粹白跑。
+        #   判据与 `_take_from_pot` 开头那条**同一份**(`_pot_now(...).busy`) ——
+        #   只是**提前到"动身拿盘子之前"**问。
+        _ck_now = self._pot_now(holder)
+        if _ck_now is not None and not getattr(_ck_now, "busy", False):
+            self.log(f"[救锅] {holder.id} 那口锅**已经是空的**了(菜被别人取走了?) —— "
+                     f"不折腾了: 停火已经达成, 盘子也不去拿了")
+            return True
         if not self._get_plate_for_pot(km2, x, z, plate_type, taking=op.target):
             self.log("[救锅] ⚠ 拿不到干净盘子 —— 锅已在台面上停火, 取菜留到下一轮")
             return True
