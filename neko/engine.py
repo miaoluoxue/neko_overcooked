@@ -4774,7 +4774,20 @@ class Engine:
                 ck = km.cooking_on(s)
                 if ck is None or not ck.is_pot or not ck.inside:
                     continue
-                if want and want not in self._norm(ck.inside):
+                # ☠☠ **按"份"精确比, 不能用子串**(2026-09-18 `s_balloon_1_5` 实机):
+                #   原来写的是 `want not in self._norm(ck.inside)` —— 子串匹配 ⇒
+                #   锅里是 **`PastaTomato`** 时, 搜 **`Pasta`** 也**命中** ⇒
+                #   判成"锅里已经有我要煮的东西了"(`already=True`) ⇒ **跳过"放进去"**
+                #   直接走"取出来", 而手上是料不是盘 ⇒ 连试 3 次全废 ⇒ 冷板凳。
+                #   (日志原样: `hob1 上的锅里已经有 Pasta(接着用它)` 紧接着
+                #    `⚠ 手上有 'PastaTomato' 不是盘子, 没法去锅里取菜`。)
+                #   ⚠ `_held_is` 那边用 `startswith` 是**另一回事**(它处理的是
+                #     `ChoppedX` 这种**同一件东西改名**); 而这里问的是
+                #     "**锅里是不是就是这一份**" ⇒ 同名族里的两个东西必须分得开。
+                _ins = {self._norm(t) for t in
+                        (getattr(ck, "inside", "") or "").replace("+", ",").split(",")
+                        if t.strip()}
+                if want and want not in _ins:
                     continue
                 if self.board is not None:
                     owner = self.board.stove_owner(s.id)
