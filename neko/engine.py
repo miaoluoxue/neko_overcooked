@@ -1391,10 +1391,24 @@ class Engine:
         # ⇒ **"该用哪口锅"不归这条判据管** —— 它归 `_pick_stove` 的
         #   `cook_id ∈ cook_steps`(那条才是游戏拒收的权威判据, 见那边的注释)。
         #   这条只回答"游戏此刻的放置目标是不是**我们选中的那个灶台/那口锅**"。
-        cand = [self._norm(stove.name)]
+        # ☠☠☠ **这里必须比"带实例后缀的全名", 不能过 `_norm`**(2026-09-18 用户:
+        #   "**厨师放到了右边的锅但是在左边的锅等待**")。
+        #   `_norm` 会**剥掉 ` (2)` 这种实例后缀**(它存在的理由是"计划里用的是不带后缀的
+        #   名字") ⇒ **左右两口同名锅归一化之后一模一样** ⇒ 这个守卫等于不存在:
+        #   它说"游戏会放到 hob3 那口锅", 而游戏实际放进了 hob1 那口 ⇒ 我们随后
+        #   **在错的那口锅边等熟** —— 实机 `s_balloon_1_5` 里
+        #   `煮中 utensil_pot_01 (2) Raw 0.0/12.0` 刷了几十行, 就是因为料在**另一口锅**里,
+        #   而这一口一直是空的(`prog` 永远 0)。
+        #   ⚠ 代价: 老 dll / 游戏只报不带后缀的名字时, 这里会**判否** ⇒ **不放**
+        #     (正是本函数的用途: "宁可这一步失败, 也不要放错地方还报成功"), 而且有日志。
+        def _same_name(a: str, b: str) -> bool:
+            """带后缀的**全名**比 —— 大小写/多余空白不敏感, 但 `(1)`/`(2)` **必须分得开**。"""
+            return (" ".join(str(a or "").split()).lower()
+                    == " ".join(str(b or "").split()).lower())
+        cand = [stove.name]
         if want_pot and pot:
-            cand.append(self._norm(pot))
-        return (t in cand), tgt
+            cand.append(pot)
+        return any(_same_name(tgt, c) for c in cand), tgt
 
     def interact(self, kind: str = "pickup", verify_hold_change=True) -> bool:
         # force=True: 这一段的全部意义就是"按键之后世界变了没有", 绝不能用缓存旧帧
