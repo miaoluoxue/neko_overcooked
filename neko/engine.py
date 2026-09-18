@@ -24,7 +24,7 @@ from map_model import (KitchenMap, Station, is_plate, is_pot, is_extinguisher,
                        teleport_edges, conveyor_edges, wind_cells, belt_vel)
 #: 地面传送带的字符。**从 terrain 导进来而不是抄一份** ——
 #: "判定和显示只能有一条规则", 抄一份迟早会漂(这一轮已经栽过好几次)。
-from terrain import CH_TRAVELATOR, EdgeRules
+from terrain import CH_TRAVELATOR, EdgeRules, SOFT_DANGER
 
 #: 选站位时给**传送带格**加的距离惩罚 —— 只是排到所有非传送带格之后,
 #: 不是排除(旁边只有带子时还是得站上去)。取个远大于地图尺寸的数:
@@ -185,18 +185,6 @@ STEP_COOLDOWN = float(os.environ.get("NEKO_STEP_COOLDOWN") or 20.0)
 #: 关掉 = 逐字退回"带子只是能走的一格 + 站位躲着它"的老行为。
 BELT_ON = (os.environ.get("NEKO_BELT") or "1").strip().lower()     not in ("0", "off", "no", "false", "none")
 
-#: **"我打算做这一步, 超过这么多秒还没做成 ⇒ 交给队友试试, 我去做别的"**(秒)。
-#: `NEKO_HANDOFF_WAIT` 可调, `0` = 关掉这条规则。
-#:
-#: 用户 2026-09-18 原话:
-#:   > "两人一个单需要互相通信, 我做了啥, 我打算做啥, 我做完了吗, **如果 8 秒内没有完成
-#:   >  就试试让另一个厨师帮忙完成, 我去做其他**"
-#:
-#: ☠ 触发点是"**我这儿一个候选都没有**"(即将进入 `IDLE_WAIT` 那 20 秒)—— 不是"某一步走了
-#:   8 秒"。横穿厨房的一趟 `fetch` 本来就可能 8 秒以上, 拿它当"没完成"会误报;
-#:   而"链上一个都做不了"是**硬证据**: 我就是卡住了(实机 `s_sushi_*`: P1 攥着一根黄瓜
-#:   干等 20 秒, 既不求助、也不让位、也不腾手)。
-HANDOFF_WAIT = float(os.environ.get("NEKO_HANDOFF_WAIT") or 8.0)
 
 #: **一个厨师同时最多认领几张单** —— 2026-09-18 用户: "**改成一人一单吧**" ⇒ 默认 **1**。
 #:
@@ -205,6 +193,12 @@ HANDOFF_WAIT = float(os.environ.get("NEKO_HANDOFF_WAIT") or 8.0)
 #: 人**反而没活了**。⇒ 回到"一人一单": **一个槽位只由一个厨师认领**(键 = 槽位 id)。
 #: 调成 2 就是老的"最多揽两张", 调大等于不限制。`NEKO_CLAIM_MAX` 可调。
 CLAIM_MAX = int(float(os.environ.get("NEKO_CLAIM_MAX") or 1))
+
+#: **"切不动"时最多换几个站位格**(用户 2026-09-18: "**交互不了就换一个目的地**")。
+#: 依据(实机 `s_sushi_1_4`): 板上有料、`placeh` 也对得上, 可 `use` 打空 20+ 下 ——
+#: 那是**站位格**不对(游戏把 `m_interactable` 判成 null), 不是这块板不行;
+#: 而料就在这块板上, 把板划掉等于这一单没救。`NEKO_CHOP_CELLS` 可调。
+CHOP_CELL_TRIES = int(float(os.environ.get("NEKO_CHOP_CELLS") or 3))
 
 #: **"这一支刚试过、不行" 记多久**(秒)。`NEKO_BRANCH_TTL` 可调, `0` = 不记。
 #:
@@ -984,6 +978,9 @@ class Engine:
                 #   是 3D 体积 ⇒ 重生点/台面边缘很容易被投影成"危险"; 再加上
                 #   `DANGER_CHARS` 把**空洞 V 也算危险**, 这关 832 格里 667 格被判危险。
                 # 处置按规则 2(拿不准就问游戏): **游戏不认为他在危险里 → 信游戏。**
+                # ☠ **顺便把"危险格"那一层证伪掉**(见 `_danger_trust_check`): 他就站在
+                #   这一格上而游戏没弄死他 ⇒ 投影错了 ⇒ 规划也该跟着不信它。
+                self._danger_trust_check(tm, st)
                 if _danger_trust and tm is not None and tm.ok and tm.is_danger_world(x, z):
                     # 先给游戏 0.6 秒 —— 真掉下去的话 `m_bRespawning` 会翻起来(有个短延迟)
                     _t, _fell = time.time(), False
@@ -2006,39 +2003,60 @@ class Engine:
             return False
         if tm is None or not getattr(tm, "ok", False):
             return False
+        # ☠☠ **交互不了就换一个目的地**(用户 2026-09-18)。这里"目的地"是**站位格**:
+        #   板上有料、`placeh` 也对得上, 可 `use` 就是打空(`m_interactable` 是 null)
+        #   ⇒ 那不是"这块板不行", 而是**这一格站得不对**。原来空按一轮之后就把
+        #   **这块板**划掉 25 秒 —— 而料就在这块板上, 划掉它等于这一单没救
+        #   (实机 `s_sushi_1_4`: 一整局的 `chop` 全烧在这儿, 25 下发空按)。
+        #   ⇒ 改成: 空按一轮 ⇒ **换一格再站**(`_approach` 的 `attempt` 就是干这个的)
+        #     再按, 最多换 `CHOP_CELL_TRIES` 格; 全都不行才认"这一支不行"。
         landed = 0
-        for (sx, sz) in cands[:2]:
-            dx, dz = sx - tx, sz - tz
-            d = (dx * dx + dz * dz) ** 0.5
-            if d <= near + 0.05:
-                continue                # 这个候选格本来就在落位圈里, 没可挪的余地
-            ux, uz = dx / d, dz / d
-            for r in (near, near - 0.2, near + 0.2):
-                if r < 0.3 or r >= d:
+        done = False
+        for _k in range(CHOP_CELL_TRIES):
+            if _k:
+                self.log(f"[步骤] ⚠ {board.id} 上按不动 —— **换一个站位格再试**"
+                         f"({_k + 1}/{CHOP_CELL_TRIES})")
+                try:
+                    if not self._approach(km, board.x, board.z, attempt=_k, tight=0.8,
+                                          want=board.name):
+                        continue
+                except Exception as e:                             # noqa: BLE001
+                    self.log(f"[步骤] ⚠ 换站位格出错: {e!r}")
                     continue
-                px, pz = tx + ux * r, tz + uz * r
-                c = tm.cell_of(px, pz)
-                if not tm.inside(*c) or not tm.walkable(*c) or c not in reach:
-                    continue            # 落点踩在障碍/带子格、或过不去 —— 换个半径
-                self.navigate_smart(km, px, pz, tight=0.25)
-                self.face(tx, tz)
-                st2 = self.state(force=True)
-                ax, az, _ = self.pos(st2) if st2 else (None, None, "")
-                if ax is None:
-                    continue
-                landed += 1
-                df = ((tx - ax) ** 2 + (tz - az) ** 2) ** 0.5
-                if self._aim_ok(st2, want):
-                    self.log("[接近] 小物件落位 (%.1f,%.1f) 距 %.2f 格"
-                             "(候选格心在 %.2f 格), 游戏说可作用 ✓"
-                             % (ax, az, df, d))
-                    return True
-                pick, _use = self.interaction_targets(st2)
-                self.log("[接近] 小物件落位 (%.1f,%.1f) 距 %.2f 格, 游戏说: 抓取=%r ✗"
-                         % (ax, az, df, pick))
-                if landed >= 4:
-                    return False        # 试够了, 交回老路(它后面还有"就地微调"兜底)
-        return False
+                time.sleep(0.2)
+            landed = 0
+            for (sx, sz) in cands[:2]:
+                dx, dz = sx - tx, sz - tz
+                d = (dx * dx + dz * dz) ** 0.5
+                if d <= near + 0.05:
+                    continue                # 这个候选格本来就在落位圈里, 没可挪的余地
+                ux, uz = dx / d, dz / d
+                for r in (near, near - 0.2, near + 0.2):
+                    if r < 0.3 or r >= d:
+                        continue
+                    px, pz = tx + ux * r, tz + uz * r
+                    c = tm.cell_of(px, pz)
+                    if not tm.inside(*c) or not tm.walkable(*c) or c not in reach:
+                        continue            # 落点踩在障碍/带子格、或过不去 —— 换个半径
+                    self.navigate_smart(km, px, pz, tight=0.25)
+                    self.face(tx, tz)
+                    st2 = self.state(force=True)
+                    ax, az, _ = self.pos(st2) if st2 else (None, None, "")
+                    if ax is None:
+                        continue
+                    landed += 1
+                    df = ((tx - ax) ** 2 + (tz - az) ** 2) ** 0.5
+                    if self._aim_ok(st2, want):
+                        self.log("[接近] 小物件落位 (%.1f,%.1f) 距 %.2f 格"
+                                 "(候选格心在 %.2f 格), 游戏说可作用 ✓"
+                                 % (ax, az, df, d))
+                        return True
+                    pick, _use = self.interaction_targets(st2)
+                    self.log("[接近] 小物件落位 (%.1f,%.1f) 距 %.2f 格, 游戏说: 抓取=%r ✗"
+                             % (ax, az, df, pick))
+                    if landed >= 4:
+                        return False        # 试够了, 交回老路(它后面还有"就地微调"兜底)
+            return False
 
     def _approach(self, km: KitchenMap, tx: float, tz: float, attempt: int = 0,
                   tight: float = 0.8, want: str = "", near: float = 0.0) -> bool:
@@ -3067,6 +3085,36 @@ class Engine:
         rules = EdgeRules(ed, self._belt_blocked_edges(tm))
         self._travel_cache = (tm, rules)
         return rules
+
+    def _danger_trust_check(self, tm, st) -> None:
+        """**证伪"危险格"那一层** —— 厨师站在被标成危险的格子上, 而游戏**没弄死他**。
+
+        依据(规则 2, 问游戏): `m_bRespawning` / KillPlane 才是权威, 而那一层是
+        **2D 投影 vs 3D 体积**出来的、会大面积误报 ——
+        实测 2026-09-18 `s_sushi_1_4`: 29x25 的图 **危险 536 格 / 可走只有 48 格(74%)**,
+        而两个厨师在上面走来走去。误报的代价**全落在规划上**(见 `terrain.SOFT_DANGER`)。
+        ⇒ 一旦被这样证伪, 就把这张地形翻成"不再相信危险层", **规划/可达/站位一起跟上**。
+
+        ⚠ 判据只用**软危险**(不含火): 火是动态的、看得见, 而且有专门的灭火线 ——
+          "不信投影"不等于"往火里走"。
+        ⚠ 只翻一次(`distrust_danger` 自己保证), 翻了之后这个函数几乎零开销。
+        """
+        if tm is None or not getattr(tm, "ok", False) or not getattr(tm, "danger_trust", True):
+            return
+        cx, cz, _ = self.pos(st or {})
+        if cx is None or self.is_respawning(st):
+            return
+        if not tm.is_danger_world(cx, cz):
+            return
+        i, j = tm.cell_of(cx, cz)
+        if tm.at(i, j) not in SOFT_DANGER:
+            return                       # 火不算(见 docstring)
+        if tm.distrust_danger():
+            self.log(f"[地形] ⚠ **不再相信「危险格」那一层** —— 厨师正站在 "
+                     f"({cx:.1f},{cz:.1f}), 而地图把这一格标成 {tm.at(i, j)!r}, "
+                     f"游戏却没弄死他 ⇒ **投影错了**(实测那种图 74% 的格被标成危险)。"
+                     f"规划/可达/站位从此也认这些格; 想从一开始就不信就设 "
+                     f"`NEKO_TERRAIN_DANGER=0`")
 
     def _belt_blocked_edges(self, tm, r: float = None) -> set:
         """**逆着强传送带走的那一步, 禁掉** —— 用户 2026-09-18 定的"寻路边规则"。
@@ -4181,22 +4229,45 @@ class Engine:
                 self.mark_branch_dead(op.target, board.id, "板是空的")
                 return False
 
+        # ☠☠ **交互不了就换一个目的地**(用户 2026-09-18)。这里"目的地"是**站位格**:
+        #   板上有料、`placeh` 也对得上, 可 `use` 就是打空(`m_interactable` 是 null)
+        #   ⇒ 那不是"这块板不行", 而是**这一格站得不对**。原来空按一轮之后就把
+        #   **这块板**划掉 25 秒 —— 而料就在这块板上, 划掉它等于这一单没救
+        #   (实机 `s_sushi_1_4`: 一整局的 `chop` 全烧在这儿, 20+ 下发空按)。
+        #   ⇒ 改成: 空按一轮 ⇒ **换一格再站**(`_approach` 的 `attempt` 就是干这个的)再按,
+        #     最多换 `CHOP_CELL_TRIES` 格; 全都不行才认"这一支不行"。
         landed = 0
         done = False
-        for i in range(max_chops + 3):
-            if not self.round_active():
-                return False
-            if _board_workable():
-                landed += 1
-            self.kb.chop()
-            time.sleep(0.35)
-            cur = self._board_item(board.id)
-            if base and cur and cur != base:
-                self.log(f"[步骤] 切好了({i+1} 刀): {base} → {cur}")
-                done = True
-                break
-            if not base and landed and i + 1 >= max_chops:
-                done = True   # 读不到板上的名字, 按刀数收工(**但要有回执**)
+        for _k in range(CHOP_CELL_TRIES):
+            if _k:
+                self.log(f"[步骤] ⚠ {board.id} 上按不动 —— **换一个站位格再试**"
+                         f"({_k + 1}/{CHOP_CELL_TRIES})")
+                try:
+                    if not self._approach(km, board.x, board.z, attempt=_k, tight=0.8,
+                                          want=board.name):
+                        continue
+                except Exception as e:                             # noqa: BLE001
+                    self.log(f"[步骤] ⚠ 换站位格出错: {e!r}")
+                    continue
+                time.sleep(0.2)
+            landed = 0
+            done = False
+            for i in range(max_chops + 3):
+                if not self.round_active():
+                    return False
+                if _board_workable():
+                    landed += 1
+                self.kb.chop()
+                time.sleep(0.35)
+                cur = self._board_item(board.id)
+                if base and cur and cur != base:
+                    self.log(f"[步骤] 切好了({i+1} 刀): {base} → {cur}")
+                    done = True
+                    break
+                if not base and landed and i + 1 >= max_chops:
+                    done = True   # 读不到板上的名字, 按刀数收工(**但要有回执**)
+                    break
+            if done:
                 break
         if not done:
             if not landed:
@@ -5537,6 +5608,14 @@ class Engine:
         #   `s_wonderland_1_5`: 期望 `countertop_01 (2)` 却报 `workstation_mixer_01 (2)`)。
         #   这里挪到"游戏说放置目标就是它"为止, 对不上就**不按**。
         if not self._align_for_place(spot):
+            # ☠☠ **交互不了就换一个目的地**(用户 2026-09-18): 站不到"游戏认的那一格"
+            #   ⇒ 把**这块台面划掉**(25 秒), 让下一轮 `pick_assemble_spot` 挑别的台面,
+            #   而不是三次重试都撞同一面墙。
+            #   依据(实机 `s_sushi_1_4`): `挪了 8 次, 游戏仍说放置目标是 (13)(期望 (16))`
+            #   之后连着 3 轮重试**还是那一块 counter27** —— 因为 `assemble_spot` 是
+            #   "整局粘住"的, 不划掉它就永远挑回同一块(见 `mark_branch_dead` 的用法)。
+            #   ⚠ 全被划掉时 `pick_assemble_spot` 会退回"不过滤的那份"(宁可挤也别没有)。
+            self.mark_branch_dead(PLACE_SENTINEL, spot.id, "站不到游戏认的放置位")
             return False
         # 手上端着盘子放到"已经有盘子"的台面 → 游戏做的其实是**两盘合并**:
         # ServerPlate.TransferToContainer → CombineWithContents, 然后把**自己清空**
@@ -7205,7 +7284,7 @@ class Engine:
     #
     # ⚠ 保留的那一半同样是用户点名的: 链走不动时**不许停机**, 要去做别的(兜底 + 冷板凳)。
     def _chain_pick(self, km, st, flow, ops, pending, cx, cz, held, tm, reach,
-                    mate=None, mate_op: str = "", mate_ask: bool = False):
+                    mate=None):
         """**链上第一个现在能做的步骤** → `(下标, 可行性字典)`; 一个都不能做 ⇒ `(None, None)`。
 
         ☠ **顺序 = `pending` 的顺序 = `derive()` 给出的那条链的顺序** —— 这正是"递归求解"
@@ -7219,11 +7298,14 @@ class Engine:
           闸门是用来排序的, 不是用来把活干没的(规则 5)。`_held_is` 认不出名字时,
           它是唯一的救生圈。
 
-        三种"跳过这一步, 看下一步"的理由(**都不是失败**, 所以不记冷板凳):
+        两种"跳过这一步, 看下一步"的理由(**都不是失败**, 所以不记冷板凳):
           · `step_benched` —— 刚试过没成, 让位 20 秒(见 `bench_step`);
-          · `handoff_live` —— 已经丢给队友了, 等他(传球那条线);
-          · **队友正在做这一步**(`_mate_doing` 的通报) —— 两个人合作同一张单时靠它错开。
-            ⚠ 但**他在为这一步求助**(`ask`)时不跳 —— 那正是要搭手的信号。
+          · `handoff_live` —— 已经丢给队友了, 等他(传球那条线)。
+
+        ☠☠ **2026-09-18 用户: "主要是一人一单, 就不需要给对方负责和通信了"** ——
+          所以这里**不再看队友在做什么**(原来那条"他在做这一步 ⇒ 我顺到下一步"删掉了):
+          一人一单时两人各做各的链, 盯着对方只会**互相让到没人干活**(实机打回来过)。
+          队友通报那条通道**还在**(纯遥测, 见 `_mate_publish`), 只是不再参与决策。
         """
         info = {}
 
@@ -7239,11 +7321,6 @@ class Engine:
                 if self.step_benched(f"{op.action} {op.target}"):
                     continue
                 if self.handoff_live(op.action, op.target):
-                    continue
-                if mate_op and self._same_step(mate_op, op) and not mate_ask:
-                    if getattr(self, "_chain_mate_said", None) != mate_op:
-                        self._chain_mate_said = mate_op
-                        self.log(f"[链] 队友在做 {mate_op} —— 我顺到链上的下一步")
                     continue
                 if info[j]["cell"] is not None:
                     return j, info[j]
@@ -7337,84 +7414,6 @@ class Engine:
                 return op, r
         return None, None
 
-    def _yield_same_step(self, op) -> bool:
-        """**同一拍两人选中了同一步** ⇒ cid 大的那个让位。返回"我让不让"。
-
-        ☠ 为什么需要: 队友通报是**异步**的 —— "跳过队友正在做的那一步"只在**下一拍**
-          生效, 而两人可能在**同一拍**里各自选中同一步(实测症状: 两人一起跑同一趟
-          `fetch` / 一起挤同一块板)。真正动手之前补一道确定性判据, 把那半拍省下来。
-        ☠ **判据必须是两边都能独立算出的**: 只用共享黑板上的通报 + 各自的 cid。
-          谁 cid 大谁让 ⇒ 两边读到同一批通报 ⇒ **结论一致** ⇒ 只有一个真的去做。
-          (这跟"步级认领"不是一回事: 不写任何占位/锁, 只是把人**这一拍**的选择错开。)
-        ⚠ 让的那个人**多花半拍重选**, 不是白跑一趟; 下一拍他也不会再选中它
-          (那时队友的通报还在, `_chain_pick` 那条"顺到下一步"会接手)。
-        ⚠ 队友**在为这一步求助** ⇒ 我上, 不让(那正是要搭手的时候)。
-        """
-        if not MATE_SYNC or getattr(self, "board", None) is None:
-            return False
-        m = self._mate_doing() or {}
-        if not m or not self._same_step(str(m.get("op") or ""), op):
-            return False
-        if self._mate_asking(m, op):
-            return False
-        try:
-            mine, his = int(self.cid), int(self._mate_cid())
-        except Exception:                                          # noqa: BLE001
-            return False
-        if mine <= his:
-            return False                       # 我 cid 小 ⇒ 我做, 让他让
-        self.log(f"[让位] 两人同一拍都选中了 {op.action} {op.target} —— "
-                 f"我(cid={mine})让, 去选链上别的(免得两人跑同一趟)")
-        return True
-
-    def _handoff_to_mate(self, ops, pending, held: str) -> bool:
-        """**我卡住了 ⇒ 请队友接手这一步, 我去做别的**(用户 2026-09-18 的"8 秒规则")。
-
-        三步, 缺一不可:
-          ① **正式求助**(`_mate_ask`) —— 他看到之后**不会跳过**这一步
-             (`_chain_pick` 里 `mate_ask` ⇒ 不跳, 那句"他在为这一步求助 ⇒ 我做"就是接口);
-          ② **本地上冷板凳** —— 我让位。⚠ 冷板凳是**每个引擎各一份**(`self._step_bench`),
-             **不会连着队友一起挡** —— 这正是"让位"而不是"放弃";
-          ③ **把手上的料放下**(`_drop_held`, 记进我自己的 `_preposed`) —— 腾出手才能
-             "去做别的"(**空手是回退态**, 用户定的不变量); 而且那份料**我下一轮还能捡回来**。
-
-        ☠ 判据"**该做的是哪一步**" = 链上第一个**目标和我手上这份同名**、还没做完的那步
-          (实机: 我攥着 `Cucumber`, 卡住的正是 `chop Cucumber`)。手上空的就退而求其次,
-          报链上第一个还没做完的步骤(让队友知道我在等哪一环)。
-        ⚠ 手上这份链上根本没有(杂活抓来的/别人的料)⇒ 不硬报一个假步骤, 只把料放下。
-        """
-        want = ""
-        try:
-            hn = self._norm(held or "")
-            if hn:
-                for j in pending:
-                    if j < len(ops) and self._norm(getattr(ops[j], "target", "")) == hn:
-                        want = f"{ops[j].action} {ops[j].target}"
-                        break
-            if not want and pending:
-                j0 = pending[0]
-                if j0 < len(ops):
-                    want = f"{ops[j0].action} {ops[j0].target}"
-        except Exception:                                          # noqa: BLE001
-            want = ""
-        if not want and not held:
-            return False
-        if want:
-            self.log(f"[让位] ⏳ 我卡住 {HANDOFF_WAIT:.0f} 秒还没做成 {want}"
-                     f" —— **请队友接手**, 我去做别的")
-            try:
-                self._mate_ask(want, need="我这边做不成这一步")
-            except Exception:                                      # noqa: BLE001
-                pass
-            self.bench_step(want, "卡住 8 秒让给队友")
-        else:
-            self.log(f"[让位] ⏳ 我卡住了, 手上这份({held!r})不在链上 —— 先把它放下")
-        if held:
-            st = self.state(force=True)
-            self._drop_held(st or {}, held)
-            self.log(f"[让位] 把手上的 {held!r} 放到脚下(记进预置, 我下一轮还能捡回来)")
-        return True
-
     def _execute_chain(self, flow: DishFlow, ops: list, retries: int, total: int) -> bool:
         """**按链的顺序做完这一单**(`execute` 的默认执行器, 2026-09-18)。
 
@@ -7475,9 +7474,7 @@ class Engine:
             reach = tm.distances_from(cx, cz, at_y=self.chef_y(st),
                                       extra_edges=self._travel_edges(km, tm))
             i, info = self._chain_pick(km, st, flow, ops, pending, cx, cz, held,
-                                       tm, reach, mate=mate,
-                                       mate_op=str(_m.get("op") or ""),
-                                       mate_ask=bool(_m.get("ask")))
+                                       tm, reach, mate=mate)
             is_chore = i is None
             if i is not None:
                 pick = ops[i]
@@ -7491,15 +7488,6 @@ class Engine:
                     self._chain_pick_log(ops, pending, info)
                     self.log(f"[引擎] 现在没有任何可做的动作 —— 先等 {IDLE_WAIT:.0f} 秒再看"
                              f"(`NEKO_IDLE_WAIT=0` 可关掉这个等待)")
-                # ☠☠ **8 秒规则**(用户 2026-09-18): 卡住满 `HANDOFF_WAIT` 秒 ⇒
-                #   请队友接手这一步, **我把料放下去做别的** —— 而不是在这里干等 20 秒。
-                #   ⚠ 只在**这一条路**上触发(一个候选都没有 = 硬证据, 见常量的注释)。
-                if HANDOFF_WAIT > 0 and time.time() - _idle_since >= HANDOFF_WAIT:
-                    _idle_since = time.time()          # 让它每 8 秒重说一次, 不刷屏
-                    try:
-                        self._handoff_to_mate(ops, pending, held)
-                    except Exception as e:                             # noqa: BLE001
-                        self.log(f"[让位] 出错: {e!r}")
                 if time.time() - _idle_since < IDLE_WAIT:
                     self.kb.release_all()
                     time.sleep(1.0)
@@ -7527,15 +7515,6 @@ class Engine:
                     else f"第{i+1}/{total}步 {op.action} {op.target}")
             self.log(f"[引擎] ▶ {_tag}{_chef}")
             self._mate_publish(op, did=getattr(self, "_last_did", None), left=len(pending))
-            # ☠☠ **同一拍撞车 ⇒ 让位**(2026-09-18, 用户: "一个厨师做完一单之后开始
-            #   下一个链的时候会冲突"): 通报是异步的, 两人可能在**同一拍**各自选中同一步,
-            #   而"跳过队友在做的那步"要到**下一拍**才生效 —— 那时两人都已经上路了。
-            #   ⇒ 这里补一道**确定性 tie-break**(见 `_yield_same_step`), 在真的动手之前拆开。
-            if not is_chore and self._yield_same_step(op):
-                if i not in pending:
-                    pending.append(i)
-                    pending.sort()
-                continue
             done = False
             self._last_fail_kind = ""
             for attempt in range(1 if is_chore else retries + 1):
@@ -9215,6 +9194,13 @@ class Engine:
             if km is None:
                 time.sleep(0.5)
                 continue
+            # ⚠ 每轮顺手证伪一次"危险格"那一层 —— 厨师正站在被标成危险的格子上
+            #   而游戏没弄死他(见 `_danger_trust_check`)。放在这里是因为**不导航的那些轮**
+            #   (取料/等锅/发呆)同样能抓到证据, 而误报的代价全在规划那一侧。
+            try:
+                self._danger_trust_check(self.terrain(), st)
+            except Exception as e:                                 # noqa: BLE001
+                self.log(f"[地形] 危险格复核出错: {e!r}")
             if not self.ensure_knowledge(st):
                 time.sleep(2)
                 continue

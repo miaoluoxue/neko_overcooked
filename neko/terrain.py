@@ -35,6 +35,7 @@
 from __future__ import annotations
 
 import heapq
+import os
 from collections import deque
 
 # 能站的格子
@@ -111,6 +112,19 @@ CH_DYNAMIC = "~"
 CH_PHYS = "x"
 
 DANGER_CHARS = CH_FIRE + CH_HAZARD + CH_VOID + CH_VOID_LOW
+
+#: **"软危险"** = 危险格里**由静态投影得来**的那几种(水面/岩浆 / 空洞 / 低空洞)。
+#: ☠ 为什么单独列一份: 这一层是**2D 投影 vs 3D KillPlane** 出来的, 实测会**大面积误报**
+#:   (2026-09-18 `s_sushi_1_4`: 29x25 的图里 **危险 536 格 / 可走只有 48 格 = 74%**,
+#:    而厨师明明在上面走来走去)。误报的代价全落在**规划**上 ——
+#:   `walkable()` 收它 ⇒ `distances_from`/`find_path(use_reach)`/`_stand_cell_of` 的
+#:   候选集塌成那 48 格 ⇒ A* 只能贴着一条走廊挤、挤到真实碰撞体上就"撞到地图上看不见的
+#:   障碍", 站位格也挑不到游戏认的那一格(实机症状: 切菜 `身边没有可互动的东西` /
+#:   放置 "游戏说 (13) 期望 (16)")。
+#: ⇒ 所以它**可以被"不再相信"**(见 `TerrainMap.distrust_danger`), 触发条件是**证伪**:
+#:   厨师**站在这格里而游戏没弄死他** —— 那是游戏在说"这里能站", 比投影权威。
+#: ⚠ **火不在里面**(`CH_FIRE` 是动态的、看得见, 而且有专门的灭火线): 不信投影 ≠ 往火里走。
+SOFT_DANGER = CH_HAZARD + CH_VOID + CH_VOID_LOW
 
 #: 游戏自己的**跨步吸附**阈值 —— 依据(反编译) `PlayerControls.StepHeightMax = 0.65`
 #: (`PlayerControls.cs:50`), 用在 `ClientPlayerControlsImpl_Default.cs:889`:
@@ -224,6 +238,11 @@ class TerrainMap:
         #: 留着它只是为了诊断打印(让你能看见它跳)。
         self.floor_y = float(data.get("floorY") or 0.0)
         self.regular = bool(data.get("regular"))
+        #: **还信不信"危险格"那一层**(见 `SOFT_DANGER` 的注释)。
+        #: 默认 `True`(照老行为); 一旦被**证伪**(厨师站在被标成危险的格子上而游戏没弄死他)
+        #: 就翻成 `False` —— 从此 `walkable()` 也认 `SOFT_DANGER`, 规划/站位/可达集
+        #: 全都跟着回到"信游戏"。`NEKO_TERRAIN_DANGER=0` 可以直接从一开始就不信。
+        self.danger_trust = (os.environ.get("NEKO_TERRAIN_DANGER") or "1").strip().lower()             not in ("0", "off", "no", "false", "none")
         #: C# 报的**活跃网格管理器个数**(`GridManager.GetActiveCount()`)。
         #: 为什么要留着: 多网格关卡里"主网格"取的是 `GetActive(0)`, 而活跃集合
         #: **可能随关卡子区域激活/停用而变** —— 一旦它变了, 统一网格的参照系
@@ -524,7 +543,9 @@ class TerrainMap:
         ch = self.at(i, j)
         return (ch == CH_FREE
                 or (ch == CH_PLATFORM and allow_platform)
-                or (ch == CH_TRAVELATOR and allow_travelator))
+                or (ch == CH_TRAVELATOR and allow_travelator)
+                # ☠ **被证伪之后也认"软危险"格** —— 见 `SOFT_DANGER` / `distrust_danger`。
+                or (not self.danger_trust and ch in SOFT_DANGER))
 
     def _mark(self, i: int, j: int, at_y: float = None, reach: set = None,
               dynamic: set = None, conv: dict = None) -> str:
@@ -640,6 +661,20 @@ class TerrainMap:
         # 以及 `s_wizard_5_5` 西梯那个角度上的 0.93), 又远低于真该拦的
         # (平台沉下去 1.65 / 7.58)。见 STEP_MAX 的注释。
         return abs(float(a) - float(b)) <= STEP_MAX
+
+    def distrust_danger(self, why: str = "") -> bool:
+        """**不再相信"危险格"那一层** —— 第一次翻的时候返回 `True`(给调用方去记日志)。
+
+        依据(规则 2, 问游戏): 厨师**此刻就站在**一个被标成危险的格子上, 而游戏**没有**
+        弄死他(没在重生、也没掉下去) ⇒ 游戏说"这里能站" ⇒ 投影错了。
+        ⚠ 只翻一次; 翻了之后 `walkable()` 认 `SOFT_DANGER`(不含火), 规划/可达/站位一起变。
+        ⚠ **只影响规划与站位**, 不影响 `is_danger_world` 那两个"他是不是掉下去了"的判据
+          (那两处本来就该问游戏, 见 `navigate` 的退路) —— 那里仍按原地形判。
+        """
+        if not self.danger_trust:
+            return False
+        self.danger_trust = False
+        return True
 
     def is_danger(self, i: int, j: int) -> bool:
         """这一格会不会弄死厨师(水面/岩浆/火/空洞)。"""
