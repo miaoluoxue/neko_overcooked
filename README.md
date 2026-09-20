@@ -1,3 +1,17 @@
+## 实验性故事模式与双人协作修复
+
+本分支基于上游 `9a5ca05`，包含故事模式控制器、双 Agent API 和移动厨房恢复修复。上游后续已重写调度器，本分支尚未适配最新 main；请勿直接替换新版引擎。完整故事模式通关尚未验证，`s_balloon_2_2` 仍有出餐效率不足的问题。
+
+- Python 3.10+；Windows 启动脚本默认使用 PATH 中的 `python`，可通过 `NEKO_PYTHON` 指定解释器。PowerShell 入口使用 `-PythonPath`。
+- 菜单桥编译：`./tools/build_menu_bridge.ps1 -GameDir '<游戏目录>'`；做菜桥编译：`./tools/build_game_bridge.ps1 -GameDir '<游戏目录>' -Compiler '<Roslyn csc.exe 路径>'`。需要游戏及 BepInEx 提供的引用程序集。编译后将 `build` 下两个桥接 DLL 安装到游戏的 `BepInEx/plugins`。
+- [故事模式使用说明](自动冒险说明.md)。停止自动流程使用 `Stop-Adventure.cmd`。
+- 回归测试：`python -X utf8 -m unittest discover -s . -p 'test_*.py' -q`（100 项）。测试不启动游戏。
+- 文档中的实机日志和状态快照保留在本地，不随 PR 发布；运行令牌、存档和反编译游戏代码也不包含在提交中。
+
+## 双 Agent / LLM 接入
+
+外部解说 Agent 请使用新增的高层 HTTP API（48780）：[双 Agent 接入报告](docs/LLM双Agent接入报告.md)。提供角色状态和动作、个人行为模式切换、双方同意后开启故事/街机新局。启动：`./Start-Agent-Bridge.ps1 -StartGame`。SDK：`tools/agent_client.py`。下文游戏操作桥是本地 bot 的内部接口。
+
 # neko_overcooked
 
 

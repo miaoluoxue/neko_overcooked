@@ -36,9 +36,8 @@ import math
 #:   · `press`/`wash`/`work`(8~11) —— **故意低于 `YIELD_MIN_SCORE`**:
 #:     人类队友更近且没挂机 ⇒ 自动**让位**(规格:"可以让人类处理一部分评分不高的行为");
 #:     人类挂机(`AFK_SECONDS`) ⇒ 自己做("如果人类也在挂机, 那确实只能脚本去自己做")。
-#:   · `serve_any`(交菜 45) —— **例外, 比阈值高 ⇒ 不让位**: 它是临门一脚,
-#:     不该推给人类; 但仍低于 `cook 45`/`assemble 60`/`deliver 100`,
-#:     所以不会压过"把自己那盘做完再交"。
+#:   · `serve_any`(交菜 100) —— **例外, 比阈值高 ⇒ 不让位**: 它是临门一脚,
+#:     与 `deliver` 同值，避免现成菜在继续取料、备料时过期。
 STEP_VALUE = {
     "deliver": 100.0,
     "assemble": 60.0,
@@ -50,7 +49,7 @@ STEP_VALUE = {
     "tool": 0.0,          # tool/mix 这类 do_op 本来就不处理, 给 0 让它永远排最后
     # ---- 杂活(阶段二) ----
     "pass": 38.0,         # **传球**: 链条上"我这边做不了"的那一环, 把料丢给人类队友
-    "serve_any": 45.0,    # 交菜: 台面上已经拼好的一盘, 端去送餐口
+    "serve_any": 100.0,   # Finished plate: same delivery value as a held dish; do not fetch more while it expires.
     "work": 11.0,         # 加工台面上没加工完的料(切/搅/烘同一条路)
     "wash": 10.0,         # 洗盘子
     "press": 8.0,         # 按机关
@@ -190,12 +189,14 @@ def wash_urgency(clean: int, dirty: int) -> float:
 
     ⚠ 判据里**没有"应该洗几个"的常数** —— 份数完全由场上的干净/脏盘决定
       (和 `_preps` 那条"份数由订单算"同一个规矩)。
-    ⚠ 上限 40 是**故意**远低于 `rescue`(能到 200): 缺盘子会卡住"取菜/摆盘",
-      但**不会把菜烧糊** —— 两件事的紧急程度不该同级。
+    缺盘会阻止取菜并间接导致烧糊。无净盘时至少加 60 分，最高 80 分，
+    让洗盘高于继续备料；即将烧糊的救锅仍可超过它。
     """
     if clean > 0 or dirty <= 0:
         return 0.0
-    return min(WASH_URGENCY_MAX, WASH_URGENCY_PER_PLATE * float(dirty))
+    # With no clean plates the entire takeout/delivery chain is blocked.
+    # Preparing more ingredients while washing loses to travel cost causes fires.
+    return min(80.0, 60.0 + WASH_URGENCY_PER_PLATE * float(dirty))
 
 
 def burn_urgency(ratio: float) -> float:
