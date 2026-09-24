@@ -766,24 +766,8 @@ class KitchenMap:
         if not key:
             return None
         low = key.lower()
-        kn = _norm_name(key)
-        # 1) 精确: 箱子的 `spawn` / `ing`(它**出什么料** —— C# `PickupItemSpawner.m_itemPrefab`)
-        #    归一化后**相等**。
-        #
-        # ☠☠ **"精确"档里原来放的是子串命中, 那等于没有精确档**(2026-09-18 实机
-        #   `s_balloon_1_5` 打回来的): 出 `PastaTomato` 的箱子, `spawn`/`ing` 里必然含
-        #   "pasta" ⇒ `"pastatomato".find("pasta") >= 0` ⇒ **它也进了精确档**; 于是两个
-        #   箱子并列, 谁近选谁。P1 站在 (5.7,-0.4) 时到那个错箱子近 0.3 格 ⇒ 去拿了
-        #   `PastaTomato`; 而同一拍的 P2 只是站位不同就选对了 —— **两个厨师跑同一步却
-        #   分岔**, 表现成"同一个 `fetch Pasta`, 一个拿对了一个拿错了"。拿错的后果不是
-        #   白跑一趟: 后面 `cook Pasta` 拿着生料下锅, 游戏 `placeCanHandle=False` ⇒
-        #   连试 3 次 ⇒ 冷板凳, 整单就在这一步耗掉。
-        #   ⚠ "名字里凑巧含目标词会被误判"这件事, **本函数自己的模糊层注释就警告过**,
-        #     同文件的 `pack_yielding`(见上)也是为同一个坑改成精确比的 —— 判据只有一份。
-        # ⚠ **`s.name` 不参与精确比**: 它分不开 `(1)`/`(2)` —— `_norm_name` 会把
-        #   "DispenserCrate 3 (1)" 的 ` (1)` 和结尾的 ` 3` **一起**剥掉, 两个箱子都
-        #   归一化成 `dispensercrate`。它留在下面 `hay` 里给第 2/3 档用。
-        exact, sub, loose = [], [], []
+        # 1) 精确: 箱子 prefab 名 或 ing 字段等于目标(或互为子串的基本形式)
+        exact, loose = [], []
         for s in self.of("crate"):
             if ok is not None and not ok(s):
                 continue                       # 走不到的货源, 直接不算候选
@@ -792,23 +776,12 @@ class KitchenMap:
                 d = (s.x - x) ** 2 + (s.z - z) ** 2
                 exact.append((d, s))
                 continue
-            # 2) **子串命中 —— 这一档就是原来那个"精确"档**, 只是降到了中间。
-            if hay.lower().find(low) >= 0:
-                d = (s.x - x) ** 2 + (s.z - z) ** 2
-                sub.append((d, s))
-                continue
-            # 3) 模糊(老行为, 判据一个字不改): 去掉 sushi_ 之类前缀再比
+            # 2) 模糊: 去掉 sushi_ 之类前缀再比
             short = low.replace("sushi_", "").replace("sushi", "")
             if short and _norm_name(short) in [n.replace('sushi', '') for n in names]:
                 d = (s.x - x) ** 2 + (s.z - z) ** 2
                 loose.append((d, s))
-        # ☠ **三档的顺序是"老两档"的严格细化, 不是重新排优先级**:
-        #   没有真·精确命中时 `sub or loose` == 老代码的 `exact or loose` ⇒ **逐字退回
-        #   老行为**(这条是验收点, 探针 `runtime/_srcpick_probe.py` 第 [3] 节钉着它)。
-        #   ⚠ 别改成 `exact or loose` 那种两档写法 —— 那样会把第 2 档并进第 3 档, 对
-        #     `sushi_` 这类 `low != short` 的名字会多算进候选, 等于在"没命中精确档"时
-        #     偷偷放宽(探针里那条用例当场红过)。
-        best = exact or sub or loose
+        best = exact or loose
         if not best:
             return None
         best.sort(key=lambda t: t[0])
@@ -982,7 +955,7 @@ def conveyor_arrows(tm, dyn) -> dict:
     return out
 
 
-def conveyor_edges(tm, dyn, long_ride: bool = True) -> dict:
+def conveyor_edges(tm, dyn) -> dict:
     """**地面传送带把你往哪送** —— `{格: [落点格]}`, 喂给泛洪/A* 的 `extra_edges`。
 
     和传送门边同一套机制(都是"到了这一格, 就也能到那一格"), 但**语义不一样**:
@@ -1006,107 +979,25 @@ def conveyor_edges(tm, dyn, long_ride: bool = True) -> dict:
     out = {}
     if tm is None or not getattr(tm, "ok", False):
         return out
-    bv = belt_vel(tm, dyn)
-    for src, v in bv.items():
-        vx, vz = v
-        k = (1 if vx > 0 else -1, 0) if abs(vx) >= abs(vz)             else (0, 1 if vz > 0 else -1)
-        # ☠☠ **"一段"= 连着几格同向同速的带子, 不是"沿这个轴一路铺过去"**。
-        #   一格一个预制件(`Travelator.Start` 用 `StaticGridLocation.m_gridIndex`,
-        #   一个 Travelator 占一格), 所以一条长带子在 `dyn.conveyors` 里是**好几条记录**
-        #   —— 判据必须是"下一格也是带子, **而且速度一模一样**"。
-        #   ⚠ 第一版没查这个, 于是边会**沿着轴铺过普通地板** —— 那是把距离表压扁
-        #     (一行格子全变成 1 步), 而带子根本没到那儿。
-        # ☠ ① **带子一定把站在它上面的人推出这一格** —— 哪怕下一格不是带子
-        #   (那是"出口", 人照样被送出去一格)。
-        # ☠ ② 之后**只有当下一格还是同一条带子**(同向**同速**, 见上面那条注释)时才接着给,
-        #   一直给到整段的尽头 —— 于是"进口那格 → 整段的任意一格"都是**一步**:
-        #   这就是"**顺着传送带方向移动不花代价**(带子替你走)"。
-        #   ⚠ 尽头不能站(水/空洞/障碍)就**停在那里** —— 那是"会死", 不是"能去"。
-        #   ⚠ 逐格地给也"对"(泛洪照样连通), 但**代价不一样**: A* 是等权最短路,
-        #     逐格的边和走路同价 ⇒ 规划器没有任何理由去"顺流", 也就没有"免费传送"。
-        cur = src
-        lst = []
-        while True:
-            nxt = (cur[0] + k[0], cur[1] + k[1])
-            if not tm.inside(*nxt) or not tm.walkable(*nxt):
-                break
-            if nxt not in lst:
-                lst.append(nxt)
-            if not long_ride:
-                break                       # ☠ 老行为(`NEKO_BELT=0`): 只把**自己那一格**
-                #   的人送出去, 不替整条带子给捷径
-            if bv.get(nxt) != v:
-                break                       # 不是同一条带子 ⇒ 送完这一步就停
-            if nxt in out and src in out[nxt]:      # 带子绕回来 ⇒ 收手, 别无限走
-                break
-            cur = nxt
-        if lst:
-            out[src] = lst
-    return out
-
-
-def _travelator_vel(c: dict):
-    """一条 `dyn.conveyors` 记录 → **它推人的世界速度 `(vx, vz)`**; 不推人的 ⇒ `None`。
-
-    ☠☠ **全仓唯一一份解析** —— `conveyor_edges`(连通边)与 `belt_vel`(逐格速度)都吃它。
-      两份实现迟早会漂, 而方向符号一漂就是"补偿朝反方向"这种最难查的病。
-
-    依据(反编译, 规则 1):
-      · `Travelator.cs:11-18`   `m_speed`(public, 世界单位/秒) / `m_directionXZ`(private)
-      · `Travelator.cs:167-175` `GetTravelDirection()`:
-            `Leftwards => transform.right`, `Rightwards => -transform.right`
-      · `Travelator.cs:134`     `GetSurfaceVelocity() = m_speed × 方向`
-      · 插件 `InteractiveScan.ConveyorExtra` 已经把 `speed`(u/s) 与 `stepx/stepz`
-        (轴向单位步长)报出来了 ⇒ 这里只剩"归一化到网格轴"这一件事。
-    ⚠ `ConveyorStation`(台面传送带)**推的是物品**, 不推人 ⇒ `None`, 别混。
-    """
-    if (c or {}).get("type") != "Travelator":
-        return None
-    if not c.get("on", True):
-        return None                       # 关掉的带子不推人
-    sp = float(c.get("speed") or 0.0)
-    if sp <= 0.0:
-        return None                       # 停着的带子不推人
-    sx = float(c.get("stepx") or 0)
-    sz = float(c.get("stepz") or 0)
-    if abs(sx) < 0.05 and abs(sz) < 0.05:
-        return None
-    if abs(sx) >= abs(sz):
-        return (sp if sx > 0 else -sp, 0.0)
-    return (0.0, sp if sz > 0 else -sp)
-
-
-def belt_vel(tm, dyn) -> dict:
-    """**地面传送带把站在这一格的人往哪推**: `{(i,j): (vx, vz)}`(世界单位/秒)。
-
-    与 `wind_cells` **同一个形状、同一个用途**(都是"站在这里会被推"), 所以移动层的
-    补偿可以直接把两者**相加** —— 依据是它们走**同一条位移通道**:
-      · `Travelator.cs:134` `GetSurfaceVelocity() = m_speed × 方向`
-      · `SurfaceMovable.cs:42`  `Update()` **无条件每帧**算, 与有没有输入无关
-      · `RigidbodyMotion.cs:43` `Movement(v,dt)` → `MovePosition(pos + v·dt)`
-      · 风走的同一条路(`ClientPlayerControlsImpl_Default.cs:902-906`) —— 见 `wind_cells`
-
-    **为什么带速用几何投影、风却优先问游戏**(不是双标):
-      · 风要"多股求和 + 层掩码过滤 + 体积形状", 几何推不出来 ⇒ 必须问游戏;
-      · 带子是**一格一个预制件上的常数**(`m_speed`), 没有求和、没有掩码 ⇒ 投影即精确值;
-        而且插件**没有**报"脚下带速"这个字段(只有 `wind`)。
-      ⚠ 已知近似: `Travelator.CalculateVelocityAtPoint` 在**贴近边界**时会改用旁边那条
-        带子的速度(`CalculateForBorders`, 换带时过渡平滑用)。我们按"站的那一格"算,
-        差别是边界上几帧, 不影响路径形状。
-    """
-    out = {}
-    if tm is None or not getattr(tm, "ok", False):
-        return out
     for c in (dyn or {}).get("conveyors") or []:
-        v = _travelator_vel(c)
-        if v is None:
+        if c.get("type") != "Travelator":
+            continue                      # 台面传送带推的是物品, 不推人
+        sx = float(c.get("stepx") or 0)
+        sz = float(c.get("stepz") or 0)
+        if abs(sx) < 0.05 and abs(sz) < 0.05:
+            continue                      # 停着的带子不推人
+        k = (1 if sx > 0 else -1, 0) if abs(sx) >= abs(sz) \
+            else (0, 1 if sz > 0 else -1)
+        src = tm.cell_of(float(c.get("x") or 0), float(c.get("z") or 0))
+        if not tm.inside(*src):
             continue
-        cell = tm.cell_of(float(c.get("x") or 0), float(c.get("z") or 0))
-        if not tm.inside(*cell):
-            continue
-        out[cell] = v
+        dst = (src[0] + k[0], src[1] + k[1])
+        if not tm.inside(*dst) or not tm.walkable(*dst):
+            continue                      # 尽头不能站 → 不给边(那是"会死", 不是"能去")
+        lst = out.setdefault(src, [])
+        if dst not in lst:
+            lst.append(dst)
     return out
-
 
 
 def wind_cells(tm, dyn) -> dict:

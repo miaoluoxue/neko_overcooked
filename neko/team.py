@@ -1,25 +1,14 @@
-"""双人协同: 共享黑板。
+"""双人协同: 订单黑板。
 
 两个厨师是**两个独立的个体**, 各自跑自己的引擎循环(P1 用 WASD, P2 用方向键),
 但共享一块黑板来避免互相踩踏:
 
+  · 一张订单只由一个厨师认领 —— 否则两人做同一道菜, 材料翻倍、盘子打架
+    ⚠ **"一张订单"= 订单栏上的一个槽位, 不是"一个菜名"** —— 见 `key_of`。
   · 每个厨师占一个自己的组装台面 —— 否则材料会混进同一个容器
   · 每个厨师占一个灶台 —— 否则两人去抢同一个锅
-  · 各自的**队友通报**("我在干嘛") —— 见 `publish_status`
 
-☠☠ **2026-09-18 当天来回了一次**: 上午先把订单认领删掉(两个厨师**合作同一张单**),
-晚上又按用户的话**取回来** —— 原话:
-  > "**改成一人一单吧**"
-因为实机(`s_sushi_*`)打回来的形状是: 两人压在同一张单上**互相让位、又都推不动**
-(P2 卡在取料、P1 卡在摆盘), 还互相把菜板/料占着; 让位那条(8 秒规则)一触发,
-先让的那个人**反而没活了**(队友在他自己的那半条链上)。
-⇒ 回到"**一人一单**": **一个槽位只由一个厨师认领**(键 = 槽位 id, 见 `key_of`),
-两个人各做各的链, 队友通报那条通道仍然在(错开一步 / 求助搭手 / 8 秒让位都还在)。
-
-⚠ **认领只在 `Engine.plan()` 一处生效** —— 底下的候选池不看它; 所以"合作一单"那半天
-  也是靠 `_chain_pick` 的队友通报在错开, 而不是靠认领。
-
-黑板只在内存里, 谁先 claim 谁得。
+黑板只在内存里, 谁先 claim 谁得。认领会随订单完成/失败释放。
 """
 
 from __future__ import annotations
@@ -27,17 +16,11 @@ from __future__ import annotations
 import threading
 import time
 
-#: **正式求助**活多久(秒) —— 超过就当对方没看见。
-#: ☠ 它和"通报"的 TTL(`MATE_SYNC_TTL`)是**两件事**:
-#:   通报是"我这一拍在干嘛"(一直刷), 求助是"**我卡住了**"(发一次) ——
-#:   求助不该因为我还在走动而被当成"还新鲜"。
-ASK_TTL = 5.0
-
 
 class OrderBoard:
     def __init__(self):
         self._lock = threading.Lock()
-        self._orders = {}      # 槽位键 -> cid (认领者) —— 一人一单
+        self._orders = {}      # 订单名 -> cid (认领者)
         self._spots = {}       # cid -> 组装台面 id
         #: ☠ **`_spots` 的镜像**: 台面 id -> cid。守旧是热路径(用 `_spots`), 但
         #   "**这块台面被谁占了**"只有镜像答得出来 —— 而摆盘位那条"守旧早退"必须过黑板
@@ -65,17 +48,13 @@ class OrderBoard:
 
         ☠☠ **认领必须按"槽位", 不能按菜名**(2026-09-16 双脚本实机打回来的):
           同一道菜会在订单栏上**同时挂好几张**(实测 `Sushi_Fish` 一次挂了 **5 张**),
-          而认领原来按名字记(`{name: cid}`) ⇒ 5 张单**只占一个槽**:
+          而认领原来按名字记 ⇒ 5 张单**只占一个槽**:
             · P1 领了 `Sushi_Fish` ⇒ 这一格归 P1;
-            · P2 想做**另一张** `Sushi_Fish` ⇒ 按名字查归属仍是 P1 ⇒
+            · P2 想做**另一张** `Sushi_Fish` ⇒ `owner_of('Sushi_Fish')` 是 P1 ⇒
               **永远领不到** ⇒ 整局空转, 而订单栏上另外 4 张没人做。
           实测那一局: `[P2] [引擎] 空转: 5 张单都被队友认领了`, P2 站了 **43 秒** ——
           还正好堵在 P1 送餐的必经之路上(那一趟因此判"这一格推不过去"而中止,
           `serve_any` 白跑)。**一个 bug 同时吃掉了 P2 的全部产能和 P1 的一次送餐。**
-
-        ⚠ **认领本身已在 2026-09-18 删掉**(两个厨师改成合作同一张单), 但这个函数
-          **留着**: 它是 `Engine._order_key` 的唯一实现, 而"订单栏上这一格是谁"
-          在诊断里仍然要看(同名多单时按名字判会把 5 张说成 1 张)。
 
         ⇒ 本仓记过的第三条"订单没有 id、只有名字"的账。C# 侧 `OrderCapture` 现在把
           `id` 报出来了 —— 那是订单栏上**这一格的 widget 实例 id**: 交付后那一格空出来
@@ -94,7 +73,7 @@ class OrderBoard:
         return f"#{i}:{name}"
 
     def claim_order(self, key: str, cid: int) -> bool:
-        """认领一个**槽位**(`key` 用 `key_of(order)` —— **不是菜名**)。"""
+        """`key` 用 `key_of(order)` —— **不是菜名**。"""
         with self._lock:
             owner = self._orders.get(key)
             if owner is None or owner == cid:
@@ -132,6 +111,10 @@ class OrderBoard:
             # 盘子绑定按 cid 清(无主的 `slot=""` 条目留着 —— 别人还能接手它)
             for sid in [s for s, e in self._plates.items() if e.get("cid") == cid]:
                 del self._plates[sid]
+
+    def orders_of(self, cid: int) -> list:
+        with self._lock:
+            return [k for k, v in self._orders.items() if v == cid]
 
     # ---- 台子 ----
     def claim_stove(self, stove_id: str, cid: int) -> bool:
@@ -437,64 +420,3 @@ class OrderBoard:
             self._spots[cid] = best.id
             self._spot_by_sid[best.id] = cid
             return best
-
-    # ---- 队友通报("我在干嘛") ----
-    #
-    # 用户 2026-09-17 原话:
-    #   "**厨师1的信息需要强制同步给厨师2，让脚本知道另外一个在干嘛，
-    #     包括位置，在做的事，指向的对象，手上的东西，需要是什么**"
-    #
-    # ☠☠ **它不是占位、不是锁** —— 读到什么**只影响评分权重**
-    #   ("他正在做这一步 ⇒ 我让开一点")。谁真的去做仍由评分决定:
-    #   队友那条通报过期了、或者他其实做不成, 这一步还得有人做 ——
-    #   硬闸门会让两个人都站着(用户规则 5: **宁可重复, 也别让人站着**)。
-    #   (步级占位那一套是**另一条线**, 本版没有, 也别从这儿引。)
-    def publish_status(self, cid: int, op: str = "", need: str = "",
-                       ask: str = "", did: str = None, left: int = None) -> None:
-        """通报我这一拍在干嘛。**只写我自己那一格**。
-
-        用户 2026-09-18 点名的三个问题(两人一张单时"必须互相通信"):
-          ① **我做了啥**  ⇒ `did`  —— 我刚**做完**的那一步(`"fetch Cucumber"`)
-          ② **我打算做啥** ⇒ `op`   —— 我**选中并正在做**的那一步(发布时机就是"选中那一刻",
-                                     所以它同时是"打算"和"在做")
-          ③ **我做完了吗** ⇒ `left` —— 这一单**还剩几步**(`0` = 这单我做完了)
-        加上原有的:
-          · `need` = **需要是什么**(那一步卡在哪, 源是 `_op_actionable` 的 `why`)
-          · `ask`  = **正式求助**(非空才覆盖, 有自己的 TTL, 见 `ASK_TTL`)
-
-        ⚠ **`did`/`left`/`ask` 都是"没传就保留上一条"** —— 一次普通通报不该把求助抹掉,
-          也不该把"我刚做完什么"清成空(那是另一件事的快照)。
-          `op`/`need` 则**每次都覆盖**: 它们描述的是"此刻", 空了就是真的没有。
-        """
-        with self._lock:
-            ent = self._status.get(cid) or {}
-            ent["op"] = str(op or "")
-            ent["need"] = str(need or "")
-            if did is not None:
-                ent["did"] = str(did or "")
-            if left is not None:
-                ent["left"] = int(left)
-            # ⚠ `ask` **没传就保留上一条** —— 否则每拍一次普通通报都会把求助抹掉。
-            if ask:
-                ent["ask"] = str(ask)
-                ent["ask_at"] = time.time()
-            ent["at"] = time.time()
-            self._status[cid] = ent
-
-    def mate_status(self, cid: int, ttl: float = 3.0) -> dict:
-        """**只读**: 队友这一拍在干嘛 —— 没有/过期 ⇒ `{}`(当"不知道"处理)。
-
-        ☠ **过期回空, 不回旧值** —— 宁可让调用方当"不知道", 也别拿一条几秒前的
-          旧消息去猜。求助(`ask`)另外按 `ASK_TTL` 单独判。
-        """
-        now = time.time()
-        with self._lock:
-            o = self._status.get(cid)
-            if not o:
-                return {}
-            if now - float(o.get("at", 0.0)) > ttl:
-                return {}
-            out = dict(o)
-            if out.get("ask") and now - float(out.get("ask_at", 0.0)) > ASK_TTL:
-                out["ask"] = ""          # 求助过期 ⇒ 当没喊过
-            return out
