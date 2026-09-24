@@ -34,6 +34,17 @@ import sys
 import threading
 import time
 
+_log_lock = threading.Lock()
+
+def event_log(tag, *parts):
+    with _log_lock:
+        stamp = time.time()
+        for line in ' '.join(str(p) for p in parts).splitlines():
+            print(f'[{stamp:.3f}][{tag}] {line}', flush=True)
+            if tag in ('P1','P2') and line.startswith(('[步骤]', '[灭火]', '[清理糊锅]', '[洗盘]', '[救锅]', '[交菜优先]')):
+                try: AGENT_BUS.event('bot_detail', {'text':line}, tag)
+                except Exception: pass
+
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "neko"))
 
 from bridge.client import BridgeClient              # noqa: E402
@@ -42,6 +53,67 @@ from engine import Engine                           # noqa: E402
 from team import OrderBoard                         # noqa: E402
 from world import World                             # noqa: E402
 from modes import Roster, parse_mode_spec           # noqa: E402
+import control
+from agent_bus import Bus, chef_for_player
+AGENT_BUS = Bus()
+
+# The C# bridge has one main-thread job slot; serialize the team's requests.
+class TeamBridge(BridgeClient):
+    request_lock = threading.RLock()
+    def _send(self, payload):
+        with self.request_lock:
+            return super()._send(payload)
+
+ENGINES = []
+STOP = threading.Event()
+
+class TeamEngine(Engine):
+    def _prep_and_toss(self, *args, **kwargs):
+        return  # Carry the current ingredient; speculative throws can be unreachable.
+
+    def apply_commands(self):
+        if STOP.is_set():
+            self._ctrl_stop = True
+            return
+        player=self.agent_player
+        for _ in range(4):
+            cmd=AGENT_BUS.claim('mode',player)
+            if cmd is None: break
+            try:
+                self.mode_state.set_mode(cmd['payload']['mode'])
+                AGENT_BUS.put('desired_mode:'+player,cmd['payload']['mode'])
+                AGENT_BUS.finish(cmd['id'],'succeeded',{'player':player,'mode':self.mode_state.mode.value,
+                                 'applied_at':time.time(),'effect':'next_decision'})
+                self.publish_agent()
+            except Exception as e:
+                AGENT_BUS.finish(cmd['id'],'failed',{'error':str(e)})
+
+    def publish_agent(self):
+        m=self.mode_state
+        AGENT_BUS.put('engine:'+self.agent_player,dict(at=time.time(),pid=os.getpid(),chef_id=self.cid,player=self.agent_player,
+            running=getattr(self,'agent_running',False) and not STOP.is_set(),paused=self._ctrl_paused,mode=m.mode.value,
+            conscience=m.conscience,fumbles=m.fumbles,mischiefs=m.mischiefs,
+            action=getattr(self,'_agent_action',None)))
+
+    def do_op(self, km, st, op, flow, attempt=0):
+        player=self.agent_player
+        data=dict(action=op.action,target=op.target,dish=flow.name,attempt=attempt,
+                  phase='started',at=time.time(),round_seq=(st.get('round') or {}).get('seq'))
+        self._agent_action=data
+        AGENT_BUS.event('action_started',data,player)
+        self.publish_agent()
+        ok=False
+        try:
+            ok=super().do_op(km,st,op,flow,attempt)
+            return ok
+        finally:
+            self._agent_action=dict(data,phase='completed',success=bool(ok),finished_at=time.time())
+            AGENT_BUS.event('action_completed',self._agent_action,player)
+            self.publish_agent()
+
+    def _publish_status(self, *args, **kwargs):
+        pass  # The campaign supervisor owns the shared status file.
+
 from logfile import enable                          # noqa: E402
 
 # ⚠ **必须在任何输出之前**(见 `neko/logfile.py`)。双人时两个线程共用这一个文件 ——
@@ -107,14 +179,21 @@ def worker(cid: int, bindings: dict, board: OrderBoard, dry: bool, roster,
     tag = f"P{cid + 1}"
 
     def log(*a):
-        print(f"[{tag}]", *a, flush=True)
+        event_log(tag, *a)
 
-    bridge = BridgeClient(log=log)
+    bridge = TeamBridge(log=log)
     if not bridge.connect(retries=None, interval=2.0):
         log("连不上桥")
         return
     st = roster.get(cid)
     log(f"模式={st.mode.value}")
+    # Agent identity is the game player slot, never the scene's object enumeration.
+    chefs=bridge.get_state().get('layout',{}).get('chefs',[])
+    own=chef_for_player(chefs,tag)
+    if own is None:
+        log('玩家角色尚未出现，停止而不接管其他角色')
+        STOP.set();bridge.close();return
+    cid=int(own['id'])
 
     pad = None
     if use_virtual:
@@ -124,15 +203,20 @@ def worker(cid: int, bindings: dict, board: OrderBoard, dry: bool, roster,
         from bridge.virtual_pad import attach_virtual_input
         pad = attach_virtual_input(bridge, chef=cid, log=log)
         if pad is None:
-            log("⚠ 虚拟手柄装不上, 退回键盘注入(需要游戏在前台)")
+            log("虚拟手柄安装失败，停止该厨师")
+            STOP.set()
+            bridge.close()
+            return
 
     # teammate_is_human=False: 两只都是脚本。
     # ⚠ **不能让位** —— 队友正在煮他那份时, 从我这看就是"他站在我的灶台边",
     #   于是我会一直让位给他 —— 让到天荒地老。见 scoring.choose 的注释。
-    #   (2026-09-18 起两人**合作同一张单**, 但这条理由不变: 让位是给**人类**队友的
-    #    礼貌动作, 双脚本之间它只会互相礼让到站着不动。)
-    eng = Engine(bridge, cid=cid, bindings=bindings, board=board, log=log,
+    eng = TeamEngine(bridge, cid=cid, bindings=bindings, board=board, log=log,
                  mode_state=st, world=world, teammate_is_human=False)
+    eng.agent_player=tag
+    eng.agent_running=True
+    AGENT_BUS.interrupt_running('mode',tag)
+    ENGINES.append(eng)
     try:
         eng.run(dry=dry)
     except KeyboardInterrupt:
@@ -140,6 +224,8 @@ def worker(cid: int, bindings: dict, board: OrderBoard, dry: bool, roster,
     except Exception as e:
         log(f"异常退出: {e!r}")
     finally:
+        eng.agent_running=False
+        eng.publish_agent()
         try:
             eng.kb.release_all()
         except Exception:
@@ -187,16 +273,19 @@ def main() -> int:
             roster.set_all(v)
         else:
             roster.set_mode(k, v)
+    for cid in (0,1):
+        desired=AGENT_BUS.get(f'desired_mode:P{cid+1}')
+        if desired: roster.set_mode(cid,desired)
 
     board = OrderBoard()
 
     # ---- 共享世界: 一张地图 + 两个厨师的实时位置, 两个引擎共用 ----
     # 它用自己的一条**只读**连接(state/map), 不跟厨师各自的驱动连接抢 socket。
-    world_bridge = BridgeClient()
+    world_bridge = TeamBridge()
     if not world_bridge.connect(retries=None, interval=2.0):
         print("共享世界: 连不上桥", flush=True)
         return 1
-    world = World(world_bridge, log=lambda *a: print("[世界]", *a, flush=True))
+    world = World(world_bridge, log=lambda *a: event_log('世界', *a))
     print("[世界] 已建立共享地图与位置视图(两个厨师共用一份)", flush=True)
 
     players = []
@@ -228,12 +317,33 @@ def main() -> int:
     print(f"已启动 {len(threads)} 个厨师, Ctrl+C 停止", flush=True)
     try:
         while any(t.is_alive() for t in threads):
+            for eng in list(ENGINES): eng.publish_agent()
+            for line in control.take():
+                command = line.strip().lower()
+                if command == "stop":
+                    STOP.set()
+                elif command in ("pause", "resume"):
+                    for eng in ENGINES:
+                        eng._ctrl_paused = command == "pause"
+            if STOP.is_set():
+                break
             # 每 10 秒打一行共享世界摘要(两个厨师的位置 + 缓存命中情况), 便于判断"是不是各看各的"
             if int(time.time()) % 10 == 0:
-                print("[世界] " + world.note(), flush=True)
+                event_log('世界', world.note())
             time.sleep(1)
     except KeyboardInterrupt:
         print("\n停止中...", flush=True)
+    finally:
+        STOP.set()
+        for t in threads:
+            t.join(timeout=3)
+        for eng in list(ENGINES): eng.publish_agent()
+        try:
+            for cid, _ in players:
+                world_bridge.pad("uninstall", player=cid)
+        except Exception:
+            pass
+        world_bridge.close()
     return 0
 
 

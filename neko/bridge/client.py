@@ -5,6 +5,40 @@ from __future__ import annotations
 import json
 import socket
 import time
+import os
+import threading
+from pathlib import Path
+from contextlib import contextmanager
+
+_rpc_thread_lock = threading.RLock()
+
+@contextmanager
+def game_job_lock():
+    """StateCollector.RequestJob has one shared slot, including across clients.
+
+    Its _jobDone >= want test otherwise lets one process receive another's
+    response. Hold this lock through the response, not just through sendall.
+    """
+    path=Path(os.environ.get('NEKO_RPC_LOCK') or Path(__file__).resolve().parents[2]/'runtime'/'game-rpc.lock')
+    path.parent.mkdir(parents=True,exist_ok=True)
+    with _rpc_thread_lock, path.open('a+b') as f:
+        if f.tell()==0:f.write(b'0');f.flush()
+        if os.name=='nt':
+            import msvcrt
+            deadline=time.monotonic()+20
+            while True:
+                try:
+                    f.seek(0);msvcrt.locking(f.fileno(),msvcrt.LK_NBLCK,1);break
+                except OSError:
+                    if time.monotonic()>deadline:raise BridgeError('等待游戏桥请求锁超时')
+                    time.sleep(.005)
+            try:yield
+            finally:f.seek(0);msvcrt.locking(f.fileno(),msvcrt.LK_UNLCK,1)
+        else:
+            import fcntl
+            fcntl.flock(f,fcntl.LOCK_EX)
+            try:yield
+            finally:fcntl.flock(f,fcntl.LOCK_UN)
 
 
 class BridgeError(Exception):
@@ -55,6 +89,12 @@ class BridgeClient:
 
     # ---- 协议 ----
     def _send(self, payload: dict) -> dict:
+        if payload.get('cmd') in ('state','orders','ping'):
+            return self._send_unlocked(payload)
+        with game_job_lock():
+            return self._send_unlocked(payload)
+
+    def _send_unlocked(self, payload: dict) -> dict:
         if self._sock is None:
             raise BridgeError("未连接")
         line = json.dumps(payload, ensure_ascii=False)

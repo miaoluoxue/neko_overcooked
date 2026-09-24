@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -88,8 +89,12 @@ def is_pot(name: str = "", tag: str = "") -> bool:
     它与灭火器 utensil_fire_extinguisher_01 的区别: 后者没有 CookableContainer/CookingHandler,
     所以**不能只看名字里的 "utensil"**; 看 "pot"/"pan" 才准, tag 只做兜底。
     """
-    n = (name or "").lower()
-    if "pot" in n or "pan" in n:
+    # Live 2-1: Potato is tagged Pre-Ingredient; a substring 'pot' is not
+    # a CookingUtensil. Split CamelCase so FryingPan remains recognizable.
+    n = re.sub(r'([a-z])([A-Z])', r'\1_\2', name or '').lower()
+    if (tag or '').lower() in ('ingredient', 'pre-ingredient'):
+        return False
+    if re.search(r'(?<![a-z])(pot|pan)(?![a-z])', n):
         return True
     if (tag or "") == POT_TAG and "extinguish" not in n and "fire" not in n:
         return True
@@ -97,9 +102,12 @@ def is_pot(name: str = "", tag: str = "") -> bool:
 
 
 def is_plate(name: str = "", tag: str = "") -> bool:
+    n = (name or "").lower()
+    if "dirty" in n or "stack" in n or (tag or "").lower() == "dirtyplate":
+        return False
     if (tag or "") == PLATE_TAG:
         return True
-    return "plate" in (name or "").lower()
+    return "plate" in n
 
 
 def is_extinguisher(name: str = "", tag: str = "") -> bool:
@@ -471,6 +479,14 @@ class KitchenMap:
         for m in self.movers:
             if (getattr(m, "name", "") or "") in statics:
                 continue
+            # MoverScan.NamePatterns contains "rat", which also matches the
+            # stationary child collider "NewCrate". The real parent crate is
+            # already in the terrain; do not expand its child into the aisle.
+            if getattr(m, 'kind', '') == 'ByName' and not getattr(m, 'moved', False) \
+                    and 'crate' in (getattr(m, 'name', '') or '').lower() \
+                    and any(s.spawn and (s.x-m.x)**2+(s.z-m.z)**2 < .36
+                            for s in self.stations.values()):
+                continue
             # ☠ **别把"死亡面"当 mover**(实测踩过, 2026-09-14)。
             #   `movers` 里混进了 `KillPlane`(关卡地板下方那层死亡面), 它的 `r` 是
             #   **半边长** —— 实测 35.0 / 17.5 / 12.5。按半径展开后
@@ -531,6 +547,11 @@ class KitchenMap:
                 claimed.append((_norm_name(c.held), c.x, c.z))
         out = []
         for it in self.items:
+            # SceneScanner.MountOf walks the actual parent chain. Plated food
+            # visuals can have different names from the plate's recipe contents;
+            # name matching must not turn mounted children into loose ingredients.
+            if getattr(it, 'on', '') or getattr(it, 'carrier', ''):
+                continue
             n = _norm_name(getattr(it, "name", ""))
             if not n:
                 continue
@@ -766,8 +787,8 @@ class KitchenMap:
         for s in self.of("crate"):
             if ok is not None and not ok(s):
                 continue                       # 走不到的货源, 直接不算候选
-            hay = (s.spawn + " " + s.ing + " " + s.name)
-            if kn and (_norm_name(s.spawn) == kn or _norm_name(s.ing) == kn):
+            names = [_norm_name(s.spawn), _norm_name(s.ing), _norm_name(s.name)]
+            if _norm_name(key) in names:
                 d = (s.x - x) ** 2 + (s.z - z) ** 2
                 exact.append((d, s))
                 continue
@@ -778,7 +799,7 @@ class KitchenMap:
                 continue
             # 3) 模糊(老行为, 判据一个字不改): 去掉 sushi_ 之类前缀再比
             short = low.replace("sushi_", "").replace("sushi", "")
-            if short and short in hay.lower():
+            if short and _norm_name(short) in [n.replace('sushi', '') for n in names]:
                 d = (s.x - x) ** 2 + (s.z - z) ** 2
                 loose.append((d, s))
         # ☠ **三档的顺序是"老两档"的严格细化, 不是重新排优先级**:
@@ -805,12 +826,12 @@ class KitchenMap:
         原来那套推断分不开三种情况: 锅在灶上 / 锅被端在手上 / 锅放在灶台边上。
         ⚠ 老 dll(没有 `on`)⇒ 返回 None, 调用方退回按距离猜。
         """
+        station = self.stations.get(getattr(station, 'id', ''), station)
         if station is None or not station.name:
             return None
-        for it in self.items:
-            if it.on and it.on == station.name:
-                return it
-        return None
+        matches = [it for it in self.items if it.on == station.name and is_pot(it.name, it.tag)]
+        matches = [it for it in matches if abs(it.x-station.x)<.6 and abs(it.z-station.z)<.6]
+        return min(matches, key=lambda it: (it.x-station.x)**2+(it.z-station.z)**2, default=None)
 
     def cooking_on(self, station: Station) -> Optional[Cooking]:
         """某个灶台上正在煮的东西。
@@ -823,6 +844,11 @@ class KitchenMap:
         ⚠ 两条都必须留着: 老 dll 没有 `on`,`pot_on` 返回 None ⇒ 走距离那条;
           而有些关卡锅里还没有 `CookingHandler` 对应条目 ⇒ 也别把距离那条删掉。
         """
+        # Callers may retain a Station while waiting for cooking to finish.
+        # Match against this snapshot's position, including the fallback path.
+        station = self.stations.get(getattr(station, 'id', ''), station)
+        if station is None:
+            return None
         pot = self.pot_on(station)
         if pot is not None:
             for c in self.cooking:

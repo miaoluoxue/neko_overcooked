@@ -124,6 +124,14 @@ namespace Overcooked2AI.Game
             string prog = EnumName(n, "m_progress");
             if (prog.Length > 0)
                 sb.Append(",\"p\":\"").Append(prog).Append("\"");
+            // CookedCompositeAssembledNode.IsMatch IL_0019-002f compares cooking-step IDs.
+            if (kind == "cook")
+            {
+                object step = GetField(n, "m_cookingStep");
+                object id = GetField(step, "m_uID");
+                if (id != null)
+                    sb.Append(",\"cookId\":").Append(Convert.ToInt32(id));
+            }
 
             var kids = Children(n, "m_composition");
             sb.Append(",\"i\":[");

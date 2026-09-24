@@ -36,9 +36,8 @@ import math
 #:   · `press`/`wash`/`work`(8~11) —— **故意低于 `YIELD_MIN_SCORE`**:
 #:     人类队友更近且没挂机 ⇒ 自动**让位**(规格:"可以让人类处理一部分评分不高的行为");
 #:     人类挂机(`AFK_SECONDS`) ⇒ 自己做("如果人类也在挂机, 那确实只能脚本去自己做")。
-#:   · `serve_any`(交菜 45) —— **例外, 比阈值高 ⇒ 不让位**: 它是临门一脚,
-#:     不该推给人类; 但仍低于 `cook 45`/`assemble 60`/`deliver 100`,
-#:     所以不会压过"把自己那盘做完再交"。
+#:   · `serve_any`(交菜 100) —— **例外, 比阈值高 ⇒ 不让位**: 它是临门一脚,
+#:     与 `deliver` 同值，避免现成菜在继续取料、备料时过期。
 STEP_VALUE = {
     "deliver": 100.0,
     "assemble": 60.0,
@@ -50,7 +49,7 @@ STEP_VALUE = {
     "tool": 0.0,          # tool/mix 这类 do_op 本来就不处理, 给 0 让它永远排最后
     # ---- 杂活(阶段二) ----
     "pass": 38.0,         # **传球**: 链条上"我这边做不了"的那一环, 把料丢给人类队友
-    "serve_any": 45.0,    # 交菜: 台面上已经拼好的一盘, 端去送餐口
+    "serve_any": 100.0,   # Finished plate: same delivery value as a held dish; do not fetch more while it expires.
     "work": 11.0,         # 加工台面上没加工完的料(切/搅/烘同一条路)
     "wash": 10.0,         # 洗盘子
     "press": 8.0,         # 按机关
@@ -60,17 +59,38 @@ STEP_VALUE = {
 }
 STEP_VALUE_DEFAULT = 10.0   # 没见过的动作
 
-#: 锅从"刚报警"到"糊掉"之间, 紧迫度最多能加多少分。
+#: **救锅紧迫度的拐点表** `(ratio, 分)` —— 两点之间线性插值。用户 2026-09-17 选的两段式。
 #:
-#: **两个交叉点决定了这个数该多大**(算给下一个调参的人看, 别凭手感):
-#:   · 压过 `deliver`(100, 表里最高的菜谱动作) 的位置 —— 那之前脚本会"先把手上这盘送完"。
-#:     解 `15 + M·(ratio−1) > 100` ⇒ `ratio > 1 + 85/M`。M=200 ⇒ **ratio ≈ 1.43**。
-#:   · 高于 `YIELD_MIN_SCORE`(不再让位给队友)的位置: `ratio > 1 + (12−15)/M` ⇒ M=200 ⇒ **1.0**(立刻)。
+#: 为什么要拐点, 而不是老公式那条直线(`200·(ratio−alert)/(2−alert)`): 老形状**刚报警时是
+#: 0 分**, 全靠"离糊越近涨得越猛"兜。实机账(`s_lunar_1_4`)打回来的正是它的反面 ——
+#:   `rescue` 在 `ratio=1.19` 上只有 **38 分**, 而那口锅离我 **14 格 + 不顺路 12 格**,
+#:   距离/顺路两项就扣掉 46 ⇒ `15 − 28 − 18 + 38 = 7.3`, 输给了 `fetch SushiRice` 的 `16.0`。
+#:   ⇒ 糊锅窗口的**前 ~23%** 里救锅根本排不上号; 等它涨够, 走过去的时间已经没了。
+#: 拐点表把"什么时候算得上一件事"**写死成两段**, 不再靠一条斜率的运气。
 #:
-#: 为什么交叉点要落在 **1.4 左右**(而不是更晚): 剩下的时间 `(2−ratio)·need`, 对 10 秒的菜
-#:   · ratio 1.43 ⇒ **还剩约 5.7 秒** —— 够走过去(一格 0.3 秒 + 站位的开销);
-#:   · ratio 1.65 ⇒ 只剩 3.5 秒 —— 多半**走到了也来不及**(我第一版取 130 就是这里错)。
-#: 而 1.0~1.2 之间(刚熟、还有 8 秒以上)不该抢别人的活 —— 那时让位给站在旁边的人更合理。
+#: 每一点都是**给调参的人看的交叉点**(和 `WASH_URGENCY_MAX` 同一个习惯, 别凭手感)。
+#: 底下按 `rescue` 的步骤价 15、距离 2.0 分/格、且**救锅不吃顺路扣分**来算
+#: (见 `engine._rank_candidates` 里把 rescue 的 `follow` 置 0 那一段):
+#:   · `(1.00,  45)` —— **刚报警就有话语权**: `15 + 45 = 60` ⇒ 压过 `chop`(30)/`cook`(45);
+#:                     哪怕离 14 格(−28) 也还有 32 分, 仍压过 `fetch`(20)。
+#:   · `(1.30,  60)` —— 早段封顶。`60` 还**压不过 `deliver`(100)** ⇒ "手上这盘马上要交"仍优先。
+#:   · `(1.50, 120)` —— 从这儿起**压过一切**(连 `deliver` 也压): `15 − 28 + 120 = 107 > 100`,
+#:                     14 格外照样成立。剩下的时间 `(2−1.5)·need`, 对 10 秒的菜是 5 秒 —— 够走过去。
+#:   · `(2.00, 200)` —— 糊了。留满值只是让"已经毁了的那一瞬"仍排在最前
+#:                     (下一轮 `_rescues` 就不生成它了, 见那条 `ratio >= 2.0` 的闸门)。
+#:
+#: ☠☠ **`ratio <= alert` 仍然给 0** —— "还没报警"和"刚报警"之间是**一跳**, 而且**是故意的**:
+#:   报警本身就是**游戏的一次状态跳变**(`OverDoing` + 警告图标脉冲 + `CookingWarning` 音效),
+#:   我们照它跳。想磨平这一跳 ⇒ **把表里第一点往右挪**(例如 `(1.05, 30)`), 别去改那句。
+#: ⚠ 这一跳**只影响「bot + 人类」的让位** —— `scoring.choose` 的让位只对人类队友开
+#:   (`engine._rank_candidates` 的 `yield_on`), 双脚本局面本来就比不了 ⇒ 两个 bot 之间不受它影响。
+#:   (老注释那句"1.0~1.2 之间不该抢别人的活, 让位给站在旁边的人更合理"仍然是**意图**,
+#:    只是现在由"只对人类开"落实, 不再由"0 分"落实。)
+BURN_URGENCY_KNOTS = ((1.00, 45.0), (1.30, 60.0), (1.50, 120.0), (2.00, 200.0))
+
+#: **顶部那一档** —— 拐点的最后一点, 也是本仓其它紧迫度曲线的量纲基准
+#: (`_tends` / `_pot_overdue_pick` 直接拿它当满值用)。改 `BURN_URGENCY_KNOTS` 时
+#: **要让最后一点等于它**, 否则两处说法会不一致。
 BURN_URGENCY_MAX = 200.0
 
 #: **"一个干净盘都没有了"时的紧迫度上限**(分) —— 和 `BURN_URGENCY_MAX` 同一个形状。
@@ -80,6 +100,25 @@ BURN_URGENCY_MAX = 200.0
 WASH_URGENCY_MAX = 40.0
 #: 每个脏盘贡献几分(封顶在 `WASH_URGENCY_MAX`)。
 WASH_URGENCY_PER_PLATE = 8.0
+
+#: **订单快到期了最多加几分**(`order_urgency`, 2026-09-17 按步协作那件事)。
+#:
+#: **60 的量纲依据**(算给下一个调参的人看, 别凭手感): 60 = `assemble` 的步骤价 ⇒
+#:   · 能让"**快没时间的那张单**"的 `fetch`(20+60=80) 压过"**新单**的 `assemble`"(60)
+#:     —— 用户要的"最高收益的那一步"就该在残局里偏向后一张单;
+#:   · 但**永远压不过 `deliver`(100)** —— 送餐是唯一真正结算分数的动作, 不该被"抢单"
+#:     抢走别人手上那盘已经拼好的菜。
+#: ⚠ **本模块是纯函数模块**(文件头那条纪律): 这里只放**字面量**, 不读 `os.environ`。
+#:   可调的那两份由**引擎**读(`NEKO_ORDER_URGENCY` / `NEKO_ORDER_URG_FLOOR`)并**传进来**
+#:   (`order_urgency(t, cap=…, floor=…)`) —— 和 `burn_urgency_alert` 收 `alert` 同一个形状。
+#:   `0` = 关掉时钟分(退回"不看订单倒计时"的老行为)。
+ORDER_URGENCY_MAX = 60.0
+
+#: **死区**: `t >= 这个值` 时时钟分**恰好 0**。
+#: ⇒ **开局(所有单都是新单)的行为与改前逐字相同** —— 改动被关进残局里,
+#:   这也让"行为不对时"可以靠它二分定位。`NEKO_ORDER_URG_FLOOR=1.0` = 完全关掉
+#:   (和 `NEKO_ORDER_URGENCY=0` 等效, 但更直观)。
+ORDER_URGENCY_FLOOR = 0.35
 
 #: **"手上这份先做完"的加成分**。用户 2026-09-15 讲的机制:
 #:   > "比如 SushiRice, 想要放在盘子上需要**先煮熟**" —— 生米**永远**上不了盘,
@@ -150,12 +189,14 @@ def wash_urgency(clean: int, dirty: int) -> float:
 
     ⚠ 判据里**没有"应该洗几个"的常数** —— 份数完全由场上的干净/脏盘决定
       (和 `_preps` 那条"份数由订单算"同一个规矩)。
-    ⚠ 上限 40 是**故意**远低于 `rescue`(能到 200): 缺盘子会卡住"取菜/摆盘",
-      但**不会把菜烧糊** —— 两件事的紧急程度不该同级。
+    缺盘会阻止取菜并间接导致烧糊。无净盘时至少加 60 分，最高 80 分，
+    让洗盘高于继续备料；即将烧糊的救锅仍可超过它。
     """
     if clean > 0 or dirty <= 0:
         return 0.0
-    return min(WASH_URGENCY_MAX, WASH_URGENCY_PER_PLATE * float(dirty))
+    # With no clean plates the entire takeout/delivery chain is blocked.
+    # Preparing more ingredients while washing loses to travel cost causes fires.
+    return min(80.0, 60.0 + WASH_URGENCY_PER_PLATE * float(dirty))
 
 
 def burn_urgency(ratio: float) -> float:
@@ -165,11 +206,10 @@ def burn_urgency(ratio: float) -> float:
             (警告图标脉冲 + `GameOneShotAudioTag.CookingWarning` 音效)
       2.0 = 糊了(`Ruined`)
 
-    线性上涨: 刚报警时 **0 分**, 越接近糊涨得越猛(`BURN_URGENCY_MAX`)。
-    为什么不设硬阈值闸门(用户 2026-09-15 定的规矩: "如果报警, 对应的评分应该上涨"):
-      **涨分自动穿过 `YIELD_MIN_SCORE`** ⇒ 不再让位给队友 ⇒ 我去救;
-      而刚报警时它还是低分(低于阈值) ⇒ 让位给正在旁边的人。
-      一条连续规则同时表达了"什么时候该让位"和"什么时候必须我上", 不用两个阈值。
+    分随 `ratio` 在 `BURN_URGENCY_KNOTS` 上上涨(**两段式**, 见那张表的注释:
+    刚报警就 ≳45, `ratio 1.5` 起压过一切)。这只是 `alert=1.0`(煮)的便捷壳。
+    ⚠ 本函数**没有调用方**(实盘走 `burn_urgency_alert`, 因为"搅"的门槛不是 1.0)——
+      留着是给离线核对当"煮"的入口, 别当成活的路径。
     """
     if ratio is None or ratio <= 1.0:
         return 0.0
@@ -177,23 +217,81 @@ def burn_urgency(ratio: float) -> float:
 
 
 def burn_urgency_alert(ratio: float, alert: float) -> float:
-    """同上, 但**报警阈值由调用方给** —— 因为"煮"和"搅"的门槛不一样。
+    """**锅快糊了该加多少分** —— 在 `BURN_URGENCY_KNOTS` 上按 `ratio` 线性插值。
 
-    用户 2026-09-15: "**不只是锅, 其他一样的, 搅拌器, 烤箱, 平底锅**"。
+    `ratio = prog / need`(已煮秒 / 需煮秒); `alert` = 这**种**加工方式的报警起点
+    —— 用户 2026-09-15: "**不只是锅, 其他一样的, 搅拌器, 烤箱, 平底锅**"。
 
     依据(反编译, 规则 1) —— 两者**毁掉**的门槛都是 `> 2×`, 只是**报警**起点不同:
       · 煮: `> 1×` ⇒ OverDoing;  · 搅: `> 1.3×` ⇒ OverDoing(`ServerMixingHandler.cs:56`)。
-    ⇒ 紧迫度在 `[alert, 2.0]` 之间从 **0 涨到满**:
-      刚报警时 0 分(低于 `YIELD_MIN_SCORE` ⇒ 让位给旁边的人), 越接近毁掉涨得越猛。
-    ⚠ `alert=1.0` 时**与老公式逐字相同**(`(r-1)/(2-1) == r-1`) —— 老调用方行为不变。
-    ⚠ `alert` 必须 < 2.0(等于 2 就是"一报警就毁"), 用 `max(1e-6, ...)` 兜住除零。
+
+      · `ratio <= alert` ⇒ **0.0** —— 还没进报警窗口, 一个字都不加;
+      · `ratio >= 2.0`  ⇒ `BURN_URGENCY_MAX`(糊了);
+      · 中间按拐点插值。**只有 `alert` 之上那一截有效** ⇒ 先把拐点按 `max(拐点, alert)`
+        裁一刀, 于是**搅拌器(alert=1.3)自动退化成** `(1.3,60) (1.5,120) (2.0,200)` ——
+        起点比"煮"高、形状不变, **不需要另一条公式**。
+
+    ☠ **别再退回"一条直线"**(改前的形状): 它在刚报警时是 0 分, 而实机账
+      (`s_lunar_1_4`) 证明距离/顺路那两项扣得比它涨得快 ⇒ 救锅在窗口前 23% 里排不上号。
+    ☠ 也不许用 `1/(2−ratio)` 那种发散形状: `ratio→2` 时无界 ⇒ 评分表读不懂。
+      拐点是**有界、单调、且每一点都说得出理由**的。
+    ⚠ `alert >= 2.0`(等于"一报警就毁")⇒ 没有可插值的窗口, 由末尾那句
+      `r >= pts[-1][0]` 兜住直接给满 —— **不会除零**。
     """
-    span = max(1e-6, 2.0 - float(alert))
-    return BURN_URGENCY_MAX * min(1.0, (float(ratio) - float(alert)) / span)
+    try:
+        r = float(ratio)
+        a = float(alert)
+    except (TypeError, ValueError):
+        return 0.0
+    if r != r or a != a:                 # NaN: 读到的怪值不许把它变成负分/爆分
+        return 0.0
+    if r <= a:
+        return 0.0
+    # 裁掉 `alert` 之下那一截; `max` 保序 ⇒ 结果仍是非降的拐点序列。
+    pts = [(max(k, a), v) for k, v in BURN_URGENCY_KNOTS]
+    if r >= pts[-1][0]:                  # 也兜住 `a >= 2.0` 的退化(那串点会压成一点)
+        return pts[-1][1]
+    for (x0, v0), (x1, v1) in zip(pts, pts[1:]):
+        if r <= x1:
+            if x1 <= x0:                 # 两点被 `alert` 压到一起 ⇒ 取后者(更高那个)
+                return v1
+            return v0 + (v1 - v0) * (r - x0) / (x1 - x0)
+    return pts[-1][1]
+
+
+def order_urgency(t, cap: float = None, floor: float = None) -> float:
+    """**订单快到期了该加多少分**(2026-09-17 按步协作: 两个厨师按"最高收益的那一步"分工)。
+
+    `t` = 订单栏那一格**现成的**剩余比例(1.0 = 刚出现, 0 = 到期; `_all_flows` 就带着它)。
+
+    形状照抄本仓另外两条紧迫度(`burn_urgency` / `wash_urgency`): **死区 + 连续上涨 + 封顶**,
+    **没有硬闸门** —— 到了残局它就自然压过别的候选, 不需要"if t < 0.2 then 优先"那种规则。
+      · `t >= floor` ⇒ **恰好 0.0** —— 时间还早, 一个字都不加 ⇒ **开局与改前逐字相同**;
+      · `t = floor` ⇒ 0;  `t = 0` ⇒ `cap`;  中间线性。
+
+    ☠ 别用 `1/t` 或裸 `(1-t)`: 前者在 `t→0` 时无界(小 t 主导一切, 评分表变得读不懂),
+      后者在 `t=0.9` 就已经在改排序(残局才该生效的事泄漏到开局)。
+    ☠ `cap`/`floor` 的量纲依据在 `ORDER_URGENCY_MAX` / `ORDER_URGENCY_FLOOR` 的注释里。
+    ⚠ 它是**位置无关**的(和 `urgency` 一样) ⇒ **队友那份也必须加同样的值**,
+      否则 `choose` 拿"我含时钟分"和"队友不含"比, 让位判定失真。
+    """
+    c = ORDER_URGENCY_MAX if cap is None else float(cap)
+    f = ORDER_URGENCY_FLOOR if floor is None else float(floor)
+    try:
+        v = float(t)
+    except (TypeError, ValueError):
+        return 0.0
+    if v != v:                       # NaN
+        return 0.0
+    v = min(1.0, max(0.0, v))        # clamp: 读到的怪值不许把它变成负分/爆分
+    span = max(1e-6, f)
+    if v >= f:
+        return 0.0
+    return c * min(1.0, (f - v) / span)
 
 
 def score(action: str, dist: float | None, follow: float = 0.0,
-          urgency: float = 0.0, advance: float = 0.0) -> float:
+          urgency: float = 0.0, advance: float = 0.0, clock: float = 0.0) -> float:
     """给一个候选动作打分。`dist is None` = 到不了 ⇒ 直接出局(`-inf`)。
 
     dist    —— 厨师到"台面旁可站格子"的**格距**(不是欧氏距离: 要绕墙走)
@@ -202,10 +300,18 @@ def score(action: str, dist: float | None, follow: float = 0.0,
                否则"我 vs 队友"就不是在比同一件事了。
     advance —— **"这一步用的是我手上正拿着的那份东西"** 的加成分
                (`HAND_ADVANCE_BONUS`)。**谁拿着算谁的** ⇒ 队友那份要按**队友手上**的算。
+    clock   —— **订单倒计时的加成分**(`order_urgency`, 2026-09-17 按步协作)。
+               ☠ **故意另开一个参数、不并进 `urgency`**, 两个理由:
+                 ① 日志的 `紧急` 列要能分辨"**锅快糊了**"还是"**单快到期了**" —— 而日志
+                    正是那件事的验收标准(看不出来的话, 分数变了也查不出是哪个加的);
+                 ② 它和 `urgency` 一样是**位置无关**的 ⇒ 必须**同时加到"队友那份"**上。
+               ⚠ 也**不许并进 `sig`**(`sigs` 要喂给 `transform` 的 sabotage 记忆 —— 改 `sig`
+                 等于改捣蛋鬼的行为)。
     """
     if dist is None:
         return NEG_INF
-    return step_value(action) - W_DIST * dist - W_FOLLOW * follow + urgency + advance
+    return (step_value(action) - W_DIST * dist - W_FOLLOW * follow
+            + urgency + advance + clock)
 
 
 # ---------------------------------------------------------------- 状态变换

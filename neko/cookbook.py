@@ -323,7 +323,7 @@ def resolve_leaf(kb: "Knowledge", name: str) -> dict:
     # 判"**要不要切**"时**连 prefab 一起看**: 加工参数(prefab 名/切几片)只写在 prefab 上,
     # 开局限定"只看实例"会让整条链丢掉 `chop`(见 `raw_for` 的长注释)。
     # ⚠ `src` 仍然只取场景实例/箱子 —— prefab 没有位置, 导航不过去。
-    raw_k = raw if raw is not None else kb.raw_for(name, scene_only=False)
+    raw_k = raw if raw is not None else (None if kb.ready_for(name) is not None else kb.raw_for(name, scene_only=False))
     ready = kb.ready_for(name)
     crate = kb.crate_for(name)
     from_crate_raw = crate is not None and crate.spawnNext == name
@@ -458,6 +458,7 @@ class Op:
     #: ⇒ 给个显式字段, 别让 `op_rescue` 去猜(这个文件里"别赌"的教训写过好几次)。
     #: 空串 = 没填 ⇒ 退回老行为(按锅处理)。
     vessel: str = ""
+    cook_id: int = 0  # Recipe cooking step; 0 means unavailable from an older bridge.
     #: **这一条 `mix` 要一起进碗的还有哪几份**(`target` 是其中一份)。
     #:
     #: ☠☠ 用户 2026-09-15 的规格(原话):
@@ -497,6 +498,17 @@ class DishFlow:
     name: str
     plate: str = ""        # 订单要求的容器(OrderDefinitionNode.m_platingStep)
     ops: list = field(default_factory=list)
+    #: **这张单在订单栏上的槽位键**(`team.OrderBoard.key_of(o)` = `#524212:Sushi_Fish`)。
+    #:
+    #: ☠☠ 为什么必须有(2026-09-17 按步协作): 订单栏上**同一道菜会同时挂好几张**
+    #:   (实测 `Sushi_Fish` 一次挂 5 张), 而 `DishFlow` 原来**只有菜名** ⇒ 所有"按名字判"
+    #:   的地方都把 N 张单当成同一张: `_order_live`("这单还在不在")、`_pots_live["flow"]`、
+    #:   `publish_plan` 的计划键(同名多单**共用一份计划**)。
+    #:   ⇒ 步级占位(`step_key(槽位键, 步号)`)也要它 —— 没有槽位键就定不出"这是第几步"。
+    #: ⚠ **必须是带默认值的字段**, 且放在 `name` 之后(`name` 无默认值 ⇒ `@dataclass`
+    #:   的字段顺序不能乱); 空串 = "还不知道/单人模式" ⇒ 所有按槽位判的地方都要容忍它。
+    #: ⚠ 由 `Engine._order_pool` 在 `derive` 之后填(见那一步的注释), **`derive` 自己不知道**。
+    slot: str = ""
 
     def __str__(self) -> str:
         head = f"【{self.name}】" + (f" 容器={self.plate}" if self.plate else " 容器=无")
@@ -542,6 +554,21 @@ def derive(detail: dict, kb: Knowledge) -> DishFlow:
     flow = DishFlow(name=detail.get("name", "?"), plate=detail.get("plate", "") or "")
     tree = detail.get("tree")
     ops = []
+    # Keep one ID per leaf occurrence, including repeated ingredients. The nearest
+    # enclosing cooking node defines that leaf's treatment (IsMatch IL_0019-002f).
+    cook_ids = []
+    def collect_cook_ids(node, inherited=0):
+        if not isinstance(node, dict):
+            return
+        cid = int(node.get("cookId", 0) or 0) if node.get("k") == "cook" else inherited
+        if node.get("k") in ("ing", "item"):
+            cook_ids.append(cid)
+        for child in node.get("i") or []:
+            collect_cook_ids(child, cid)
+        for child in node.get("o") or []:
+            collect_cook_ids(child, inherited)
+    collect_cook_ids(tree)
+    cook_ids = iter(cook_ids)
 
     #: **同一个 `mix` 节点 = 一个碗** —— 这一组的"收尾"要在它最后一份之后发,
     #: 所以循环里先记账、到边界(`_flush_group`)再吐 `mix`/`cook`。
@@ -580,6 +607,7 @@ def derive(detail: dict, kb: Knowledge) -> DishFlow:
             _seg["mk"], _seg["leads"], _seg["cooked"] = _mk, [], False
         if kind == "__end__":
             break
+        cook_id = next(cook_ids, 0)
         _grouped = _mk is not None          # 在 mix 组里 ⇒ cook/mix/assemble 都留给收尾
         if _grouped and kind != "item" and name:
             _seg["leads"].append(name)
@@ -646,7 +674,7 @@ def derive(detail: dict, kb: Knowledge) -> DishFlow:
                 wait = 0.0
                 in_pot = True
             ops.append(Op("cook", name, note, wait=wait, optional=optional,
-                          in_pot=in_pot))
+                          in_pot=in_pot, cook_id=cook_id))
         if mixed and not _grouped:
             ops.append(Op("mix", name, "需要搅拌", optional=optional))
 

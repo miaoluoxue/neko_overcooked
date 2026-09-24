@@ -1,0 +1,919 @@
+# -*- coding: utf-8 -*-
+"""**递归目标分解规划器** —— 把"这一单怎么完成"推成一份带分工与依赖的计划。
+
+用户 2026-09-16 定的方向(原话):
+
+  > "我们需要完整语义的可行性分析, **递归验证这条分支的所有可行性**, 这样面对新机制也能被
+  >  拆解成简单的交互(背包的路径应该是, 背起-和队友的背包交互-得到食材-继续后续)因为
+  >  **和自己的背包交互是不可行的**……包括分块地图的传递可以被分解为 拿取食材-传递-等待-
+  >  传递-继续……其他不可能完成就直接拉低评分了。但是这里是需要**同时对两个厨师递归**的……
+  >  **递归的重要性是得到这一关如何得到订单的解的**, 一旦获取到解, 就可以简化成对执行层的
+  >  可行性检查了。"
+
+**核心洞见**: 同一个递归, 两个机制都出来了 —— 新机制不用改代码, 只要**基元的语义写对了**。
+
+## 这个模块只做一件事: 搜索
+
+☠☠ **判据一律不在这儿**。可行性判据是 `engine._op_actionable` / `_feasible` 那一份
+(`_feasible` 是它的唯一合并入口), 规划器把它当**注入进来的 `check`**。理由是这个项目为
+"同一件事两处各写一份"栽过两次(`OP_PREREQ` 与 `derive()` 给出相反顺序; `brief.py` 按猜的
+键名找链)。所以本模块**不 import bridge / 游戏 / KitchenMap** —— 同 `scoring.py` 的纪律,
+只吃数据、只吐计划 ⇒ 拿假世界和假 `check` 就能离线断言。
+
+## 分层: 规划期只探测, 不绑坐标
+
+| | 内容 | 何时算 |
+|---|---|---|
+| **骨架**(本模块产出) | 因果链 + 每步**谁做** + **依赖(DAG)** | 每单一次 |
+| **接地** | 每步具体去哪一格/哪个箱子 | **执行期每轮重解析**(`_op_target_for_score` 本来就在做) |
+
+两条理由:
+  · **成本** —— `check` 依赖两张预计算的 BFS 表(`_rank_candidates` 现在每次决策算那两张)。
+    两张表**算一次、所有步骤共用** ⇒ 规划期总成本仍是 2 趟 BFS。这是可解性的关键。
+  · **正确性** —— 计划里的坐标从"规划那一刻"到"执行到那一步"之间, 世界早变了(队友走了、
+    盘子被端了)。**当骨架用、不当坐标用**才对。
+
+## 递归规则("机制语义")
+
+```
+have(c, X)     ← 让厨师 c 拿到 X
+  ├─ 台面上/地上/箱子出它          → fetch X                    (无前置)
+  ├─ **d 背上的背包**出它, d≠c     → fetch X(pin_src=背包) + worn(d, 背包)
+  ├─ 队友 d 代取再传给我, d≠c      → have(d, X) + pass(d→c, X)
+  └─ 它是某加工步骤的产物          → 展开那个上游步骤
+worn(d, pack)  ← 让 d 背着它        → 某人 wear(pack)  (背的人可以是 c 也可以是 d)
+```
+
+**跨人约束就是剪枝**, 也正是"必须同时对两个厨师递归"的来源:
+  · `draw` 要求 **取的人 ≠ 背的人** —— 自己的背包自己取不了
+    (`Backpack.CanHandleDispenserPickup` 是**别人**对你判的, `Backpack.cs:25-33`);
+  · `pass` 要求 **d ≠ c**。
+"""
+
+from __future__ import annotations
+
+import os                      # ← 只为 `NEKO_PLAN_MAKESPAN` 那个回退开关(调度策略, 不是判据)
+
+from dataclasses import dataclass, field
+
+from cookbook import Op
+from map_model import _norm_name as norm
+
+#: 递归深度上限 —— 防病态输入把栈打穿(正常一单 ≤ 20 步)。
+MAX_DEPTH = 24
+
+#: **"这一步之后链子就走不下去了"的罚分** —— 见 `plan()` 里挑厨师那一段。
+#:
+#: 要比任何正常的格距大好几个数量级(一条链加起来也就几十格), 但**不是 `inf`** ——
+#: 万一两个厨师都做不了下一步, 那也还是得有人去把料取回来(由执行层去试),
+#: 不能因为"链子断"就判整单无解。
+CHAIN_DEAD_PENALTY = 1e6
+
+#: **派活时看不看"并行"**(2026-09-17, 用户: "两个厨师各做贪心未必是最优解")。
+#:
+#: `1`(默认) —— 目标 = **并行之后最长的那条**(makespan): 把这一步派给谁之后,
+#:   **两个厨师各自的总时间取最大**, 取最小的那个。
+#: `0`       —— 逐字退回老行为: 只看"**这个目标对谁最便宜**"(`min(该厨师的份额代价)`)。
+#:
+#: ☠☠ 为什么老口径不够: 那是**串行求和**, 而两个厨师是**并行**的 ——
+#:   它会把整单排给同一个厨师(只要那个人每一步都稍便宜一点), 而**另一个闲着**。
+#:   实测症状(仓库里记过两次): `★ 我(P2)下一步应为: (没有分给我的步)` —— 计划整单排给了 P1。
+#: ⚠ 这是**调度策略**, 不是可行性判据 —— 所以它敢放在 `planner.py` 里(判据仍然全部注入)。
+PLAN_MAKESPAN = (os.environ.get("NEKO_PLAN_MAKESPAN") or "1").strip().lower() \
+    not in ("0", "off", "no", "false")
+
+#: `WorldView.plate_src` 的 `how` → **日志里那句人话**。
+#: 只在 `assumptions` 里用 ⇒ 键对不上时退回打原样(不许因为它而丢一行)。
+PLATE_HOW = {"on_spot": "摆盘位上那只", "stack": "盘子堆", "counter": "台面上的空盘",
+             "hand": "手上那只"}
+
+#: 可以用来"拆成两半 + 传递"的动作 —— 料能拿在手上的那些。
+#: ⚠ `assemble`/`deliver` **不在**里面: 它们作用的是台面/盘子, 不是"把料传过去"能解决的。
+PASSABLE = ("fetch", "chop", "cook", "mix")
+
+
+# ---------------------------------------------------------------- 世界视图
+
+@dataclass
+class Source:
+    """**这一份料能怎么拿到** —— 一条"货源描述"。"""
+
+    #: `"here"`   = 台面上/地上就有(走过去拿, 无前置)
+    #: `"crate"`  = 某个箱子 / **没被背**的背包出它(同上, 无前置)
+    #: `"pack"`   = 某个背包出它(**只有被背着的才掏得出来**, 见 `_solve_have_inner` ②)
+    kind: str
+    #: 台面 id / 背包名 —— 会写进 `Op.pin_src`(见那边的注释: 钉死货源)
+    ref: str = ""
+    #: `kind == "pack"` 时: **现在背着它的人**; `< 0` = **还在场上没人背**
+    #: ⇒ 得先有人把它背上才掏得出(而那一步会决定"谁不能来取")。
+    chef: int = -1
+
+
+@dataclass
+class WorldView:
+    """规划器眼里的世界 —— **只装语义事实, 不装地图细节**。
+
+    适配器(引擎侧)负责从 `km`/`kb`/`st` 建出来; 离线探针直接手写一个。
+    这样规划器不必知道 `Station.on` / `Chef.back` 这些字段长什么样。
+    """
+
+    #: 场上有哪些厨师(通常 (0, 1))
+    chefs: tuple = (0, 1)
+    #: 归一化料名 -> `[Source, ...]`
+    sources: dict = field(default_factory=dict)
+    #: 归一化料名 -> `[上游动作名, ...]` —— 哪些加工步骤能产出它(`chop`/`cook`/`mix`)
+    made_by: dict = field(default_factory=dict)
+    #: 归一化料名 -> 那件东西**还没加工完**(知识表里有 `next`) ⇒ 上不了盘
+    needs_work: dict = field(default_factory=dict)
+    #: 厨师 -> 他**背上**那个背包的名字("" = 空手背)
+    chef_back: dict = field(default_factory=dict)
+    #: 厨师 -> 他**手上**拿着什么 —— 计划推演的**起点**(之后由 `_apply_effect` 推进)。
+    chef_held: dict = field(default_factory=dict)
+    #: **还在场上、没人背**的背包名 —— `solve_worn` 靠它区分
+    #: "马上就能背上"和"已经不在了(被人捡走/掉水里)"
+    resting_packs: list = field(default_factory=list)
+    #: **正在煮/搅的那些** —— `[(灶台 id, 归一化料名, 离熟还有几秒)]`。
+    #:
+    #: ☠☠ **只当事实用, 不参与搜索判据**(2026-09-17 三层的接缝)。它由 `_plan_ctx` 从
+    #:    开火台账(`Engine._pots_live`)现读 —— 那是"**放完就走**"那套的记忆。
+    #: 用途只有一处: 让**计划说得出来**"为什么没从『去箱子拿一份 X』开始"
+    #:   (X 已经在灶上了) —— 写进 `assumptions` / `notes`, 人读日志时一眼看见。
+    #: ☠ **为什么不拿它改搜索**: "到点回去取"是**执行层**的事(`_tends` + `KIND_DEFER`
+    #:   + 那条硬上限), 而规划器自己构造的 `tend` 步**没有 `at_x/at_z`**
+    #:   (`_tends` 才有) —— 在这儿另造一条判据 = 把同一件事写第二遍, 本仓为这个栽过两次。
+    cooking: list = field(default_factory=list)
+    #: 这一刻的**世界指纹** —— 参与记忆化的 key。世界没变就不重算(见 `_Ctx.memo`)
+    #: ☠ **2026-09-17 核实: 这是死字段** —— `_plan_ctx` 老老实实填了 `terrain().ver`,
+    #:   而规划器全文**没有一处读它**; `memo` 又挂在每次新建的 `_Ctx` 上
+    #:   ⇒ "世界没变就不重算"**根本没实现**(只在单次 `plan()` 调用内有效)。留着是
+    #:   给以后接线用的, 别以为它现在管用。
+    epoch: object = 0
+
+    #: **本单的摆盘位** —— `(sid, x, z)`;"这块台面摆盘"是**规划期**用**只读**模式
+    #: (`pick_assemble_spot(claim=False)`)挑出来的。`None` = 这一关一块能摆盘的台面都没有。
+    #:
+    #: ☠☠ 为什么要它(用户点名的"规划器**推不出『去哪拿一只盘子』**"):
+    #:   执行层拿盘子的路有**三条**(摆盘位上已经有一只 / `_empty_plate_source` 的
+    #:   盘子堆与台面空盘 / 手上那只), 而规划器**一条都不知道** ——
+    #:   `derive()` 的链里压根没有"拿盘子"这一步(执行层是在 `op_assemble` /
+    #:   `_get_plate_for_pot` 里顺手解决的)。后果有两层:
+    #:     · 计划说不出"摆盘位在哪", 于是 `assemble` 那几步**恒被标成**
+    #:       `探测期判不可行(还没挑摆盘位)` —— 一句**假理由**(那不是"不可能",
+    #:       是"规划期没去问"); 见 `Engine._PlanView`。
+    #:     · **"盘子从哪来"这条约束根本没进计划** ⇒ 这份计划在"全场一只空盘都没有"
+    #:       的世界里看起来照样成立, 到执行期才一个接一个失败。
+    #: ⇒ 现在把执行层那三条**只读地**在规划期解析一遍, 由适配器填进来。
+    plate_spot: tuple = None
+    #: **那只空盘从哪来** —— `(how, sid, x, z)`; `how` ∈
+    #:   `"on_spot"`(摆盘位上已经有一只, 材料放上去直接进盘) /
+    #:   `"stack"`(盘子堆) / `"counter"`(台面上的空盘)。
+    #: ⚠ 与 `plate_spot` **是两件事**: 位子挑得出来 ≠ 上面有盘。
+    #: ⚠ **"不知道"和"问过了、真没有"是两回事** —— 后者见 `plate_known`。
+    plate_src: tuple = None
+    #: **适配器真的去查过"盘子"这件事吗**。
+    #:
+    #: ☠☠ 没有它, 老调用方(手写 `WorldView` 的离线桩, 以及 `NEKO_PLAN_PLATE=0`)
+    #:   会被读成"**全场一只空盘都没有**" ⇒ 每份计划都多一条 `⚠` 假设 + 一条剪枝理由。
+    #:   那是**假信号**: 真因是"没人去问"。本仓为这个形状栽过(见 `cook_steps` 的
+    #:   "空列表 = 拿不到这件信息 ⇒ 退回老行为, 别当成'哪儿都不能进'")。
+    #: ⇒ `False`(默认) = **一行都不说**; `True` + `plate_src is None` 才是"真的没有"。
+    plate_known: bool = False
+
+
+# ---------------------------------------------------------------- 计划
+
+@dataclass
+class Step:
+    """计划里的一步。"""
+
+    chef: int
+    op: Op
+    #: 依赖的 step 下标(在 `Plan.steps` 里) —— 跨人依赖也在这儿。
+    #: ⚠ 两个厨师是**并行**执行的, 所以这里给的是**偏序(DAG)**而不是全序:
+    #:   每个引擎每轮取"分给我、且依赖都已完成"的第一步来做。
+    deps: tuple = ()
+    why: str = ""
+    #: **这一步的代价** —— 注入的 `check` 报回来的**第三个值**。
+    #:
+    #: 为什么要它: 没有代价就只能"**谁先试到谁做**"(`for c in chefs: 第一个可行的`) ——
+    #: 于是"该让近的人做"这件事**推不出来**, 分工是"可行"而不是"最优"。
+    #: ⚠ 它是**规划那一刻**的量, 执行时要重新接地; **只用来比大小**, 不作别用。
+    #: ☠☠ **单位由注入方定, 本模块不管**(2026-09-17): 引擎那边已经从"**格数**"换成了
+    #:   "**秒数**"(`Engine._op_seconds` —— 走路的秒数 + 动作本身的服务时间), 因为
+    #:   "两个厨师各做贪心未必是最优解, 需要**相同时间最高分**的路线"要解的是**时间**。
+    #:   所以这里的日志只写"总代价 N", **不写单位** —— 单位只有一处(引擎那一侧)。
+    cost: float = 0.0
+    #: **这一步属于哪张单** —— 槽位键(`DishFlow.slot`), 没有才退回菜名。
+    #:
+    #: ☠☠ 为什么必须有它(2026-09-17 跨单合并计划): 合并之后**一份计划里有好几张单的步**,
+    #:   而下游判"这一步做完了没"(`Engine._plan_next`)和"这一步是不是排给我的"
+    #:   (`Engine._plan_bonus`)**原来只看 `(action, 归一化 target)`** ——
+    #:   **两张单完全可以有同名同步的步骤**(实测订单栏同时挂 5 张 `Sushi_Fish`),
+    #:   于是"A 单的 `fetch Rice` 做完了"会把"B 单的 `fetch Rice`"一起判成做完了,
+    #:   奖励分也会加错那一张单的步。这正是本仓"**订单没有 id、只有名字**"那条账的
+    #:   第五处(前四处: 锅台账归属 / 传球台账清空 / `_flow_completed_by` / 计划黑板键)。
+    #: ⚠ 口径**必须与 `Engine._plan_key` 逐字一致**(`slot or name`) —— 两边要能对上,
+    #:   否则归属过滤会静默筛空。空串 = 老调用方(离线探针的假 `Flow` 没有 `slot`)。
+    slot: str = ""
+
+    def __str__(self) -> str:
+        return "P%d %s %s" % (self.chef + 1, self.op.action, self.op.target)
+
+
+class Assumption(str):
+    """**一条"这份计划依赖的世界事实"** —— 它**就是**那行日志文本, 另外挂着三个标签。
+
+    为什么是 `str` 的子类(2026-09-17, 让 `Plan.assumptions` **可以被校验**):
+      `Plan.assumptions` 原来只是一串**人话**("货源 counter1 仍然存在且够得着"),
+      而 `Plan.assumptions` 自己的 docstring 写着「地图/世界更新时**只校验这些**
+      (破了就局部修补)」—— **一句散文是没法校验的**, 于是那句话一直只是句口号:
+      世界变了没人管, 直到某一步**真的失败**才 `_plan_dirty` 整份作废。
+
+      ⇒ 把文本**原样**留着(日志/`__str__`/`sorted(set(...))`/`" | ".join(...)`
+        逐字不变, 这才是能把改动说成"加法"的关键), 另外挂上:
+          · `kind` —— 哪一类事实(`src`/`wear`/`back`/`cooking`/`plate_spot`/…);
+          · `key`  —— 具体是**哪一个**(台面 id / 料名 / `"厨师|背包名"`);
+          · `slot` —— 这一条属于**哪张单**(槽位键); **空 = 全局**(归属不明)。
+
+    ☠☠ **`slot` 空是"不知道", 不是"没有归属"** —— 校验时按**最保守**处置(整份作废),
+      而不是猜一张单去作废。全局性的事实(摆盘位/正在煮的锅/全场有没有空盘)天生
+      不属于任何一张单 ⇒ 它们就该是空。见 `Engine._plan_check`。
+
+    ☠ **别把 `kind`/`key` 忘了填** —— 漏填的后果是**静默**的: 校验器认不出这一类,
+      一律放行(那是刻意的兜底, 见 `Engine._assumption_ok`), 于是这条假设**永不报警**。
+      和 `Step.slot` 那条账是同一个形状: 标签漏了不报错, 只是那条路悄悄不生效。
+    """
+
+    __slots__ = ("kind", "key", "slot")
+
+    def __new__(cls, text, kind: str = "", key: str = "", slot: str = ""):
+        o = super().__new__(cls, text)
+        o.kind, o.key, o.slot = kind, key, slot
+        return o
+
+    def __repr__(self) -> str:                 # 调试时看得见标签, 别只印文本
+        return "Assumption(%r, kind=%r, key=%r, slot=%r)" % (
+            str(self), self.kind, self.key, self.slot)
+
+
+def dedup_assumptions(items) -> list:
+    """**排序 + 去重** —— 与老的 `sorted(set(那一串文本))` **逐字等价**。
+
+    ☠ 去重按**文本**(`str.__eq__`/`__hash__` 继承自 `str`) ⇒ 与改前同一套相等性;
+      排序也按文本 ⇒ 日志里那几行的次序一个字节都不变。
+      ⚠ **不能图省事直接 `sorted(set(items))`**: 那样相等的判据会退化成"文本相同**且**
+        标签相同" —— 两张单里同一条全局假设(摆盘位那种)会从"一行"变成"两行"。
+    """
+    seen, out = set(), []
+    for a in items or []:
+        if str(a) in seen:
+            continue
+        seen.add(str(a))
+        out.append(a)
+    out.sort(key=str)
+    return out
+
+
+@dataclass
+class Plan:
+    #: ⚠ **展示用**的名字。跨单合并之后它可能是**好几张单**拼起来的
+    #:   (`"A + B + C"`) —— 想判"这份计划覆盖哪几张单"要看 `slots`, **别解析它**。
+    flow: str = ""
+    steps: list = field(default_factory=list)
+    #: **这份计划依赖了哪些世界事实** —— "P2 背着出 X 的背包" / "mix1 可达" 这类。
+    #: 地图/世界更新时**只校验这些**(破了就局部修补), 而不是整体重规划。
+    #: 这是用户那个"动态地图要不要重规划"的答案的一半(另一半是重接地)。
+    #:
+    #: ☠☠ **元素是 `Assumption`(一个 `str` 子类)** —— 它**就是**那行日志文本,
+    #:   另外挂着 `kind`/`key`/`slot`。所以 `sorted`/`set`/`join`/`in`/f-string
+    #:   全按**文本**走, 打印与加这件东西之前**逐字相同**; 而 `Engine._plan_check`
+    #:   拿那三个标签去**真的校验**(2026-09-17 —— 在那之前这句 docstring 是句口号:
+    #:   一串散文没法校验, 于是世界变了没人管, 直到某一步真失败才整份作废)。
+    #: ⚠ 字符串(老调用方/离线桩直接塞进来的)也**收**: 校验时认不出 `kind` 就放行。
+    assumptions: list = field(default_factory=list)
+    cost: float = 0.0
+    notes: list = field(default_factory=list)
+
+    @property
+    def slots(self) -> tuple:
+        """**这份计划覆盖了哪几张单** —— 槽位键的元组(按首次出现去重)。
+
+        ☠ 它是 `Engine._plan_flow` 做归属过滤的依据: 合并计划覆盖 3 张单 ⇒ 收窄闸门
+          就该放行**这 3 张单**的候选, 而不是只放行第一张(老行为的后果是
+          "计划活着的时候跨单池每轮都被压回一张单" ⇒ `COOP_ORDERS` 静默失效)。
+
+        ☠☠ **是"算出来的", 不是"存下来的"** —— 本仓规矩 1(一个事实只有一处)。
+          存一份字段就要在 `_plan_one` 和 `plan` 两处填, 而它**完全由 `Step.slot`
+          决定** ⇒ 两份迟早对不上; 对不上的症状是**静默**的(收窄放行了错误的单)。
+        ⚠ 空元组 = 老计划/离线桩(它们的 `_Step` 没有 `slot`)⇒ 读的人**退回**
+          原来那个键(`_plan_cur_key`), 那是老语义。
+        """
+        return tuple(dict.fromkeys(s.slot for s in self.steps if s.slot))
+
+    def steps_of(self, chef: int) -> list:
+        """分给某个厨师的那些步(按计划内顺序)。"""
+        return [s for s in self.steps if s.chef == chef]
+
+    def ready_all_for(self, chef: int, done: set) -> list:
+        """**这个厨师现在能动手的所有步** —— 分给他、且依赖都已完成的那些。
+
+        ☠☠ 为什么是**列表**而不是"第一步"(跨单合并计划, 2026-09-17):
+          合并计划是**几条链的并集**, 而链与链之间**没有依赖边** ——
+          拿"第一个就绪的"会让执行层**一路串行做完第一张单**才开始第二张
+          (`ready_for` 是按 `steps` 顺序扫的, 而第一张单整条链都排在前面)。
+          那等于把跨单并行**又**掐掉了, 只是换了个地方掐。
+          ⇒ 每个厨师手上的**每条链的链首**都该是就绪的, 由执行层的评分
+          (距离/时钟分/步级占位)去挑先做哪个 —— 那才是"计划影响排序, 不接管执行"。
+
+        ⚠ 单张单时结果与老的 `ready_for` **逐字等价**(一条链只有一个链首):
+          返回长度 0 或 1, 且第一个就是老写法会返回的那一个。
+
+        `done` = 已完成/已作废的 step 下标集合。
+        """
+        return [s for i, s in enumerate(self.steps)
+                if i not in done and s.chef == chef
+                and all(d in done for d in s.deps)]
+
+    def ready_for(self, chef: int, done: set) -> Step | None:
+        """**这个厨师下一步该做哪个** —— 分给他、且依赖都已完成的第一步。
+
+        ⚠ 保留给老调用方(离线探针 + 日志)。跨单合并计划下**执行层不该用它**
+          —— 理由见 `ready_all_for`。
+        """
+        _r = self.ready_all_for(chef, done)
+        return _r[0] if _r else None
+
+    def __str__(self) -> str:
+        out = [f"【{self.flow}】计划 {len(self.steps)} 步, 估代价 {self.cost:.1f}"]
+        for i, s in enumerate(self.steps):
+            dep = ("  ←依赖 " + ",".join(str(d) for d in s.deps)) if s.deps else ""
+            sl = f"[{s.slot}] " if s.slot else ""
+            out.append(f"  {i}. {sl}{s}{dep}   {s.why}")
+        for a in self.assumptions:
+            out.append(f"  ⚠ 假设: {a}")
+        return "\n".join(out)
+
+
+# ---------------------------------------------------------------- 搜索
+
+@dataclass
+class _Ctx:
+    """一次 `plan()` 调用的全部中间状态 —— **不用全局变量**(那会让离线断言互相污染)。"""
+
+    world: WorldView
+    check: object                       # (op, chef) -> (ok, why, dist)
+    log: object = None
+    #: `(归一化料名, chef)` -> `list[Step]` 或 `None`(记下"不行", 免得反复试)
+    memo: dict = field(default_factory=dict)
+    #: 正在展开的 `(归一化料名, chef)` —— 撞上就是环, 当场剪掉
+    visiting: set = field(default_factory=set)
+    #: **计划推演出来的手持**: `{chef: 手上拿着什么}` —— 见 `_apply_effect`。
+    #:
+    #: ☠☠ 为什么必须有它(`assume_held` 原来写死成 `op.target` 是不够的):
+    #   计划里**第 8 步的判据用的是第 0 步的世界**。而那意味着靠后的步骤全都判
+    #   "做不了" ⇒ 整条链**根本没被验证过** —— 与"递归验证这条分支的所有可行性"
+    #   **正相反**(实测: `s_festivemashup_1_3` 的计划里第 5~9 步全是"留给执行层")。
+    #   ⇒ 沿着计划把**每一步的效果**应用到一个符号状态上, 后面的步骤就拿这个状态判。
+    #   ⚠ 只建模**手持**(唯一一个链路真正依赖的转移)。碗里几份 / 灶上有没有锅 /
+    #     盘子在不在 —— **都还没建模**, 那些仍按"当前帧"判。见文件头 "已知未建模"。
+    held: dict = field(default_factory=dict)
+    n: int = 0                          # 已产出的 step 数(防跑飞)
+    notes: list = field(default_factory=list)
+    depth: int = 0
+
+
+def _say(ctx: _Ctx, msg: str) -> None:
+    ctx.notes.append(msg)
+    if ctx.log is not None:
+        ctx.log(f"[规划] {msg}")
+
+
+def _ok(ctx: _Ctx, op: Op, chef: int, assume_held=None):
+    """问注入的检查器。契约: `check(op, chef, assume_held=None) -> (ok, why, dist)`。
+
+    ⚠ **判据不在这儿** —— 这一层只管转发。`ok` 为假时把 `why` 原样带出来(日志要看得见原因)。
+
+    ☠☠ **`assume_held` = "假设这个厨师手上拿着这份料"** —— 没有它就推不出跨人路线。
+      为什么必须要有(2026-09-16 实测打回来的): 规划器要表达
+      "**P2 先掏出来、再传给我**", 而那**第二步的前提**是"P2 手上已经有它了" ——
+      可规划那一刻 P2 手上是空的。而 `_feasible` 读的是**当前帧**的手持
+      (`_op_actionable` 的 `pass` 分支第一句就是 `_held_is(held, op.target)`)
+      ⇒ 不假设的话,**跨人传递那条路永远判不可行**, 规划器就永远推不出正解。
+      ⚠ 这不是"让判据变松" —— 假设的是**前一步的效果**, 而那一步在计划里是**真的会做**的。
+    """
+    try:
+        r = ctx.check(op, chef, assume_held)
+    except Exception as e:                                     # noqa: BLE001
+        return False, f"check 抛异常({e!r})", None
+    if not r:
+        return False, "check 返回空", None
+    ok = bool(r[0])
+    why = r[1] if len(r) > 1 else ""
+    dist = r[2] if len(r) > 2 else None
+    return ok, why, dist
+
+
+def _apply_effect(op, chef: int, held: dict, chefs=()) -> None:
+    """**把这一步的效果应用到"计划推演出来的手持"上** —— 见 `_Ctx.held`。
+
+    ☠ 判据的依据是 `cookbook.derive()` 给的那条链的不变量:
+      `fetch → [chop] → [cook|mix] → assemble` —— 链上**每一步作用的是同一个物理个体**,
+      所以拿着的那份从头到尾没换过, **直到 `assemble` 把它交出去(进碗/进盘)**。
+      · `fetch`            → 手上就是它
+      · `chop`/`cook`/`mix` → 还是它(切/煮/搅都不换手, `derive` 的注释写明了)
+      · `assemble`         → **手空了**(料进碗/进盘了)
+      · `deliver`          → **手空了**(盘子送出去了)
+      · `wear`             → **手上什么都不变**(背上的东西不进手) —— 这条最容易错,
+        背包进了 `Back` 槽位, 而 `interact` 的验收只看 `held`(实测过, 见 `_wear_backpack`)。
+    """
+    a = op.action
+    if a in ("fetch", "chop", "cook", "mix"):
+        held[chef] = op.target
+    elif a in ("assemble", "deliver"):
+        held[chef] = ""
+    elif a == "pass":
+        # 传给**队友**(`op_pass` 丢向 `_mate`) ⇒ 料**换手**: 丢的人空了, 对面拿到了。
+        held[chef] = ""
+        for d in chefs:
+            if d != chef:
+                held[d] = op.target
+    # wear: **手上什么都不变** —— 背上的东西不进手槽位(见上面的注释)。
+
+
+def _ways(ctx: _Ctx, item: str, kind: str) -> list:
+    return [s for s in (ctx.world.sources.get(norm(item)) or []) if s.kind == kind]
+
+
+def solve_worn(ctx: _Ctx, wearer: int, pack: str) -> list | None:
+    """**让 `wearer` 自己背上 `pack`** —— 已经背着就返回 `[]`(零步), 背不上返回 `None`。
+
+    ☠☠ **背的人只能是 `wearer` 本人, 不能"随便挑一个"** —— 游戏里"背上背包"就是
+      **按拾取键的那个人**自己背上(`ServerBackpack.HandlePickup` 把背包挂到
+      `_carrier` 的 `PlayerAttachTarget.Back` 上, `ServerBackpack.cs:70-82`)。
+      挑错了人 ⇒ 背包到了别人背上, 而后面那句 `fetch` 是按"从 `wearer` 背上取"推出来的
+      ⇒ **当场变成"自己取自己的背包"** —— 一条物理上做不到的解, 而且是最坏的那种
+      (不报错, 走过去按半天)。
+    """
+    if (ctx.world.chef_back or {}).get(wearer, "") == pack:
+        return []
+    if pack not in (ctx.world.resting_packs or []):
+        # 既不在谁背上、也不在场上了(被人捡走/掉水里了) ⇒ 这条路现在不成立。
+        ctx.notes.append(f"{pack} 既没被背、也不在场上 —— 推不出怎么把它弄上身")
+        return None
+    op = Op("wear", pack, note=f"把 {pack} 背上")
+    op.pin_src = pack
+    ok, why, _d = _ok(ctx, op, wearer)
+    if ok:
+        return [Step(wearer, op, cost=(_d or 0.0),
+                     why=f"P{wearer+1} 把 {pack} 背上(两个人都背上之前谁都取不到料)")]
+    ctx.notes.append(f"P{wearer+1} 背不上 {pack}: {why}")
+    return None
+
+
+def solve_have(ctx: _Ctx, chef: int, item: str) -> list | None:
+    """**让 `chef` 拿到 `item`** —— 返回达成它的步骤序列, 不行返回 `None`。
+
+    这是递归的核心。"不行"和"没试过"**必须分开**(`memo` 记 `None`) —— 否则环检测和
+    重复展开会让搜索退化。
+    """
+    key = (norm(item), chef)
+    if key in ctx.memo:
+        return ctx.memo[key]
+    if key in ctx.visiting:
+        ctx.notes.append(f"环: {item}(P{chef+1}) 又绕回自己了")
+        return None
+    if ctx.depth >= MAX_DEPTH:
+        ctx.notes.append(f"深度到顶({MAX_DEPTH}), 放弃展开 {item}")
+        return None
+
+    ctx.visiting.add(key)
+    ctx.depth += 1
+    try:
+        out = _solve_have_inner(ctx, chef, item)
+        ctx.memo[key] = out
+        return out
+    finally:
+        ctx.depth -= 1
+        ctx.visiting.discard(key)
+
+
+def _solve_have_inner(ctx: _Ctx, chef: int, item: str) -> list | None:
+    # ---- ① 直接货源: 台面上 / 地上 / 箱子(含**没被背**的背包) ----
+    for s in _ways(ctx, item, "here") + _ways(ctx, item, "crate"):
+        op = Op("fetch", item, note=f"从 {s.ref or '场上的现货'} 取")
+        if s.ref:
+            op.pin_src = s.ref
+        ok, why, _d = _ok(ctx, op, chef)
+        if ok:
+            return [Step(chef, op, cost=(_d or 0.0), why=f"现货在 {s.ref or '场上'}")]
+        ctx.notes.append(f"P{chef+1} 取不到 {item}({s.ref}): {why}")
+
+    # ---- ② **背包**出它 ⇒ 前置 `worn`, 且**取的人 ≠ 背的人** ----
+    #
+    # ☠ 一条机制事实: **没被背的背包不是货源**。`ServerBackpack.CanBlockReferral` 是
+    #   `!IsAttached()` ⇒ 没被背时 referral 被挡住 ⇒ 按拾取键是"把它背上", **不是**掏料。
+    #   所以 `Source.chef` 有两种取值:
+    #     · `>= 0` —— 已经被这个人背着(直接掏, 前置通常为零步);
+    #     · `< 0`  —— **还在场上**(没人背) ⇒ 得先有人背上, 那才有得掏。
+    for s in _ways(ctx, item, "pack"):
+        # 谁去背? 已经背着的就是那个人; 还在地上的则**每个厨师都试一遍**
+        # (背的人是谁会影响"谁不能来取", 所以这是一个真的分支)。
+        wearers = [s.chef] if s.chef >= 0 else list(ctx.world.chefs)
+        for w in wearers:
+            pre = solve_worn(ctx, w, s.ref)
+            if pre is None:
+                continue
+            # ---- 情形 A: 背包在**别人**身上 ⇒ 我走过去掏 ----
+            if w != chef:
+                op = Op("fetch", item, note=f"从 P{w+1} 背上的 {s.ref} 取")
+                op.pin_src = s.ref
+                ok, why, _d = _ok(ctx, op, chef)
+                if ok:
+                    return pre + [Step(chef, op, deps=tuple(range(len(pre))),
+                                       cost=(_d or 0.0),
+                                       why=f"从 P{w+1} 背上的背包取")]
+                ctx.notes.append(f"P{chef+1} 够不着 P{w+1} 背上的背包: {why}")
+                continue
+            # ---- 情形 B: 背包在**我自己**身上 ⇒ 我取不了 ⇒ **请另一个厨师替我掏、再传给我** ----
+            #
+            # ☠☠ **这是 `s_festivemashup_1_3` 要的那条路**(2026-09-16 那一局的诊断):
+            #   那一关**每个背包出自己那份料** ⇒ P1 需要的料就在 P1 自己背上, 而
+            #   `Backpack.CanHandleDispenserPickup`(`Backpack.cs:25-33`)是**别人**对你判的
+            #   ⇒ **P1 单独一个人永远拿不到**, 必须队友掏出来递过来。
+            #   引擎的贪心路径里**没有这个动作**(它只有"我丢给队友", 没有反向) ⇒
+            #   实测表现是: 走去按自己背包的拾取键(按不动), 而那一刻游戏报的 `抓取`
+            #   指向旁边队友背的**另一个**背包 ⇒ 掏错料 ⇒ 放回去 ⇒ 无限循环, 一局报废。
+            #
+            # ☠☠☠ **2026-09-17 更正 —— 这条注释原来写的是"(实测)", 而那是假的**:
+            #   这条路**从来没通过过**。两道闸门叠着堵死它, 两道都修完了才通:
+            #     ① **站位格**: 这里构造的 `pass` 步**不填 `at_x/at_z`**, 而
+            #        `_op_target_for_score` 的 pass 分支见到 0/0 就回
+            #        `None, "传球: 没解析到队友位置"` ⇒ `_feasible` 的
+            #        `if ok and target is not None` 不成立 ⇒ `cell=None` ⇒
+            #        `check` 回 `ok=False` ⇒ `if not ok2: continue` ⇒ **分支被丢弃**。
+            #        (传球那条路本来就走 `_throw_spot`、**不读** `at_x/at_z` ⇒ 已改成
+            #         不再拿"能不能解析出目标"当前置。)
+            #     ② **取错了人**: `_fetch_source_live` 的 `exclude_back` 硬取
+            #        `self.chef(st)`(**本引擎那个厨师**)的背 ⇒ 问"P2 能不能从 P1 背上掏"
+            #        时算出"那是 P1 自己背的, 不能掏" ⇒ 恒 None。
+            #        (已加 `me_back` 参数, 由 `_plan_ctx.check` 传**被评估那个厨师**的背。)
+            #   ⚠ 教训: 下面那句 `assume_held` 的注释**自己就说中了这个病**, 于是修了
+            #     **手持**那道闸门 —— 而同一步还有**第二道**(站位格)没人注意,
+            #     原地把修好的那道抵消了。**"我修好了一道闸门"不等于"这条路通了"。**
+            #   ⚠ 钉它的探针: `runtime/_planctx_probe.py` §⑭。改这一带必须先跑它。
+            for d in ctx.world.chefs:
+                if d == chef:
+                    continue
+                ask = Op("fetch", item, note=f"替 P{chef+1} 从他自己背的 {s.ref} 里取")
+                ask.pin_src = s.ref
+                ok, why, _d = _ok(ctx, ask, d)
+                if not ok:
+                    ctx.notes.append(f"P{d+1} 也够不着 P{w+1} 背上的背包: {why}")
+                    continue
+                # ☠ 传那一步的前提是"P{d+1} 手上已经有它了" —— 而那正是上一步的效果。
+                #   不假设就永远判不可行(`_feasible` 读当前帧) ⇒ 跨人路线推不出来。
+                give = Op("pass", item, note=f"P{d+1} 传给 P{chef+1}")
+                ok2, why2, _d2 = _ok(ctx, give, d, assume_held=item)
+                if not ok2:
+                    ctx.notes.append(f"P{d+1} 传不出来 {item}: {why2}")
+                    continue
+                return pre + [
+                    Step(d, ask, deps=tuple(range(len(pre))), cost=(_d or 0.0),
+                         why=f"P{d+1} 替我从**我背上**的 {s.ref} 掏(自己背的取不了)"),
+                    Step(d, give, deps=(len(pre),), cost=(_d2 or 0.0),
+                         why=f"P{d+1} 传给我"),
+                ]
+
+    # ---- ③ 队友代取再传给我(分厨房/够不着那条路) ----
+    for d in ctx.world.chefs:
+        if d == chef:
+            continue
+        sub = solve_have(ctx, d, item)
+        if sub is None:
+            continue
+        op = Op("pass", item, note=f"P{d+1} 丢给 P{chef+1}")
+        # ☠ **`assume_held` 不能漏** —— 传的前提是"P{d+1} 手上已经有它了", 而那正是
+        #   `sub`(他取料那一步)的效果。不假设的话 `_op_actionable` 读**当前帧**的手持
+        #   ⇒ 这一步恒判不可行 ⇒ **整条"队友代取再传给我"的路线全废**
+        #   (实测: 分厨房那关会推成"P2 取完自己切了", 因为传不出去)。
+        ok, why, _d = _ok(ctx, op, d, assume_held=item)
+        if ok:
+            return sub + [Step(d, op, deps=tuple(range(len(sub))), cost=(_d or 0.0),
+                               why=f"P{d+1} 传过来")]
+        ctx.notes.append(f"P{d+1} 传不过来 {item}: {why}")
+
+    # ---- ④ 它是某个加工步骤的产物 ⇒ 展开上游 ----
+    for act in (ctx.world.made_by.get(norm(item)) or []):
+        # 上游那一步作用的是**同一个物理个体**(`derive()` 的链就是这么排的),
+        # 所以这里只要"让某人把它做出来" —— 具体是哪一份由执行层接地。
+        for e in ctx.world.chefs:
+            op = Op(act, item, note=f"上游: {act}")
+            ok, why, _d = _ok(ctx, op, e)
+            if ok:
+                return [Step(e, op, cost=(_d or 0.0), why=f"上游 {act} 产出它")]
+            ctx.notes.append(f"P{e+1} 做不了上游 {act} {item}: {why}")
+        # 上游自己也可能要跨人(比如"料在队友手上") ⇒ 递归一层
+        for e in ctx.world.chefs:
+            sub = solve_have(ctx, e, item)
+            if sub is not None:
+                return sub
+    return None
+
+
+def _slot_of(flow) -> str:
+    """`flow` 的槽位键 —— **口径必须与 `Engine._plan_key` 逐字一致**(`slot or name`)。
+
+    ⚠ 两处**是同一件事的两份字面**(planner 不该 import engine, engine 也不该被
+      planner 反向依赖)。改动任何一边, 另一边必须跟着改 —— 对不上的后果是
+      "归属过滤把候选筛空", 而它是**静默**的(日志上只看到收窄没命中)。
+    """
+    return str(getattr(flow, "slot", "") or "") or str(getattr(flow, "name", "") or "")
+
+
+def _plan_one(flow, world: WorldView, check, log=None, notes_out=None) -> Plan | None:
+    """把**一条** `DishFlow` 推成**一份带分工与依赖的计划**; 推不出来返回 `None`。
+
+    ☠ **推不出来 ≠ 不做这一单**。调用方的处置是**退回现有的贪心路径**(那才是"绝不停机"),
+    不是放弃。规划器只是个更强的"选哪个", 不是唯一的活路。
+
+    ⚠ **这一份是"单张单"那条老路径, 行为要与加跨单合并之前逐字相同** ——
+      跨单那条走 `plan()`, 它只是把本函数的结果拼起来。48 个离线探针钉的就是这里。
+    """
+    ctx = _Ctx(world=world, check=check, log=log)
+    # ☠ **把 `ctx.notes` 接到调用方给的列表上**(2026-09-17) —— 见 `plan()` 的 `notes_out`。
+    #   一行的代价, 换来的是: 整个递归里那十几处 `ctx.notes.append(...)`
+    #   **一处都不用改**, 而且**每一条 return 路径**(包括"推不出解"那些 `return None`)
+    #   都自动带上理由 —— 不用逐处 `extend`(那才是会漏的写法)。
+    #   `notes_out is None`(默认)⇒ 逐字老行为, 48 个离线探针一个都不受影响。
+    if notes_out is not None:
+        ctx.notes = notes_out
+    steps: list = []
+    assumptions: list = []
+    _slot = _slot_of(flow)
+
+    def push(new: list) -> list:
+        """把一批 `Step` 并进计划, 返回它们在 `steps` 里的下标。
+
+        ☠ **就地盖 `slot` 章**(`Step.slot` 的注释解释了为什么必须有它)。
+          在这一处盖而不是在每个 `Step(...)` 构造点盖: 构造点有六处, 漏一处就是
+          "那一步永远判不出归属" —— 而症状是**静默**的(那一张单的步会被当成别的单的)。
+        ⚠ 改的是 `solve_have` memo 里的对象, 但**一份计划只服务一张单** ⇒ 盖的是同一个值,
+          幂等。☠ **跨单合并时不能共享 `_Ctx` 正是这个原因**(见 `plan()` 的注释)。
+        """
+        base = len(steps)
+        for _s in new:
+            _s.slot = _slot
+        steps.extend(new)
+        return list(range(base, len(steps)))
+
+    # ---- 逐条走菜谱链: `fetch` 交给递归展开, 其余步骤沿用链的顺序 ----
+    # ☠ 这里**不重新推导配方树** —— `cookbook.derive()` 已经把树走成了链, 那是它擅长的。
+    #   递归要解决的是它**看不见**的东西: 货源在哪、谁够得着、要不要跨人。
+
+    #: ☠☠ **一份料的链由同一个人负责** —— 厨师一次只能拿一个东西, 所以
+    #   `fetch X` 之后那件料在谁手上, 接下去的 `chop/cook/assemble X` 就该由**他**做。
+    #   换人不是不行, 但那需要**插一次 `pass`** —— 而 `solve_have` 的 ③ 已经把
+    #   "跨人"这条表达出来了(它返回的就是 `队友的步骤 + 一次 pass`), 所以这里
+    #   只管跟着 `owner` 走就行。
+    owner = world.chefs[0] if world.chefs else 0
+    prev: list = []          # 上一步的下标 —— 链式依赖, 保住 `derive()` 的先后
+    _ops_all = list(getattr(flow, "ops", None) or [])
+    # ☠ **计划推演出来的手持** —— 起点是"现在手上有什么", 之后每推进一步就更新一次
+    #   (`_apply_effect`)。后面的步骤拿**它**当 `assume_held`, 而不是写死 `op.target`。
+    #   没有它的话, 靠后的步骤全按"当前帧"判 ⇒ 整条链根本没被验证过。
+    held_now: dict = dict(ctx.world.chef_held or {})
+    for _i, op in enumerate(_ops_all):
+        if op.action == "fetch":
+            # ☠ **挑"代价最小"的那个厨师, 不是"第一个可行的"** —— 见 `Step.cost`。
+            #   原来写的是 `for c in chefs: 第一个成功的就 break` ⇒ 分工只保证"可行",
+            #   **"该让近的人做"推不出来**(实测: 明明队友就在箱子旁边, 却排给了隔半张图的另一个)。
+            #   ⚠ **全都要试**(不能 break) —— `solve_have` 有记忆化(`ctx.memo`), 多试几个很便宜。
+            #   ⚠ 代价是**规划那一刻**的距离, 只用来比大小; 真正的接地由执行层每轮重做。
+            # ☠☠ **还要看"链的下一步他做不做得了"** —— 只看取料那一步的代价会推出
+            #   一条**断头路**: 实测(2026-09-16 加代价模型时当场撞出来的) 它会把料留在
+            #   **队友**手上, 因为"队友取更近"; 可后面那步(切/煮/搅)**只有我能做**
+            #   (那边的台面只有我够得着) ⇒ 计划到此为止, 料白取了。
+            #   ⇒ 下一步在那个厨师手里做不到, 就给他记一个**大罚分**(不是直接排除 ——
+            #     万一两个人都做不到, 那也还是得有人去取, 由执行层去试)。
+            _nxt = None
+            if _i + 1 < len(_ops_all) and _ops_all[_i + 1].target == op.target:
+                _nxt = _ops_all[_i + 1]
+            best, best_cost = None, None
+            # ☠☠ **已经派出去的时间**(本单里, 按 `Step.chef` 累加) —— 见 `PLAN_MAKESPAN`。
+            #   没有它, 挑 owner 就是"这个目标对谁最便宜", **完全不管那个人手上排了多少**。
+            _load = {c: sum(s.cost for s in steps if s.chef == c) for c in world.chefs}
+            for c in world.chefs:
+                sub = solve_have(ctx, c, op.target)
+                if not sub:
+                    continue
+                tot = sum(s.cost for s in sub)
+                if _nxt is not None:
+                    _okc, _w, _dc = _ok(ctx, _nxt, c, assume_held=op.target)
+                    if not _okc:
+                        tot += CHAIN_DEAD_PENALTY
+                # ☠ `_m` = **把这一步派给 c 之后, 两个厨师各自的总时间取最大**
+                #   (另一个人的排队时间照旧)。派给谁让"最长的那条"最短, 就选谁。
+                #   ⚠ `CHAIN_DEAD_PENALTY` 仍然有效: 它加进 `tot` ⇒ 那个人的 makespan 爆掉 ⇒ 落选。
+                #   ⚠ `steps` 是**正在建的**那份计划, 所以这里的 load 是**实际已派**的, 不是估的。
+                _m = max(_load[c] + tot,
+                         max((v for k, v in _load.items() if k != c), default=0.0)) \
+                    if PLAN_MAKESPAN else tot
+                if best_cost is None or _m < best_cost:
+                    best, best_cost = (c, sub), _m
+            if best is None:
+                # ☠ **推不出这个货源 ⇒ 这单现在做不了**。调用方的处置是**退回贪心路径**
+                #   (那才是"绝不停机"), 不是放弃这一单。
+                _say(ctx, f"**推不出** {op.target} 怎么拿到 —— 这一单现在无解")
+                return None
+            owner, sub = best
+            _say(ctx, f"{op.target}: 选 P{owner+1}"
+                      f"({'并行后最长' if PLAN_MAKESPAN else '该步代价'} {best_cost:.1f})")
+            new = push(sub)
+            for _s in sub:
+                _apply_effect(_s.op, _s.chef, held_now, world.chefs)
+        else:
+            # ☠☠ **链上的步骤一律跟着 `owner` 走, 不跨人试。**
+            #   为什么(2026-09-16 实测打回来的): 原来这里是"先试 owner、不行再试别人",
+            #   于是推出过这么一份计划 —— `4. P2 fetch DLC09_DriedFruit` 紧接着
+            #   `5. P1 chop DLC09_DriedFruit`: **料在 P2 手上, 却让 P1 去切**。
+            #   根因是"别人现在凑巧能满足判据"(P1 那边板上有东西) ⇒ 计划自相矛盾。
+            #   ⇒ 跟着 `owner` 走: 厨师一次只能拿一个东西, **一份料的链由同一个人负责**。
+            # ⚠ **不在这儿判死** —— 计划只是骨架, 世界会变; 判死是**执行期**的事
+            #   (冷板凳那套是承重的)。做不了就照旧留在计划里并标出来。
+            #   `assume_held`: 这一步**该由 owner 手上拿着的东西** —— 上一步(取/掏)的效果。
+            #   不假设的话 `_op_actionable` 会读当前帧的手持 ⇒ 链上的每一步都判不可行。
+            # ☠ **`assume_held` 取"计划推演到这一步时他手上有什么"**, 不是写死的
+            #   `op.target` —— 后者等于"不管上一步有没有真给他, 都假设他拿着"。
+            #   ⚠ 判据仍然只有一份(`_feasible`), 这里给的只是**输入**。
+            assume = held_now.get(owner, "")
+            ok, why, _d = _ok(ctx, op, owner, assume_held=assume)
+            if not ok:
+                why = f"探测期判不可行({why}) —— 留给执行层"
+            new = push([Step(owner, op, cost=(_d or 0.0), why=why)])
+            _apply_effect(op, owner, held_now, world.chefs)
+        # 链式依赖: 这一步依赖**上一步**(保住 `derive()` 给的先后)
+        if prev:
+            for i in new:
+                steps[i].deps = tuple(sorted(set(steps[i].deps) | set(prev)))
+        prev = new
+
+    if not steps:
+        return None
+
+    # ---- 假设清单: 这份计划依赖了哪些世界事实(§动态地图: 只校验这些) ----
+    # ☠ **每一条都要带 `kind`/`key`/`slot`**(见 `Assumption` 的注释) —— 只写文本的话
+    #   它就只是一句人话, `Engine._plan_check` 校验不了, 这条假设永不报警。
+    # ⚠ 归属(`slot`)按**这一条事实的性质**给, 不是一律 `_slot`:
+    #   · `src`/`wear` 绑在**这一步**上 ⇒ 就是本单(`_slot`);
+    #   · `back` 是"某厨师背着" ⇒ 也是本单推出来的(跨人取料那一步的前提);
+    #   · `cooking` 是**台账级**的("我开的火"), 不属于任何一张单 ⇒ 空(全局);
+    #   · 盘子那几条同理(摆盘位是**整关一块**, 见下面) ⇒ 空。
+    for s in steps:
+        if s.op.pin_src:
+            assumptions.append(Assumption(
+                f"货源 {s.op.pin_src} 仍然存在且够得着",
+                kind="src", key=s.op.pin_src, slot=_slot))
+        if s.op.action == "wear":
+            assumptions.append(Assumption(
+                f"{s.op.target} 还在场上(没被人捡走)",
+                kind="wear", key=s.op.target, slot=_slot))
+    for c, p in (world.chef_back or {}).items():
+        if p:
+            assumptions.append(Assumption(
+                f"P{c+1} 一直背着 {p}",
+                kind="back", key="%d|%s" % (c, p), slot=_slot))
+    # ☠ **正在煮的那些也记一笔**(2026-09-17): 它们是"**放完就走**"留下的账 ——
+    #   计划里没有"回去取"那一步(`_tends` 才有), 所以要让人读日志时看得见
+    #   "这份料在灶上、到点可取", 而不是以为计划把它漏了。
+    for _sid, _item, _left in (getattr(world, "cooking", None) or []):
+        assumptions.append(Assumption(
+            f"{_item} 正在 {_sid} 上煮(约 {_left:.0f}s 后熟, 到点回去取)",
+            kind="cooking", key=_sid))
+
+    # ---- 「去哪拿一只盘子」(2026-09-17, 用户点名的那一条) ----
+    # ☠ 计划里**没有**"拿盘子"这一步(`derive()` 的链里就没有) —— 执行层是在
+    #   `op_assemble` / `_get_plate_for_pot` 里**顺手**解决的。所以这里能做的、
+    #   也应该做的, 是**把那条约束说出来**:
+    #     · 摆盘位在哪儿(规划期只读挑的) ⇒ 写进 `assumptions` 让人看得见;
+    #     · 那只空盘从哪来 ⇒ 同上;
+    #     · **全场没有可用的空盘** ⇒ 这是一条**真的剪枝理由**, 进 `notes`
+    #       (只在"推不出解"时打印) —— 免得它又被伪装成"留给执行层"。
+    #   ⚠ `into_bowl` 那些 `assemble` 的落点是**碗**(搅拌台), 与盘子无关 ⇒ 不算。
+    #   ☠ **这几条 `slot` 留空(全局)**: 摆盘位是**整关一块**、`world.plate_*` 也是
+    #     `_plan_ctx` 建视图时**只解析一次**的 ⇒ 它们不属于任何一张单。留空之后
+    #     校验时按最保守处置(整份作废) —— 而"盘子没了"本来就该让所有单停下来重想。
+    if any(getattr(s.op, "action", "") in ("assemble", "deliver")
+           and not getattr(s.op, "into_bowl", False) for s in steps) \
+            and getattr(world, "plate_known", False):
+        _ps = getattr(world, "plate_spot", None)
+        _pc = getattr(world, "plate_src", None)
+        if _ps:
+            assumptions.append(Assumption(
+                f"摆盘位 {_ps[0]} (规划期只读挑的)",
+                kind="plate_spot", key=_ps[0]))
+        if _pc and _pc[0] == "on_spot":
+            assumptions.append(Assumption(
+                f"那只空盘**已经在** {_pc[1]} 上(材料放上去直接进盘)",
+                kind="plate_src", key="on_spot|%s" % _pc[1]))
+        elif _pc:
+            assumptions.append(Assumption(
+                f"空盘从 {_pc[1]} 取({PLATE_HOW.get(_pc[0], _pc[0])})",
+                kind="plate_src", key="%s|%s" % (_pc[0], _pc[1])))
+        else:
+            _msg = ("全场**没有可用的空盘**(盘子堆 / 台面上的空盘都没有)"
+                    " —— 摆盘那一步要现找, 很可能做不成")
+            # ⚠ 这一条**永远算成立**: 它说的是"一件坏事为真" —— 空盘出现了是**好消息**,
+            #   不是"计划依赖的事实破了"。`kind="no_plate"` 的校验器直接返回 True。
+            assumptions.append(Assumption("⚠ " + _msg, kind="no_plate", key=""))
+            ctx.notes.append("⚠ 盘子: " + _msg)
+
+    return Plan(flow=getattr(flow, "name", ""), steps=steps,
+                assumptions=dedup_assumptions(assumptions),
+                # 代价 = 各步"到站位几格"之和(不是步数) —— 步数不反映远近。
+                cost=sum(s.cost for s in steps), notes=list(ctx.notes))
+
+
+def plan(flows, world: WorldView, check, log=None, notes_out=None) -> Plan | None:
+    """**把一张单、或者一池单**推成一份带分工与依赖的计划; 推不出来返回 `None`。
+
+    ⚠ **`notes_out`(可选)**: 给一个 list, 本函数会把**每一条剪枝理由**写进去
+      (`P{chef+1} 取不到 {item}({s.ref}): {why}` / `check 抛异常(…)` / `环:` / `深度到顶` …),
+      **成功失败都写**。默认 `None` ⇒ 逐字老行为。
+      ☠☠ **为什么必须有这个出口**(2026-09-17): 以前这些理由**只活在 `ctx.notes` 里,
+      随函数返回被 GC 扔掉** —— 于是 `[规划] … 推不出解` 是一句**不可诊断**的话,
+      而 `_ok` 又把"检查器抛的任何异常"一律变成"这条支不可能"(`planner.py:292`)
+      ⇒ **一次崩溃和"真的不可能"在日志上长得一模一样**。要分清两者, 只有把理由带出来。
+
+    两种入参(**用户 2026-09-17 选的形状: "只覆盖到池、不在规划期排人"**):
+      · **单个 flow** ⇒ 逐字走 `_plan_one`(老路径, 一行行为都不变);
+      · **一串 flow** ⇒ 每条各推一份, 拼成**一份合并计划**(见下)。
+
+    ☠☠ **为什么要能合并**(这是"跨单合作"的核心): 执行层的候选池是**跨订单**的
+      (`Engine.execute` 把最多 `COOP_ORDERS` 张单拼起来, `engine.py:9391-9438`),
+      而规划器原来只覆盖**最紧急那一张** ⇒ `_rank_candidates` 的收窄闸门
+      (`engine.py:7636-7660`)每轮把池**压回一张单**, `COOP_ORDERS` 静默失效。
+      计划覆盖到池之后, 收窄放行的是**这几张单**的候选, 池才是真的池。
+
+    ☠☠ **合并 = 无交并(disjoint union), 不建跨单依赖边**: 几条链本来就互相独立,
+      而跨单的协作由**执行层共享的那个池**表达(评分 + 步级占位去错开两个人) ——
+      那正是用户定的形状("可能不需要按订单分配…可以两个脚本做订单的一部分")。
+      ⇒ 每一条**逐字等于**它单独推出来的那一份(这一点由探针 ① 钉死)。
+
+    ☠☠ **每条单各建一个 `_Ctx`, 绝不共享 `memo`**: `solve_have` 的记忆化存的是
+      **`Step` 对象**, 而 `push()` 把它们**原样**并进 `steps`, 之后"链式依赖"那一段
+      (`_plan_one` 结尾的 `steps[i].deps = ...`)**就地改写 `deps`**
+      ⇒ 共享 memo 会让两张单改到**同一批对象**
+      (一张单改完另一张看到的依赖就错了)。各建一份的代价只是"同一份料搜两遍",
+      而 `check` 那一侧本来就是无状态的。
+
+    ☠ **某一条推不出 ⇒ 跳过它、不放弃整份**: 推不出解的单本来就要退回贪心路径,
+      没理由因此把**别的单**的计划也扔掉(老行为下那几张单本来就没有计划)。
+      全都不推不出 ⇒ 返回 `None`, 调用方照旧退回贪心(那是"绝不停机")。
+    """
+    if not isinstance(flows, (list, tuple)):
+        return _plan_one(flows, world, check, log=log, notes_out=notes_out)
+    _fs = [f for f in flows if f is not None]
+    if not _fs:
+        return None
+    if len(_fs) == 1:
+        return _plan_one(_fs[0], world, check, log=log,
+                         notes_out=notes_out)   # ⚠ 老路径, 别在这儿加东西
+
+    steps: list = []
+    assumptions: list = []
+    notes: list = []
+    names: list = []
+    dropped: list = []
+    for f in _fs:
+        _nm = str(getattr(f, "name", "") or "") or "?"
+        sub = _plan_one(f, world, check, log=log, notes_out=notes)
+        if sub is None:
+            # ⚠ **不 `return None`** —— 见上面那条 ☠。它只是不进这份合并计划。
+            dropped.append(_nm)
+            continue
+        # ☠ **`deps` 要整体偏移**, 而且要**造新的 `Step`**: 老对象的下标是
+        #   "在它自己那份计划里"的位置, 直接并进来会**指到别的单的步上**。
+        base = len(steps)
+        for s in sub.steps:
+            steps.append(Step(chef=s.chef, op=s.op,
+                              deps=tuple(d + base for d in s.deps),
+                              why=s.why, cost=s.cost, slot=s.slot))
+        assumptions.extend(sub.assumptions or [])
+        notes.extend(sub.notes or [])
+        names.append(_nm)
+    if not steps:
+        # ☠ 一条都推不出 ⇒ **把理由带回调用方** —— 这一句是"推不出解"可诊断的出口。
+        #   ⚠ 上面各条 `_plan_one(...)` 是**直接写进 `notes`** 的(同一个 list),
+        #     所以只在 `notes_out` 是**另一个** list 时才需要搬一次(否则会重复)。
+        if notes_out is not None and notes_out is not notes:
+            notes_out.extend(notes)
+        return None                          # 一条都推不出 ⇒ 与单张单同一个处置
+    if dropped:
+        _msg = (f"⚠ {' / '.join(dropped)} 推不出解 —— **不进这份合并计划**"
+                f"(它们这一轮照旧走评分那条路)")
+        notes.append(_msg)
+        if log is not None:
+            log(f"[规划] {_msg}")
+    return Plan(flow=" + ".join(names), steps=steps,
+                assumptions=dedup_assumptions(assumptions),
+                cost=sum(s.cost for s in steps), notes=notes)

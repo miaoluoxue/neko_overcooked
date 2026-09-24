@@ -222,7 +222,7 @@ def say(payload: dict) -> str:
         line = _say_live(live, why=eng.get("round_why") or "")
         # ⚠ 暂停这一句必须说清楚: 数据是"最后一次读数", 不是此刻 —— 否则外面会
         #   拿着几秒前的分数当现状(而且**局可能已经在我们停止读取时打完了**)。
-        return ("脚本已暂停(游戏不在前台); 最后一次读数: " + line) if paused else line
+        return ("脚本已暂停; 最后一次读数: " + line) if paused else line
     res = payload.get("result")
     if res:
         return say_result(payload)
